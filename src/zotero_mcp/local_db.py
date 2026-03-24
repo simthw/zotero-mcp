@@ -5,6 +5,7 @@ Provides direct SQLite access to Zotero's local database for faster semantic sea
 when running in local mode.
 """
 
+import json
 import os
 import sqlite3
 import platform
@@ -346,34 +347,155 @@ class LocalZoteroReader:
 
         return meta
 
+    def _find_content_list_json(self, attachment_key: str, resolved_path: Path) -> Path | None:
+        """Find MinerU content_list.json file in the attachment folder.
+
+        Looks for files matching patterns:
+        - content_list.json
+        - *_content_list.json (MinerU standard naming)
+
+        Args:
+            attachment_key: The Zotero attachment item key
+            resolved_path: The resolved attachment file path
+
+        Returns:
+            Path to content_list.json if found, None otherwise
+        """
+        if resolved_path and resolved_path.exists():
+            # Check the same directory as the attachment
+            parent_dir = resolved_path.parent
+            
+            # For Zotero storage format: storage/KEY/filename.pdf
+            # The content_list.json should be in the same folder
+            
+            # Priority 1: Look for *_content_list.json pattern (MinerU standard)
+            for f in parent_dir.iterdir():
+                if f.is_file() and f.name.endswith('_content_list.json'):
+                    return f
+            
+            # Priority 2: Look for exact content_list.json
+            content_list = parent_dir / "content_list.json"
+            if content_list.exists():
+                return content_list
+        return None
+
+    def _extract_text_from_content_list_json(self, json_path: Path) -> str:
+        """Extract text content from MinerU content_list.json format.
+
+        The content_list.json format from MinerU can be:
+        1. A list of dicts with 'text', 'type', 'page_idx', etc.
+        2. A dict with 'content' or 'data' key containing a list
+        {
+            "content": [
+                {"text": "...", "type": "text", ...},
+                ...
+            ]
+        }
+
+        Args:
+            json_path: Path to the content_list.json file
+
+        Returns:
+            Extracted text content, or empty string on failure
+        """
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            # Handle root-level list format (MinerU standard)
+            if isinstance(data, list):
+                content_list = data
+            else:
+                # Handle dict format with 'content' or 'data' key
+                content_list = data.get('content') or data.get('data') or []
+
+            if isinstance(content_list, list):
+                text_parts = []
+                for item in content_list:
+                    if isinstance(item, dict):
+                        # MinerU format: {"text": "...", "type": "text", ...}
+                        text = item.get('text', '')
+                        item_type = item.get('type', '')
+                        # Only extract text from text-type elements
+                        if text and isinstance(text, str) and item_type == 'text':
+                            text_parts.append(text.strip())
+                    elif isinstance(item, str):
+                        # Simple list format
+                        text_parts.append(item.strip())
+
+                if text_parts:
+                    return '\n\n'.join(text_parts)
+
+            # Fallback: try to extract any text-like content from dict
+            if isinstance(data, dict):
+                # Look for any text content in the dict
+                for key in ['text', 'content', 'fulltext', 'body']:
+                    if key in data and isinstance(data[key], str):
+                        return data[key]
+
+            return ""
+        except Exception as e:
+            logger.warning(f"Failed to extract text from content_list.json: {e}")
+            return ""
+
     def _extract_fulltext_for_item(self, item_id: int) -> tuple[str, str] | None:
         """Attempt to extract fulltext and source from the item's best attachment.
 
-        Preference: use PDF when available; fall back to HTML when no PDF exists.
-        Returns (text, source) where source is 'pdf' or 'html'.
+        Priority order:
+        1. content_list.json (MinerU format) - highest quality structured text
+        2. PDF - extract text using pdfminer
+        3. HTML - extract text using markitdown/BeautifulSoup
+
+        Returns (text, source) where source is 'content_list_json', 'pdf', or 'html'.
         """
+        best_content_list_json = None
         best_pdf = None
         best_html = None
+
         for key, path, ctype in self._iter_parent_attachments(item_id):
             resolved = self._resolve_attachment_path(key, path or "")
             if not resolved or not resolved.exists():
                 continue
-            if ctype == "application/pdf" and best_pdf is None:
-                best_pdf = resolved
-            elif (ctype or "").startswith("text/html") and best_html is None:
-                best_html = resolved
-        # Prefer PDF, otherwise fall back to HTML
-        target = best_pdf or best_html
-        if not target:
-            return None
-        text = self._extract_text_from_file(target)
-        if text == _EXTRACTION_TIMEOUT:
-            return (_EXTRACTION_TIMEOUT, "timeout")
-        if not text:
-            return None
-        # Determine source type
-        source = "pdf" if target.suffix.lower() == ".pdf" else ("html" if target.suffix.lower() in {".html", ".htm"} else "file")
-        return (text, source)
+
+            # Priority 1: Check for content_list.json in the attachment folder
+            if ctype == "application/pdf":
+                content_list = self._find_content_list_json(key, resolved)
+                if content_list and content_list.exists():
+                    if best_content_list_json is None:
+                        best_content_list_json = content_list
+                if best_pdf is None:
+                    best_pdf = resolved
+            elif (ctype or "").startswith("text/html"):
+                # Also check for content_list.json alongside HTML
+                content_list = self._find_content_list_json(key, resolved)
+                if content_list and content_list.exists():
+                    if best_content_list_json is None:
+                        best_content_list_json = content_list
+                if best_html is None:
+                    best_html = resolved
+
+        # Priority 1: Use content_list.json if available (highest quality)
+        if best_content_list_json:
+            text = self._extract_text_from_content_list_json(best_content_list_json)
+            if text:
+                logger.info(f"Using content_list.json for item {item_id}: {best_content_list_json}")
+                return (text, "content_list_json")
+
+        # Priority 2: Use PDF
+        if best_pdf:
+            text = self._extract_text_from_file(best_pdf)
+            if text == _EXTRACTION_TIMEOUT:
+                return (_EXTRACTION_TIMEOUT, "timeout")
+            if text:
+                return (text, "pdf")
+
+        # Priority 3: Use HTML
+        if best_html:
+            text = self._extract_text_from_file(best_html)
+            if text:
+                return (text, "html")
+
+        return None
 
     def close(self):
         """Close database connection."""
@@ -608,6 +730,44 @@ class LocalZoteroReader:
     # Public helper to quickly check full text metadata for item
     def get_fulltext_meta_for_item(self, item_id: int) -> tuple[str, str] | None:
         return self._get_fulltext_meta_for_item(item_id)
+
+    def has_content_list_json(self, item_id: int) -> bool:
+        """Check if the item has a content_list.json file in its attachment folder.
+
+        Args:
+            item_id: The Zotero item ID
+
+        Returns:
+            True if content_list.json exists, False otherwise
+        """
+        for key, path, ctype in self._iter_parent_attachments(item_id):
+            resolved = self._resolve_attachment_path(key, path or "")
+            if not resolved or not resolved.exists():
+                continue
+            if ctype == "application/pdf":
+                content_list = self._find_content_list_json(key, resolved)
+                if content_list and content_list.exists():
+                    return True
+        return False
+
+    def get_content_list_json_path(self, item_id: int) -> Path | None:
+        """Get the path to content_list.json for an item.
+
+        Args:
+            item_id: The Zotero item ID
+
+        Returns:
+            Path to content_list.json if found, None otherwise
+        """
+        for key, path, ctype in self._iter_parent_attachments(item_id):
+            resolved = self._resolve_attachment_path(key, path or "")
+            if not resolved or not resolved.exists():
+                continue
+            if ctype == "application/pdf":
+                content_list = self._find_content_list_json(key, resolved)
+                if content_list and content_list.exists():
+                    return content_list
+        return None
 
     # Public helper to extract fulltext on demand for a specific item
     def extract_fulltext_for_item(self, item_id: int) -> tuple[str, str] | None:

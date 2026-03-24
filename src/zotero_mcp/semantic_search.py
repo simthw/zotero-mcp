@@ -446,11 +446,23 @@ class ZoteroSemanticSearch:
                             existing_metadata = chroma_client.get_document_metadata(it.key)
                             if existing_metadata:
                                 chroma_has_fulltext = existing_metadata.get("has_fulltext", False)
+                                chroma_fulltext_source = existing_metadata.get("fulltext_source", None)
                                 local_has_fulltext = len(reader.get_fulltext_meta_for_item(it.item_id)) > 0
+
+                                # Check if content_list.json is now available (higher priority source)
+                                has_content_list = reader.has_content_list_json(it.item_id)
+                                content_list_is_newer = False
+                                if has_content_list and chroma_fulltext_source != "content_list_json":
+                                    # content_list.json exists but chroma used a different source
+                                    content_list_is_newer = True
+                                    logger.info(f"content_list.json found for item {it.key}, will re-extract")
 
                                 # Skip only if chroma does not have the fulltext embedding but local does (e.g. the users updated it)
                                 if not chroma_has_fulltext and local_has_fulltext:
                                     # Document exists but lacks fulltext - we need to update it
+                                    updated_existing += 1
+                                elif content_list_is_newer:
+                                    # content_list.json is available (higher quality source)
                                     updated_existing += 1
                                 else:
                                     should_extract = False
