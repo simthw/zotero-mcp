@@ -155,12 +155,13 @@ def setup_semantic_search(existing_semantic_config: dict | None = None, semantic
     print("1. Default (all-MiniLM-L6-v2) - Free, runs locally")
     print("2. OpenAI - Better quality, requires API key")
     print("3. Gemini - Better quality, requires API key")
+    print("4. Custom model (for OpenAI-compatible APIs like SiliconFlow)")
 
     while True:
-        choice = input("\nChoose embedding model (1-3): ").strip()
-        if choice in ["1", "2", "3"]:
+        choice = input("\nChoose embedding model (1-4): ").strip()
+        if choice in ["1", "2", "3", "4"]:
             break
-        print("Please enter 1, 2, or 3")
+        print("Please enter 1, 2, 3, or 4")
 
     config = {}
 
@@ -221,6 +222,33 @@ def setup_semantic_search(existing_semantic_config: dict | None = None, semantic
             print(f"Using custom Gemini base URL: {base_url}")
         else:
             print("Using default Gemini base URL")
+
+    elif choice == "4":
+        # Custom model for OpenAI-compatible APIs
+        config["embedding_model"] = "openai"
+
+        # Get custom model name
+        model_name = input("Enter custom model name (e.g., BAAI/bge-m3): ").strip()
+        if not model_name:
+            print("Warning: No model name provided, using text-embedding-3-small")
+            model_name = "text-embedding-3-small"
+        config["embedding_config"] = {"model_name": model_name}
+        print(f"Using custom model: {model_name}")
+
+        # Get API key
+        api_key = getpass.getpass("Enter your API key (hidden): ").strip()
+        if api_key:
+            config["embedding_config"]["api_key"] = api_key
+        else:
+            print("Warning: No API key provided. Set OPENAI_API_KEY environment variable.")
+
+        # Get custom base URL
+        base_url = input("Enter custom OpenAI base URL (leave blank for default): ").strip()
+        if base_url:
+            config["embedding_config"]["base_url"] = base_url
+            print(f"Using custom base URL: {base_url}")
+        else:
+            print("Using default OpenAI base URL")
 
     # Configure update frequency
     print("\n=== Database Update Configuration ===")
