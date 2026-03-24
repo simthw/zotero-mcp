@@ -25,10 +25,12 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
 
     max_input_tokens = 8000  # text-embedding-3-* limit is 8191
 
-    def __init__(self, model_name: str = "text-embedding-3-small", api_key: str | None = None, base_url: str | None = None):
+    def __init__(self, model_name: str = "text-embedding-3-small", api_key: str | None = None, base_url: str | None = None, max_input_tokens: int | None = None):
         self.model_name = model_name
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
+        if max_input_tokens is not None:
+            self.max_input_tokens = max_input_tokens
         if not self.api_key:
             raise ValueError("OpenAI API key is required")
 
@@ -68,19 +70,34 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
         return self.__call__([text])[0]
 
     def truncate(self, text: str, max_tokens: int) -> str:
-        """Truncate using tiktoken cl100k_base (correct for OpenAI models)."""
-        try:
-            import tiktoken
-            if not hasattr(self, '_tokenizer'):
-                self._tokenizer = tiktoken.get_encoding("cl100k_base")
-            tokens = self._tokenizer.encode(text)
-            if len(tokens) > max_tokens:
-                tokens = tokens[:max_tokens]
-                text = self._tokenizer.decode(tokens)
-        except ImportError:
-            max_chars = max_tokens * 3
-            if len(text) > max_chars:
-                text = text[:max_chars]
+        """Truncate text to fit within the token limit.
+
+        Uses tiktoken cl100k_base when the model is a native OpenAI model.
+        For third-party models served via an OpenAI-compatible API (detected
+        by a non-OpenAI model_name), uses a conservative character estimate
+        since the actual tokenizer may differ significantly.
+        """
+        is_native_openai = self.model_name.startswith("text-embedding-")
+        if is_native_openai:
+            try:
+                import tiktoken
+                if not hasattr(self, '_tokenizer'):
+                    self._tokenizer = tiktoken.get_encoding("cl100k_base")
+                tokens = self._tokenizer.encode(text)
+                if len(tokens) > max_tokens:
+                    tokens = tokens[:max_tokens]
+                    text = self._tokenizer.decode(tokens)
+                return text
+            except ImportError:
+                pass
+        # Conservative character-based truncation for non-OpenAI models.
+        # Subword tokenizers (e.g. bge-m3's XLMRoberta SentencePiece) can
+        # produce ~1 token per 1.5-2 chars on malformed PDF text with no
+        # whitespace.  Empirically, 16000 chars still exceeds bge-m3's 8192
+        # token limit on such text, so we use 1.5 chars/token for safety.
+        max_chars = int(max_tokens * 1.5)
+        if len(text) > max_chars:
+            text = text[:max_chars]
         return text
 
 
@@ -309,7 +326,8 @@ class ChromaClient:
             model_name = self.embedding_config.get("model_name", "text-embedding-3-small")
             api_key = self.embedding_config.get("api_key")
             base_url = self.embedding_config.get("base_url")
-            return OpenAIEmbeddingFunction(model_name=model_name, api_key=api_key, base_url=base_url)
+            max_input_tokens = self.embedding_config.get("max_input_tokens")
+            return OpenAIEmbeddingFunction(model_name=model_name, api_key=api_key, base_url=base_url, max_input_tokens=max_input_tokens)
 
         elif self.embedding_model == "gemini":
             model_name = self.embedding_config.get("model_name", "gemini-embedding-001")

@@ -23,8 +23,12 @@ logger = logging.getLogger(__name__)
 _EXTRACTION_TIMEOUT = "__EXTRACTION_TIMEOUT__"
 
 
-def _extract_pdf_worker(file_path: str, maxpages: int, result_queue):
-    """Worker: extract text from a PDF in a separate process."""
+def _extract_pdf_worker(file_path: str, maxpages: int, result_queue=None):
+    """Worker: extract text from a PDF in a separate process.
+
+    When called via ProcessPoolExecutor (result_queue is None) the text is
+    returned directly.  The legacy Queue path is kept for compatibility.
+    """
     try:
         # Suppress pdfminer warnings about malformed PDF color spaces, fonts, etc.
         import logging as _logging
@@ -32,9 +36,13 @@ def _extract_pdf_worker(file_path: str, maxpages: int, result_queue):
 
         from pdfminer.high_level import extract_text
         text = extract_text(file_path, maxpages=maxpages) or ""
-        result_queue.put(text)
+        if result_queue is not None:
+            result_queue.put(text)
+        return text
     except Exception:
-        result_queue.put("")
+        if result_queue is not None:
+            result_queue.put("")
+        return ""
 
 
 @dataclass
@@ -109,6 +117,7 @@ class LocalZoteroReader:
         self._connection: sqlite3.Connection | None = None
         self.pdf_max_pages: int | None = pdf_max_pages
         self.pdf_timeout: int = pdf_timeout
+        self._pdf_pool = None  # Lazy-initialized ProcessPoolExecutor
         # Reduce noise from pdfminer warnings
         try:
             logging.getLogger("pdfminer").setLevel(logging.ERROR)
@@ -253,13 +262,21 @@ class LocalZoteroReader:
 
         return None
 
-    def _extract_text_from_pdf(self, file_path: Path) -> str:
-        """Extract text from a PDF using pdfminer in a subprocess with timeout.
+    def _get_pdf_pool(self):
+        """Lazily create a single-worker ProcessPoolExecutor for PDF extraction."""
+        if self._pdf_pool is None:
+            from concurrent.futures import ProcessPoolExecutor
+            self._pdf_pool = ProcessPoolExecutor(max_workers=1)
+        return self._pdf_pool
 
-        Returns the extracted text, empty string on failure, or
-        _EXTRACTION_TIMEOUT sentinel if the process was killed due to timeout.
+    def _extract_text_from_pdf(self, file_path: Path) -> str:
+        """Extract text from a PDF using pdfminer in a persistent worker process.
+
+        Uses a single reusable worker process to avoid the per-PDF spawn
+        overhead on Windows.  Returns the extracted text, empty string on
+        failure, or _EXTRACTION_TIMEOUT sentinel on timeout.
         """
-        import multiprocessing
+        from concurrent.futures import TimeoutError as FuturesTimeout
 
         # Page limit (preserve existing fallback chain)
         if isinstance(self.pdf_max_pages, int) and self.pdf_max_pages > 0:
@@ -273,41 +290,31 @@ class LocalZoteroReader:
 
         timeout = self.pdf_timeout or 30
 
-        result_queue = None
-        process = None
         try:
-            result_queue = multiprocessing.Queue()
-            process = multiprocessing.Process(
-                target=_extract_pdf_worker,
-                args=(str(file_path), maxpages, result_queue),
-            )
-            process.start()
-            process.join(timeout=timeout)
-
-            if process.is_alive():
-                logger.warning(f"PDF extraction timed out after {timeout}s: {file_path.name}")
-                process.kill()
-                process.join(timeout=5)
-                return _EXTRACTION_TIMEOUT
-
-            if not result_queue.empty():
-                return result_queue.get_nowait()
-            return ""
+            pool = self._get_pdf_pool()
+            future = pool.submit(_extract_pdf_worker, str(file_path), maxpages)
+            text = future.result(timeout=timeout)
+            return text or ""
+        except FuturesTimeout:
+            logger.warning(f"PDF extraction timed out after {timeout}s: {file_path.name}")
+            # The worker is stuck; kill the pool so the next call gets a fresh one.
+            self._shutdown_pdf_pool(kill=True)
+            return _EXTRACTION_TIMEOUT
         except Exception as e:
             logger.warning(f"PDF extraction failed: {file_path.name}: {e}")
             return ""
-        finally:
-            if result_queue is not None:
-                try:
-                    result_queue.close()
-                    result_queue.join_thread()
-                except Exception:
-                    pass
-            if process is not None:
-                try:
-                    process.close()
-                except Exception:
-                    pass
+
+    def _shutdown_pdf_pool(self, kill: bool = False):
+        """Shutdown the PDF worker pool."""
+        if self._pdf_pool is not None:
+            try:
+                if kill:
+                    self._pdf_pool.shutdown(wait=False, cancel_futures=True)
+                else:
+                    self._pdf_pool.shutdown(wait=False)
+            except Exception:
+                pass
+            self._pdf_pool = None
 
     def _extract_text_from_html(self, file_path: Path) -> str:
         """Extract text from HTML using markitdown if available; fallback to stripping tags."""
@@ -382,15 +389,18 @@ class LocalZoteroReader:
     def _extract_text_from_content_list_json(self, json_path: Path) -> str:
         """Extract text content from MinerU content_list.json format.
 
-        The content_list.json format from MinerU can be:
-        1. A list of dicts with 'text', 'type', 'page_idx', etc.
-        2. A dict with 'content' or 'data' key containing a list
-        {
-            "content": [
-                {"text": "...", "type": "text", ...},
-                ...
-            ]
-        }
+        Supports multiple MinerU output formats:
+
+        1. Nested pages format (list of lists):
+           Each top-level item is a page (list of blocks). Each block is a dict
+           with 'type' (e.g. 'paragraph', 'title'), 'content' (a dict whose
+           single key like 'paragraph_content' maps to a list of text spans),
+           and 'bbox'.
+
+        2. Flat list of dicts with 'text' key:
+           [{"text": "...", "type": "text", ...}, ...]
+
+        3. Dict wrapper with 'content' or 'data' key containing a list.
 
         Args:
             json_path: Path to the content_list.json file
@@ -412,23 +422,27 @@ class LocalZoteroReader:
             if isinstance(content_list, list):
                 text_parts = []
                 for item in content_list:
-                    if isinstance(item, dict):
-                        # MinerU format: {"text": "...", "type": "text", ...}
-                        text = item.get('text', '')
-                        item_type = item.get('type', '')
-                        # Only extract text from text-type elements
-                        if text and isinstance(text, str) and item_type == 'text':
-                            text_parts.append(text.strip())
+                    if isinstance(item, list):
+                        # Nested pages format: each item is a page (list of blocks)
+                        for block in item:
+                            text = self._extract_text_from_mineru_block(block)
+                            if text:
+                                text_parts.append(text)
+                    elif isinstance(item, dict):
+                        # Could be a block directly (single-page) or flat format
+                        text = self._extract_text_from_mineru_block(item)
+                        if text:
+                            text_parts.append(text)
                     elif isinstance(item, str):
                         # Simple list format
-                        text_parts.append(item.strip())
+                        if item.strip():
+                            text_parts.append(item.strip())
 
                 if text_parts:
                     return '\n\n'.join(text_parts)
 
             # Fallback: try to extract any text-like content from dict
             if isinstance(data, dict):
-                # Look for any text content in the dict
                 for key in ['text', 'content', 'fulltext', 'body']:
                     if key in data and isinstance(data[key], str):
                         return data[key]
@@ -437,6 +451,49 @@ class LocalZoteroReader:
         except Exception as e:
             logger.warning(f"Failed to extract text from content_list.json: {e}")
             return ""
+
+    @staticmethod
+    def _extract_text_from_mineru_block(block: dict) -> str:
+        """Extract text from a single MinerU block.
+
+        A block has 'type' (paragraph, title, equation_interline, etc.) and
+        'content' which is a dict like:
+            {"paragraph_content": [{"type": "text", "content": "..."}]}
+
+        Also handles the flat format where text is directly in block['text'].
+        """
+        if not isinstance(block, dict):
+            return ""
+
+        # Skip non-text block types (headers, footers, page numbers)
+        block_type = block.get('type', '')
+        if block_type in ('page_header', 'page_footer', 'page_number'):
+            return ""
+
+        # Format 1: nested content dict (MinerU pages format)
+        content = block.get('content')
+        if isinstance(content, dict):
+            # The content dict has a single key like 'paragraph_content',
+            # 'title_content', etc. whose value is a list of text spans.
+            for key, spans in content.items():
+                if key == 'level':
+                    continue
+                if isinstance(spans, list):
+                    parts = []
+                    for span in spans:
+                        if isinstance(span, dict):
+                            t = span.get('content', '')
+                            if isinstance(t, str) and t.strip():
+                                parts.append(t.strip())
+                    if parts:
+                        return ' '.join(parts)
+
+        # Format 2: flat format with 'text' key
+        text = block.get('text', '')
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+        return ""
 
     def _extract_fulltext_for_item(self, item_id: int) -> tuple[str, str] | None:
         """Attempt to extract fulltext and source from the item's best attachment.
@@ -460,7 +517,9 @@ class LocalZoteroReader:
             # Priority 1: Check for content_list.json in the attachment folder
             if ctype == "application/pdf":
                 content_list = self._find_content_list_json(key, resolved)
+                logger.debug(f"Checking PDF attachment {key}: path={resolved}, content_list={content_list}")
                 if content_list and content_list.exists():
+                    logger.info(f"Found content_list.json: {content_list}")
                     if best_content_list_json is None:
                         best_content_list_json = content_list
                 if best_pdf is None:
@@ -475,6 +534,7 @@ class LocalZoteroReader:
                     best_html = resolved
 
         # Priority 1: Use content_list.json if available (highest quality)
+        logger.debug(f"best_content_list_json={best_content_list_json}, best_pdf={best_pdf}, best_html={best_html}")
         if best_content_list_json:
             text = self._extract_text_from_content_list_json(best_content_list_json)
             if text:
@@ -498,7 +558,8 @@ class LocalZoteroReader:
         return None
 
     def close(self):
-        """Close database connection."""
+        """Close database connection and worker pool."""
+        self._shutdown_pdf_pool()
         if self._connection:
             self._connection.close()
             self._connection = None
