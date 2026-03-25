@@ -473,10 +473,14 @@ class LocalZoteroReader:
         # Format 1: nested content dict (MinerU pages format)
         content = block.get('content')
         if isinstance(content, dict):
-            # The content dict has a single key like 'paragraph_content',
-            # 'title_content', etc. whose value is a list of text spans.
+            # Equation blocks: {"math_content": "LaTeX", "math_type": "latex"}
+            math = content.get('math_content')
+            if isinstance(math, str) and math.strip():
+                return f"$$ {math.strip()} $$"
+
+            # Text blocks: {"paragraph_content": [{"type": "text", "content": "..."}]}
             for key, spans in content.items():
-                if key == 'level':
+                if key in ('level', 'math_type', 'image_source'):
                     continue
                 if isinstance(spans, list):
                     parts = []
