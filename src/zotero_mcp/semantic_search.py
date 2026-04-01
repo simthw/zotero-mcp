@@ -764,6 +764,9 @@ class ZoteroSemanticSearch:
                 # Create document text and metadata
                 # Always include structured fields; append fulltext when available
                 fulltext = item.get("data", {}).get("fulltext", "")
+                # Guard: never store the PDF timeout sentinel in ChromaDB
+                if fulltext == "__EXTRACTION_TIMEOUT__":
+                    fulltext = ""
                 structured_text = self._create_document_text(item)
                 if fulltext.strip():
                     doc_text = (structured_text + "\n\n" + fulltext) if structured_text.strip() else fulltext
