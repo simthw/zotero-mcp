@@ -86,7 +86,23 @@ def get_item_fulltext(
         # Get item metadata in markdown format
         metadata = _client.format_item_metadata(item, include_abstract=True)
 
-        # In local mode, prefer direct local DB/storage extraction first.
+        # Get attachment details upfront — needed for Zotero index lookup.
+        attachment = _client.get_attachment_details(zot, item)
+
+        # Layer 1: Zotero full text index (fast, no timeout risk).
+        # Try this before local PDF extraction so MCP never blocks on a slow PDF.
+        if attachment:
+            ctx.info(f"Found attachment: {attachment.key} ({attachment.content_type})")
+            try:
+                full_text_data = zot.fulltext_item(attachment.key)
+                if full_text_data and "content" in full_text_data and full_text_data["content"]:
+                    ctx.info("Successfully retrieved full text from Zotero's index")
+                    return f"{metadata}\n\n---\n\n## Full Text\n\n{full_text_data['content']}"
+            except Exception as fulltext_error:
+                ctx.info(f"Couldn't retrieve indexed full text: {str(fulltext_error)}")
+
+        # Layer 2: local file extraction (PDF/HTML/content_list.json).
+        # In local mode, try direct extraction from the attachment directory.
         # This avoids pyzotero dump() failures on linked file:// attachments
         # when using remote clients over SSE/HTTP.
         local_extract_error_msg = None
@@ -98,6 +114,7 @@ def get_item_fulltext(
                 zotero_db_path = None
                 pdf_max_pages = None
                 fulltext_display_max = None
+                pdf_timeout = None
 
                 if config_path.exists():
                     try:
@@ -107,6 +124,7 @@ def get_item_fulltext(
                             zotero_db_path = semantic_cfg.get("zotero_db_path")
                             extraction_cfg = semantic_cfg.get("extraction", {})
                             pdf_max_pages = extraction_cfg.get("pdf_max_pages")
+                            pdf_timeout = extraction_cfg.get("pdf_timeout")
                             # Separate display limit for when Claude reads papers
                             # (reduces token usage vs. indexing which can be higher)
                             fulltext_display_max = extraction_cfg.get(
@@ -123,33 +141,22 @@ def get_item_fulltext(
                 elif pdf_max_pages is None:
                     pdf_max_pages = DEFAULT_FULLTEXT_DISPLAY_MAX
 
-                with LocalZoteroReader(db_path=zotero_db_path, pdf_max_pages=pdf_max_pages) as reader:
+                with LocalZoteroReader(db_path=zotero_db_path, pdf_max_pages=pdf_max_pages, pdf_timeout=pdf_timeout or 30) as reader:
                     local_item = reader.get_item_by_key(item_key)
                     if local_item:
                         extracted = reader.extract_fulltext_for_item(local_item.item_id)
-                        if extracted and extracted[0]:
+                        if extracted and extracted[0] and extracted[1] != "timeout":
                             source = extracted[1] if len(extracted) > 1 else "file"
                             ctx.info(f"Retrieved full text from local storage ({source})")
                             return f"{metadata}\n\n---\n\n## Full Text\n\n{extracted[0]}"
+                        elif extracted and extracted[1] == "timeout":
+                            ctx.warning(f"PDF extraction timed out for item {item_key}, falling back to dump+convert")
         except Exception as local_extract_error:
             local_extract_error_msg = str(local_extract_error)
             ctx.info(f"Local extraction fallback not available: {str(local_extract_error)}")
 
-        # Try to get attachment details
-        attachment = _client.get_attachment_details(zot, item)
         if not attachment:
             return f"{metadata}\n\n---\n\nNo suitable attachment found for this item."
-
-        ctx.info(f"Found attachment: {attachment.key} ({attachment.content_type})")
-
-        # Try fetching full text from Zotero's full text index first
-        try:
-            full_text_data = zot.fulltext_item(attachment.key)
-            if full_text_data and "content" in full_text_data and full_text_data["content"]:
-                ctx.info("Successfully retrieved full text from Zotero's index")
-                return f"{metadata}\n\n---\n\n## Full Text\n\n{full_text_data['content']}"
-        except Exception as fulltext_error:
-            ctx.info(f"Couldn't retrieve indexed full text: {str(fulltext_error)}")
 
         # If we couldn't get indexed full text, try to download and convert the file
         try:
