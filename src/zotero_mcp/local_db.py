@@ -499,17 +499,33 @@ class LocalZoteroReader:
 
         return ""
 
+    def _read_zotero_ft_cache(self, cache_path: Path) -> str:
+        """Read Zotero's pre-built full text cache file (.zotero-ft-cache).
+
+        Zotero writes this file when it indexes an attachment.  Reading it is
+        instant (pure file I/O) and avoids PDF extraction timeouts entirely.
+        Returns the text, or empty string on failure.
+        """
+        try:
+            return cache_path.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception as e:
+            logger.debug(f"Could not read .zotero-ft-cache at {cache_path}: {e}")
+            return ""
+
     def _extract_fulltext_for_item(self, item_id: int) -> tuple[str, str] | None:
         """Attempt to extract fulltext and source from the item's best attachment.
 
         Priority order:
         1. content_list.json (MinerU format) - highest quality structured text
-        2. PDF - extract text using pdfminer
-        3. HTML - extract text using markitdown/BeautifulSoup
+        2. .zotero-ft-cache - Zotero's pre-built index (instant, no timeout risk)
+        3. PDF - extract text using pdfminer
+        4. HTML - extract text using markitdown/BeautifulSoup
 
-        Returns (text, source) where source is 'content_list_json', 'pdf', or 'html'.
+        Returns (text, source) where source is 'content_list_json', 'zotero_cache',
+        'pdf', or 'html'.
         """
         best_content_list_json = None
+        best_ft_cache = None
         best_pdf = None
         best_html = None
 
@@ -526,6 +542,10 @@ class LocalZoteroReader:
                     logger.info(f"Found content_list.json: {content_list}")
                     if best_content_list_json is None:
                         best_content_list_json = content_list
+                # Priority 2: .zotero-ft-cache alongside the PDF
+                ft_cache = resolved.parent / ".zotero-ft-cache"
+                if ft_cache.exists() and best_ft_cache is None:
+                    best_ft_cache = ft_cache
                 if best_pdf is None:
                     best_pdf = resolved
             elif (ctype or "").startswith("text/html"):
@@ -538,14 +558,21 @@ class LocalZoteroReader:
                     best_html = resolved
 
         # Priority 1: Use content_list.json if available (highest quality)
-        logger.debug(f"best_content_list_json={best_content_list_json}, best_pdf={best_pdf}, best_html={best_html}")
+        logger.debug(f"best_content_list_json={best_content_list_json}, best_ft_cache={best_ft_cache}, best_pdf={best_pdf}, best_html={best_html}")
         if best_content_list_json:
             text = self._extract_text_from_content_list_json(best_content_list_json)
             if text:
                 logger.info(f"Using content_list.json for item {item_id}: {best_content_list_json}")
                 return (text, "content_list_json")
 
-        # Priority 2: Use PDF
+        # Priority 2: Use Zotero's pre-built full text cache (instant, no timeout risk)
+        if best_ft_cache:
+            text = self._read_zotero_ft_cache(best_ft_cache)
+            if text:
+                logger.info(f"Using .zotero-ft-cache for item {item_id}: {best_ft_cache}")
+                return (text, "zotero_cache")
+
+        # Priority 3: Use PDF
         if best_pdf:
             text = self._extract_text_from_file(best_pdf)
             if text == _EXTRACTION_TIMEOUT:
@@ -553,7 +580,7 @@ class LocalZoteroReader:
             if text:
                 return (text, "pdf")
 
-        # Priority 3: Use HTML
+        # Priority 4: Use HTML
         if best_html:
             text = self._extract_text_from_file(best_html)
             if text:
@@ -781,8 +808,8 @@ class LocalZoteroReader:
                 title=row['title'],
                 abstract=row['abstract'],
                 creators=row['creators'],
-                fulltext=(res := (self._extract_fulltext_for_item(row['itemID']) if include_fulltext else None)) and res[0],
-                fulltext_source=res[1] if include_fulltext and res else None,
+                fulltext=(res := (self._extract_fulltext_for_item(row['itemID']) if include_fulltext else None)) and (res[0] if res[1] != "timeout" else None),
+                fulltext_source=res[1] if include_fulltext and res and res[1] != "timeout" else None,
                 notes=row['notes'],
                 extra=row['extra'],
                 date_added=row['dateAdded'],
