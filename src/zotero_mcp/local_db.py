@@ -15,7 +15,7 @@ from typing import Any
 from dataclasses import dataclass
 from urllib.parse import urlparse, unquote
 
-from .utils import is_local_mode
+from .utils import is_local_mode, _normalize_for_search
 
 logger = logging.getLogger(__name__)
 
@@ -23,14 +23,15 @@ logger = logging.getLogger(__name__)
 _EXTRACTION_TIMEOUT = "__EXTRACTION_TIMEOUT__"
 
 
-def _extract_pdf_worker(file_path: str, maxpages: int, result_queue=None):
-    """Worker: extract text from a PDF in a separate process.
+def _extract_pdf_worker(file_path: str, maxpages: int, result_queue):
+    """Legacy worker — kept for backward compatibility but no longer used.
 
-    When called via ProcessPoolExecutor (result_queue is None) the text is
-    returned directly.  The legacy Queue path is kept for compatibility.
+    The actual extraction now uses subprocess.run (see _extract_text_from_pdf)
+    to avoid a deadlock on macOS where multiprocessing's 'spawn' start method
+    re-imports the zotero_mcp package, triggering FastMCP server initialization
+    in the child process. See https://github.com/54yyyu/zotero-mcp/issues/178
     """
     try:
-        # Suppress pdfminer warnings about malformed PDF color spaces, fonts, etc.
         import logging as _logging
         _logging.getLogger("pdfminer").setLevel(_logging.ERROR)
 
@@ -43,6 +44,7 @@ def _extract_pdf_worker(file_path: str, maxpages: int, result_queue=None):
         if result_queue is not None:
             result_queue.put("")
         return ""
+
 
 
 @dataclass
@@ -117,7 +119,6 @@ class LocalZoteroReader:
         self._connection: sqlite3.Connection | None = None
         self.pdf_max_pages: int | None = pdf_max_pages
         self.pdf_timeout: int = pdf_timeout
-        self._pdf_pool = None  # Lazy-initialized ProcessPoolExecutor
         # Reduce noise from pdfminer warnings
         try:
             logging.getLogger("pdfminer").setLevel(logging.ERROR)
@@ -262,21 +263,22 @@ class LocalZoteroReader:
 
         return None
 
-    def _get_pdf_pool(self):
-        """Lazily create a single-worker ProcessPoolExecutor for PDF extraction."""
-        if self._pdf_pool is None:
-            from concurrent.futures import ProcessPoolExecutor
-            self._pdf_pool = ProcessPoolExecutor(max_workers=1)
-        return self._pdf_pool
-
     def _extract_text_from_pdf(self, file_path: Path) -> str:
-        """Extract text from a PDF using pdfminer in a persistent worker process.
+        """Extract text from a PDF using pdfminer in a subprocess with timeout.
 
-        Uses a single reusable worker process to avoid the per-PDF spawn
-        overhead on Windows.  Returns the extracted text, empty string on
-        failure, or _EXTRACTION_TIMEOUT sentinel on timeout.
+        Uses subprocess.run instead of multiprocessing.Process to avoid a
+        deadlock on macOS: multiprocessing's 'spawn' start method re-imports
+        the zotero_mcp package in the child process, which triggers FastMCP
+        server initialization and blocks forever. subprocess.run starts a
+        clean Python process that only imports pdfminer.
+
+        See: https://github.com/54yyyu/zotero-mcp/issues/178
+
+        Returns the extracted text, empty string on failure, or
+        _EXTRACTION_TIMEOUT sentinel if the process was killed due to timeout.
         """
-        from concurrent.futures import TimeoutError as FuturesTimeout
+        import subprocess
+        import sys
 
         # Page limit (preserve existing fallback chain)
         if isinstance(self.pdf_max_pages, int) and self.pdf_max_pages > 0:
@@ -290,31 +292,37 @@ class LocalZoteroReader:
 
         timeout = self.pdf_timeout or 30
 
+        # Inline pdfminer script — imports ONLY pdfminer, not zotero_mcp,
+        # so the child process never triggers FastMCP initialization.
+        script = (
+            "import sys, logging; "
+            "logging.getLogger('pdfminer').setLevel(logging.ERROR); "
+            "from pdfminer.high_level import extract_text; "
+            "sys.stdout.write(extract_text(sys.argv[1], maxpages=int(sys.argv[2])) or '')"
+        )
+
         try:
-            pool = self._get_pdf_pool()
-            future = pool.submit(_extract_pdf_worker, str(file_path), maxpages)
-            text = future.result(timeout=timeout)
-            return text or ""
-        except FuturesTimeout:
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(file_path), str(maxpages)],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if result.returncode == 0:
+                return result.stdout
+            logger.warning(
+                f"PDF extraction failed (exit {result.returncode}): {file_path.name}: "
+                f"{result.stderr[:200] if result.stderr else 'no error output'}"
+            )
+            return ""
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(f"\r{' ' * 120}\r")  # Clear progress line before warning
             logger.warning(f"PDF extraction timed out after {timeout}s: {file_path.name}")
-            # The worker is stuck; kill the pool so the next call gets a fresh one.
-            self._shutdown_pdf_pool(kill=True)
             return _EXTRACTION_TIMEOUT
         except Exception as e:
+            sys.stderr.write(f"\r{' ' * 120}\r")  # Clear progress line before warning
             logger.warning(f"PDF extraction failed: {file_path.name}: {e}")
             return ""
-
-    def _shutdown_pdf_pool(self, kill: bool = False):
-        """Shutdown the PDF worker pool."""
-        if self._pdf_pool is not None:
-            try:
-                if kill:
-                    self._pdf_pool.shutdown(wait=False, cancel_futures=True)
-                else:
-                    self._pdf_pool.shutdown(wait=False)
-            except Exception:
-                pass
-            self._pdf_pool = None
 
     def _extract_text_from_html(self, file_path: Path) -> str:
         """Extract text from HTML using markitdown if available; fallback to stripping tags."""
@@ -589,8 +597,7 @@ class LocalZoteroReader:
         return None
 
     def close(self):
-        """Close database connection and worker pool."""
-        self._shutdown_pdf_pool()
+        """Close database connection."""
         if self._connection:
             self._connection.close()
             self._connection = None
@@ -711,6 +718,7 @@ class LocalZoteroReader:
             FROM items i
             JOIN itemTypes it ON i.itemTypeID = it.itemTypeID
             WHERE it.typeName NOT IN ('attachment', 'note', 'annotation')
+            AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
             """
         )
         return cursor.fetchone()[0]
@@ -778,6 +786,7 @@ class LocalZoteroReader:
         LEFT JOIN creators c ON ic.creatorID = c.creatorID
 
         WHERE it.typeName NOT IN ('attachment', 'note', 'annotation')
+        AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
         """
 
         params = []
@@ -892,10 +901,10 @@ class LocalZoteroReader:
         items = self.get_items_with_text()
         matching_items = []
 
-        query_lower = query.lower()
+        query_lower = _normalize_for_search(query).lower()
 
         for item in items:
-            searchable_text = item.get_searchable_text().lower()
+            searchable_text = _normalize_for_search(item.get_searchable_text()).lower()
             if query_lower in searchable_text:
                 matching_items.append(item)
                 if len(matching_items) >= limit:

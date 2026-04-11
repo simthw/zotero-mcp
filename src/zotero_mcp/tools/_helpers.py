@@ -79,7 +79,12 @@ def _get_write_client(ctx):
         override = _client.get_active_library()
         if override:
             web_zot.library_id = override.get("library_id", web_zot.library_id)
-            web_zot.library_type = override.get("library_type", web_zot.library_type)
+            # pyzotero stores library_type with trailing "s" (e.g. "users", "groups")
+            # but the override stores the raw value (e.g. "user", "group"),
+            # so we must append "s" to match pyzotero's internal convention.
+            raw_type = override.get("library_type")
+            if raw_type:
+                web_zot.library_type = raw_type if raw_type.endswith("s") else raw_type + "s"
         return read_zot, web_zot
     raise ValueError(
         "Cannot perform write operations in local-only mode. "
@@ -157,7 +162,7 @@ def _resolve_collection_names(zot, names, ctx=None):
         if not matches:
             raise ValueError(f"No collection found matching name '{name}'")
         if len(matches) > 1 and ctx is not None:
-            ctx.warn(
+            ctx.warning(
                 f"Multiple collections match '{name}': {matches}. "
                 "Using all. Pass collection keys directly to disambiguate."
             )
@@ -470,3 +475,22 @@ def _format_bbt_result(bbt_item: dict, citekey: str) -> str:
         "",
     ]
     return "\n".join(output)
+
+
+# ---------------------------------------------------------------------------
+# Token estimation helpers
+# ---------------------------------------------------------------------------
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate at ~4 characters per token."""
+    return len(text) // 4
+
+
+def _prepend_size_warning(text: str, suggestions: str = "") -> str:
+    """If text exceeds ~5K tokens, prepend a size warning header."""
+    est = _estimate_tokens(text)
+    if est < 5000:
+        return text
+    suggestion_text = f" {suggestions}" if suggestions else ""
+    warning = f"*Response size: ~{est // 1000}K tokens.{suggestion_text}*\n\n"
+    return warning + text
