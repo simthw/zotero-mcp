@@ -1061,9 +1061,59 @@ class ZoteroSemanticSearch:
                 "error": str(e)
             }
 
+    @staticmethod
+    def _chroma_meta_to_zotero_dict(item_key: str, meta: dict[str, Any]) -> dict[str, Any]:
+        """Rebuild a pyzotero-shaped item dict from ChromaDB metadata.
+
+        Every field needed to render a search result (title, creators, date,
+        publication, tags, DOI, url, item type) is already persisted in the
+        ChromaDB collection at indexing time by ``_create_metadata``. Returning
+        a dict shaped like pyzotero's ``{"key": ..., "data": {...}}`` lets
+        ``format_item_result`` render it verbatim with zero external I/O.
+
+        ``creators`` was persisted as a single pre-formatted string (e.g.
+        ``"Smith, John; Doe, Jane"``); ``format_creators`` in utils.py accepts
+        plain strings inside the list, so we wrap it as a one-element list.
+        ``tags`` was persisted as a space-joined string; we split it back.
+        """
+        creators_str = meta.get("creators", "") or ""
+        tags_raw = meta.get("tags", "") or ""
+        tags = [{"tag": t} for t in tags_raw.split(" ") if t]
+
+        data = {
+            "key": item_key,
+            "itemType": meta.get("item_type", "") or "",
+            "title": meta.get("title", "") or "",
+            "date": meta.get("date", "") or "",
+            "dateAdded": meta.get("date_added", "") or "",
+            "dateModified": meta.get("date_modified", "") or "",
+            "creators": [creators_str] if creators_str else [],
+            "publicationTitle": meta.get("publication", "") or "",
+            "url": meta.get("url", "") or "",
+            "DOI": meta.get("doi", "") or "",
+            "tags": tags,
+            # abstractNote is intentionally empty — the abstract is embedded
+            # inside the document text (available via matched_text). Leaving
+            # this blank avoids a Zotero API round-trip.
+            "abstractNote": "",
+        }
+        return {"key": item_key, "data": data}
+
     def _enrich_search_results(self, chroma_results: dict[str, Any], query: str) -> list[dict[str, Any]]:
-        """Enrich ChromaDB results with full Zotero item data."""
-        enriched = []
+        """Build search results purely from ChromaDB data — no Zotero I/O.
+
+        ChromaDB already stores every field required to render a result
+        (title, creators, date, publication, tags, DOI, url, item type in
+        ``metadatas``; the full embedded text in ``documents``). The previous
+        implementation issued one ``zotero_client.item(key)`` HTTP request per
+        result, which saturated the local Zotero HTTP server (port 23119) and
+        produced ``502 Bad Gateway`` errors at even modest result counts.
+
+        Semantic search is self-contained inside Chroma by design; enrichment
+        should be too. If the caller needs the full Zotero item later, they
+        can request it explicitly via ``zotero_get_item_metadata``.
+        """
+        enriched: list[dict[str, Any]] = []
 
         if not chroma_results.get("ids") or not chroma_results["ids"][0]:
             return enriched
@@ -1074,32 +1124,20 @@ class ZoteroSemanticSearch:
         metadatas = chroma_results.get("metadatas", [[]])[0]
 
         for i, item_key in enumerate(ids):
-            try:
-                # Get full item data from Zotero
-                zotero_item = self.zotero_client.item(item_key)
+            meta = metadatas[i] if i < len(metadatas) else {}
+            similarity_score = 1 - distances[i] if i < len(distances) else 0
+            matched_text = documents[i] if i < len(documents) else ""
 
-                enriched_result = {
-                    "item_key": item_key,
-                    "similarity_score": 1 - distances[i] if i < len(distances) else 0,
-                    "matched_text": documents[i] if i < len(documents) else "",
-                    "metadata": metadatas[i] if i < len(metadatas) else {},
-                    "zotero_item": zotero_item,
-                    "query": query
-                }
+            zotero_item = self._chroma_meta_to_zotero_dict(item_key, meta or {})
 
-                enriched.append(enriched_result)
-
-            except Exception as e:
-                logger.error(f"Error enriching result for item {item_key}: {e}")
-                # Include basic result even if enrichment fails
-                enriched.append({
-                    "item_key": item_key,
-                    "similarity_score": 1 - distances[i] if i < len(distances) else 0,
-                    "matched_text": documents[i] if i < len(documents) else "",
-                    "metadata": metadatas[i] if i < len(metadatas) else {},
-                    "query": query,
-                    "error": f"Could not fetch full item data: {e}"
-                })
+            enriched.append({
+                "item_key": item_key,
+                "similarity_score": similarity_score,
+                "matched_text": matched_text,
+                "metadata": meta,
+                "zotero_item": zotero_item,
+                "query": query,
+            })
 
         return enriched
 

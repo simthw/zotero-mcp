@@ -42,6 +42,58 @@ def get_item_metadata(
     _ret_logger = _logging.getLogger("zotero_mcp.retrieval")
     try:
         ctx.info(f"Fetching metadata for item {item_key} in {format} format")
+
+        # Local mode fast path: read metadata from Zotero's SQLite DB directly.
+        # BibTeX export still needs Zotero running (Better BibTeX or API), so we
+        # only take this path for the markdown format.
+        if _utils.is_local_mode() and format != "bibtex":
+            try:
+                from zotero_mcp.local_db import LocalZoteroReader
+
+                config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
+                zotero_db_path = None
+                if config_path.exists():
+                    try:
+                        with open(config_path, encoding="utf-8") as _f:
+                            zotero_db_path = (
+                                json.load(_f)
+                                .get("semantic_search", {})
+                                .get("zotero_db_path")
+                            )
+                    except Exception:
+                        pass
+
+                with LocalZoteroReader(db_path=zotero_db_path) as reader:
+                    local_item = reader.get_item_by_key(item_key)
+                    if local_item:
+                        md_lines = [
+                            f"# {local_item.title or 'Untitled'}",
+                            f"**Type:** {local_item.item_type or 'unknown'}",
+                            f"**Item Key:** {local_item.key}",
+                        ]
+                        if local_item.creators:
+                            md_lines.append(f"**Authors:** {local_item.creators}")
+                        if local_item.doi:
+                            md_lines.append(f"**DOI:** {local_item.doi}")
+                        if local_item.date_added:
+                            md_lines.append(f"**Added:** {local_item.date_added}")
+                        if local_item.date_modified:
+                            md_lines.append(f"**Modified:** {local_item.date_modified}")
+                        if include_abstract and local_item.abstract:
+                            md_lines.extend(["", "## Abstract", local_item.abstract])
+                        if local_item.extra:
+                            md_lines.extend(["", "## Extra", local_item.extra])
+                        _ret_logger.debug(
+                            f"[METADATA] SQLite fast-path for {item_key} (no HTTP API)"
+                        )
+                        return "\n\n".join(md_lines)
+                    # Item not in local DB — fall through to HTTP API
+                    ctx.info(
+                        f"Item {item_key} not in local SQLite; falling back to HTTP API"
+                    )
+            except Exception as local_err:
+                ctx.info(f"Local metadata fast-path failed: {local_err}")
+
         zot = _client.get_zotero_client()
 
         t0 = _time.monotonic()
@@ -81,40 +133,23 @@ def get_item_fulltext(
     """
     try:
         ctx.info(f"Fetching full text for item {item_key}")
-        zot = _client.get_zotero_client()
 
-        # First get the item metadata
-        item = zot.item(item_key)
-        if not item:
-            return f"No item found with key: {item_key}"
-
-        # Get item metadata in markdown format
-        metadata = _client.format_item_metadata(item, include_abstract=True)
-
-        # Get attachment details upfront — needed for Zotero index lookup.
-        attachment = _client.get_attachment_details(zot, item)
-
-        # Layer 1: Zotero full text index (fast, no timeout risk).
-        # Try this before local PDF extraction so MCP never blocks on a slow PDF.
-        if attachment:
-            ctx.info(f"Found attachment: {attachment.key} ({attachment.content_type})")
-            try:
-                full_text_data = zot.fulltext_item(attachment.key)
-                if full_text_data and "content" in full_text_data and full_text_data["content"]:
-                    ctx.info("Successfully retrieved full text from Zotero's index")
-                    return f"{metadata}\n\n---\n\n## Full Text\n\n{full_text_data['content']}"
-            except Exception as fulltext_error:
-                ctx.info(f"Couldn't retrieve indexed full text: {str(fulltext_error)}")
-
-        # Layer 2: local file extraction (PDF/HTML/content_list.json).
-        # In local mode, try direct extraction from the attachment directory.
-        # This avoids pyzotero dump() failures on linked file:// attachments
-        # when using remote clients over SSE/HTTP.
+        # ------------------------------------------------------------------
+        # Layer 0 (LOCAL MODE FAST PATH): read metadata + fulltext straight
+        # from the Zotero SQLite DB and on-disk .zotero-ft-cache /
+        # content_list.json / PDF, bypassing the Zotero HTTP API entirely.
+        #
+        # The local Zotero HTTP server (port 23119) has very low concurrency
+        # and frequently returns 502 Bad Gateway when called repeatedly for
+        # item metadata, children (attachments), or fulltext_item() lookups.
+        # Since we already have the SQLite DB and .zotero-ft-cache files on
+        # disk, there's no reason to hit the HTTP server at all in local mode.
+        # ------------------------------------------------------------------
         local_extract_error_msg = None
-        try:
-            from zotero_mcp.local_db import LocalZoteroReader
+        if _utils.is_local_mode():
+            try:
+                from zotero_mcp.local_db import LocalZoteroReader
 
-            if _utils.is_local_mode():
                 config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
                 zotero_db_path = None
                 pdf_max_pages = None
@@ -130,50 +165,111 @@ def get_item_fulltext(
                             extraction_cfg = semantic_cfg.get("extraction", {})
                             pdf_max_pages = extraction_cfg.get("pdf_max_pages")
                             pdf_timeout = extraction_cfg.get("pdf_timeout")
-                            # Separate display limit for when Claude reads papers
-                            # (reduces token usage vs. indexing which can be higher)
                             fulltext_display_max = extraction_cfg.get(
                                 "fulltext_display_max_pages"
                             )
                     except Exception:
                         pass
 
-                # Use display limit if configured, otherwise fall back to
-                # pdf_max_pages, with a default cap of 10 pages.
                 DEFAULT_FULLTEXT_DISPLAY_MAX = 10
                 if fulltext_display_max is not None:
                     pdf_max_pages = fulltext_display_max
                 elif pdf_max_pages is None:
                     pdf_max_pages = DEFAULT_FULLTEXT_DISPLAY_MAX
 
-                with LocalZoteroReader(db_path=zotero_db_path, pdf_max_pages=pdf_max_pages, pdf_timeout=pdf_timeout or 30) as reader:
+                with LocalZoteroReader(
+                    db_path=zotero_db_path,
+                    pdf_max_pages=pdf_max_pages,
+                    pdf_timeout=pdf_timeout or 30,
+                ) as reader:
                     local_item = reader.get_item_by_key(item_key)
                     if local_item:
+                        # Build metadata markdown directly from SQLite row — no API call.
+                        md_lines = [
+                            f"# {local_item.title or 'Untitled'}",
+                            f"**Type:** {local_item.item_type or 'unknown'}",
+                            f"**Item Key:** {local_item.key}",
+                        ]
+                        if local_item.creators:
+                            md_lines.append(f"**Authors:** {local_item.creators}")
+                        if local_item.doi:
+                            md_lines.append(f"**DOI:** {local_item.doi}")
+                        if local_item.date_added:
+                            md_lines.append(f"**Added:** {local_item.date_added}")
+                        if local_item.abstract:
+                            md_lines.extend(["", "## Abstract", local_item.abstract])
+                        metadata = "\n\n".join(md_lines)
+
                         extracted = reader.extract_fulltext_for_item(local_item.item_id)
                         if extracted and extracted[0]:
-                            # Skip timeout sentinel — don't show "__EXTRACTION_TIMEOUT__" as content
-                            if isinstance(extracted, tuple) and len(extracted) >= 2 and extracted[1] == "timeout":
-                                ctx.info("PDF extraction timed out — skipping local fulltext")
-                            else:
-                                source = extracted[1] if len(extracted) > 1 else "file"
-                                ctx.info(f"Retrieved full text from local storage ({source})")
-                                return _helpers._prepend_size_warning(
-                                    f"{metadata}\n\n---\n\n## Full Text\n\n{extracted[0]}",
-                                    "Consider using zotero_semantic_search to find specific content instead of reading full papers."
+                            if (
+                                isinstance(extracted, tuple)
+                                and len(extracted) >= 2
+                                and extracted[1] == "timeout"
+                            ):
+                                ctx.info("PDF extraction timed out — returning metadata only")
+                                return (
+                                    f"{metadata}\n\n---\n\n"
+                                    "Full text extraction timed out. Try zotero_semantic_search "
+                                    "to retrieve relevant passages instead."
                                 )
-        except Exception as local_extract_error:
-            local_extract_error_msg = str(local_extract_error)
-            ctx.info(f"Local extraction fallback not available: {str(local_extract_error)}")
+                            source = extracted[1] if len(extracted) > 1 else "file"
+                            ctx.info(
+                                f"Retrieved full text from local storage ({source}) — no HTTP API call"
+                            )
+                            return _helpers._prepend_size_warning(
+                                f"{metadata}\n\n---\n\n## Full Text\n\n{extracted[0]}",
+                                "Consider using zotero_semantic_search to find specific content instead of reading full papers.",
+                            )
+
+                        # No local fulltext source (no .zotero-ft-cache / PDF / HTML)
+                        ctx.info(
+                            "No local fulltext source found; returning SQLite metadata only"
+                        )
+                        return (
+                            f"{metadata}\n\n---\n\n"
+                            "No local full-text source (.zotero-ft-cache, content_list.json, or "
+                            "PDF/HTML) is available for this item. Try opening it in Zotero so "
+                            "indexing can run, or rely on zotero_semantic_search over the "
+                            "abstract."
+                        )
+                    # else: item not in local DB → fall through to HTTP API below
+                    ctx.info(
+                        f"Item {item_key} not found in local SQLite; falling back to HTTP API"
+                    )
+            except Exception as local_extract_error:
+                local_extract_error_msg = str(local_extract_error)
+                ctx.info(f"Local fast-path failed, falling back to HTTP API: {local_extract_error_msg}")
+
+        # ------------------------------------------------------------------
+        # Layer 1 (REMOTE / HTTP FALLBACK): original API-based path.
+        # Only used when local mode is off or the local fast-path couldn't
+        # find the item.
+        # ------------------------------------------------------------------
+        zot = _client.get_zotero_client()
+
+        item = zot.item(item_key)
+        if not item:
+            return f"No item found with key: {item_key}"
+
+        metadata = _client.format_item_metadata(item, include_abstract=True)
+        attachment = _client.get_attachment_details(zot, item)
+
+        if attachment:
+            ctx.info(f"Found attachment: {attachment.key} ({attachment.content_type})")
+            try:
+                full_text_data = zot.fulltext_item(attachment.key)
+                if full_text_data and "content" in full_text_data and full_text_data["content"]:
+                    ctx.info("Successfully retrieved full text from Zotero's index")
+                    return f"{metadata}\n\n---\n\n## Full Text\n\n{full_text_data['content']}"
+            except Exception as fulltext_error:
+                ctx.info(f"Couldn't retrieve indexed full text: {str(fulltext_error)}")
 
         if not attachment:
             return f"{metadata}\n\n---\n\nNo suitable attachment found for this item."
 
-        # If we couldn't get indexed full text, try to download and convert the file
         try:
             ctx.info(f"Attempting to download and convert attachment {attachment.key}")
-
-            # Download the file to a temporary location
-
             with tempfile.TemporaryDirectory() as tmpdir:
                 file_path = os.path.join(tmpdir, attachment.filename or f"{attachment.key}.pdf")
                 zot.dump(attachment.key, filename=os.path.basename(file_path), path=tmpdir)
