@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -137,3 +138,162 @@ class TestResolveAttachmentPath:
         """Unknown path format returns None."""
         reader = self._make_reader(tmp_path)
         assert reader._resolve_attachment_path("X", "ftp://something") is None
+
+
+class TestFetchCreatorsForItems:
+    """Tests for _fetch_creators_for_items ordering and type filtering.
+
+    These tests build a minimal Zotero-schema SQLite fixture in-memory, so
+    they validate the actual SQL (ORDER BY orderIndex, creatorType filter)
+    without requiring a real Zotero installation.
+    """
+
+    def _make_conn(self) -> sqlite3.Connection:
+        """Build an in-memory DB with the subset of Zotero's schema we query."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE creators (
+                creatorID INTEGER PRIMARY KEY,
+                firstName TEXT,
+                lastName TEXT,
+                fieldMode INTEGER DEFAULT 0
+            );
+            CREATE TABLE creatorTypes (
+                creatorTypeID INTEGER PRIMARY KEY,
+                creatorType TEXT NOT NULL
+            );
+            CREATE TABLE itemCreators (
+                itemID INTEGER NOT NULL,
+                creatorID INTEGER NOT NULL,
+                creatorTypeID INTEGER NOT NULL,
+                orderIndex INTEGER NOT NULL,
+                PRIMARY KEY (itemID, creatorID, creatorTypeID)
+            );
+            INSERT INTO creatorTypes (creatorTypeID, creatorType) VALUES
+                (1, 'author'),
+                (2, 'editor'),
+                (3, 'translator');
+            """
+        )
+        return conn
+
+    def _make_reader(self, conn: sqlite3.Connection) -> LocalZoteroReader:
+        reader = FakeLocalZoteroReader()
+        reader._connection = conn
+        # Bind the real methods we want to test
+        reader._fetch_creators_for_items = (
+            LocalZoteroReader._fetch_creators_for_items.__get__(reader)
+        )
+        reader._get_connection = lambda: conn
+        return reader
+
+    def test_preserves_order_index(self):
+        """Creators must come back in orderIndex order, not insertion order."""
+        conn = self._make_conn()
+        # Insert creators and itemCreators rows in a scrambled order —
+        # a buggy implementation that relies on row order would fail.
+        conn.executescript(
+            """
+            INSERT INTO creators VALUES (10, 'Robert A.', 'Spicer', 0);
+            INSERT INTO creators VALUES (20, 'Hong',      'Wang',   0);
+            INSERT INTO creators VALUES (30, 'De-Zhu',    'Li',     0);
+            INSERT INTO creators VALUES (40, 'Jie',       'Liu',    0);
+
+            -- Deliberately inserted out of orderIndex sequence:
+            INSERT INTO itemCreators (itemID, creatorID, creatorTypeID, orderIndex)
+                VALUES (100, 30, 1, 13);  -- Li, De-Zhu     (last author)
+            INSERT INTO itemCreators (itemID, creatorID, creatorTypeID, orderIndex)
+                VALUES (100, 20, 1, 0);   -- Wang, Hong     (first author)
+            INSERT INTO itemCreators (itemID, creatorID, creatorTypeID, orderIndex)
+                VALUES (100, 40, 1, 3);   -- Liu, Jie
+            INSERT INTO itemCreators (itemID, creatorID, creatorTypeID, orderIndex)
+                VALUES (100, 10, 1, 1);   -- Spicer, Robert A.
+            """
+        )
+        conn.commit()
+
+        reader = self._make_reader(conn)
+        result = reader._fetch_creators_for_items([100])
+
+        assert result == {
+            100: "Wang, Hong; Spicer, Robert A.; Liu, Jie; Li, De-Zhu"
+        }
+
+    def test_filters_to_authors_by_default(self):
+        """Editors and translators must be excluded when caller requests authors."""
+        conn = self._make_conn()
+        conn.executescript(
+            """
+            INSERT INTO creators VALUES (1, 'Alice',  'Author', 0);
+            INSERT INTO creators VALUES (2, 'Bob',    'Editor', 0);
+            INSERT INTO creators VALUES (3, 'Carol',  'Trans',  0);
+
+            INSERT INTO itemCreators VALUES (200, 1, 1, 0);  -- author
+            INSERT INTO itemCreators VALUES (200, 2, 2, 1);  -- editor (drop)
+            INSERT INTO itemCreators VALUES (200, 3, 3, 2);  -- translator (drop)
+            """
+        )
+        conn.commit()
+
+        reader = self._make_reader(conn)
+        result = reader._fetch_creators_for_items([200])
+
+        assert result == {200: "Author, Alice"}
+
+    def test_institutional_single_field_name(self):
+        """fieldMode=1 means lastName holds the full institutional name."""
+        conn = self._make_conn()
+        conn.executescript(
+            """
+            INSERT INTO creators VALUES
+                (1, NULL, 'World Health Organization', 1);
+            INSERT INTO itemCreators VALUES (300, 1, 1, 0);
+            """
+        )
+        conn.commit()
+
+        reader = self._make_reader(conn)
+        result = reader._fetch_creators_for_items([300])
+
+        assert result == {300: "World Health Organization"}
+
+    def test_multiple_items_grouped_separately(self):
+        """Each itemID should get its own ordered creator list."""
+        conn = self._make_conn()
+        conn.executescript(
+            """
+            INSERT INTO creators VALUES (1, 'A', 'Alpha', 0);
+            INSERT INTO creators VALUES (2, 'B', 'Beta',  0);
+            INSERT INTO creators VALUES (3, 'C', 'Gamma', 0);
+
+            INSERT INTO itemCreators VALUES (1, 1, 1, 0);
+            INSERT INTO itemCreators VALUES (1, 2, 1, 1);
+            INSERT INTO itemCreators VALUES (2, 3, 1, 0);
+            INSERT INTO itemCreators VALUES (2, 1, 1, 1);
+            """
+        )
+        conn.commit()
+
+        reader = self._make_reader(conn)
+        result = reader._fetch_creators_for_items([1, 2])
+
+        assert result == {
+            1: "Alpha, A; Beta, B",
+            2: "Gamma, C; Alpha, A",
+        }
+
+    def test_empty_input_returns_empty(self):
+        """No item IDs → empty dict, no query executed."""
+        conn = self._make_conn()
+        reader = self._make_reader(conn)
+        assert reader._fetch_creators_for_items([]) == {}
+
+    def test_missing_item_absent_from_result(self):
+        """Items with no creators should not appear in the result dict."""
+        conn = self._make_conn()
+        reader = self._make_reader(conn)
+        # No itemCreators rows at all
+        result = reader._fetch_creators_for_items([999])
+        assert result == {}

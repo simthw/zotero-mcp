@@ -665,7 +665,13 @@ class LocalZoteroReader:
     def get_feed_items(
         self, library_id: int, limit: int = 20
     ) -> list[dict[str, Any]]:
-        """Get items from a specific RSS feed by its libraryID."""
+        """Get items from a specific RSS feed by its libraryID.
+
+        Creators are fetched with a separate ordered query rather than joined
+        into the main SELECT — ``GROUP_CONCAT`` doesn't preserve author order
+        and would lose the paper's original byline sequence. See
+        ``_fetch_creators_for_items`` for details.
+        """
         conn = self._get_connection()
         rows = conn.execute(
             """
@@ -674,15 +680,7 @@ class LocalZoteroReader:
                    fi.readTime, fi.translatedTime,
                    title_val.value as title,
                    abstract_val.value as abstract,
-                   url_val.value as url,
-                   GROUP_CONCAT(
-                       CASE
-                           WHEN c.firstName IS NOT NULL AND c.lastName IS NOT NULL
-                           THEN c.lastName || ', ' || c.firstName
-                           WHEN c.lastName IS NOT NULL THEN c.lastName
-                           ELSE NULL
-                       END, '; '
-                   ) as creators
+                   url_val.value as url
             FROM feedItems fi
             JOIN items i ON fi.itemID = i.itemID
             JOIN itemTypes it ON i.itemTypeID = it.itemTypeID
@@ -693,16 +691,18 @@ class LocalZoteroReader:
             LEFT JOIN fields url_f ON url_f.fieldName = 'url'
             LEFT JOIN itemData url_data ON i.itemID = url_data.itemID AND url_data.fieldID = url_f.fieldID
             LEFT JOIN itemDataValues url_val ON url_data.valueID = url_val.valueID
-            LEFT JOIN itemCreators ic ON i.itemID = ic.itemID
-            LEFT JOIN creators c ON ic.creatorID = c.creatorID
             WHERE i.libraryID = ?
-            GROUP BY i.itemID
             ORDER BY i.dateAdded DESC
             LIMIT ?
             """,
             (library_id, limit),
         ).fetchall()
-        return [dict(row) for row in rows]
+
+        results = [dict(row) for row in rows]
+        creators_map = self._fetch_creators_for_items([r['itemID'] for r in results])
+        for r in results:
+            r['creators'] = creators_map.get(r['itemID'])
+        return results
 
     def get_item_count(self) -> int:
         """
@@ -736,6 +736,14 @@ class LocalZoteroReader:
         conn = self._get_connection()
 
         # Query to get items with their text content (simplified for now)
+        #
+        # Creators are fetched separately (see _fetch_creators_for_items below)
+        # instead of being joined + GROUP_CONCAT'd here. Reason: SQLite's
+        # GROUP_CONCAT does NOT guarantee aggregation order, so joining
+        # itemCreators in the main query produced author lists in arbitrary
+        # order — the original paper's author sequence was lost. A separate
+        # query can ORDER BY ic.orderIndex and filter to creatorType='author',
+        # which is the only way to reliably reconstruct the correct order.
         query = """
         SELECT
             i.itemID,
@@ -748,16 +756,7 @@ class LocalZoteroReader:
             abstract_val.value as abstract,
             extra_val.value as extra,
             doi_val.value as doi,
-            GROUP_CONCAT(n.note, ' ') as notes,
-            GROUP_CONCAT(
-                CASE
-                    WHEN c.firstName IS NOT NULL AND c.lastName IS NOT NULL
-                    THEN c.lastName || ', ' || c.firstName
-                    WHEN c.lastName IS NOT NULL
-                    THEN c.lastName
-                    ELSE NULL
-                END, '; '
-            ) as creators
+            GROUP_CONCAT(n.note, ' ') as notes
         FROM items i
         JOIN itemTypes it ON i.itemTypeID = it.itemTypeID
 
@@ -781,10 +780,6 @@ class LocalZoteroReader:
         -- Get notes
         LEFT JOIN itemNotes n ON i.itemID = n.parentItemID OR i.itemID = n.itemID
 
-        -- Get creators
-        LEFT JOIN itemCreators ic ON i.itemID = ic.itemID
-        LEFT JOIN creators c ON ic.creatorID = c.creatorID
-
         WHERE it.typeName NOT IN ('attachment', 'note', 'annotation')
         AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
         """
@@ -804,10 +799,14 @@ class LocalZoteroReader:
         if limit:
             query += f" LIMIT {limit}"
 
-        cursor = conn.execute(query, params)
-        items = []
+        # Materialize rows first so we can batch-fetch creators with a single
+        # query keyed on the full set of itemIDs (avoids N+1 on large libraries)
+        rows = conn.execute(query, params).fetchall()
+        item_ids = [row['itemID'] for row in rows]
+        creators_map = self._fetch_creators_for_items(item_ids)
 
-        for row in cursor:
+        items = []
+        for row in rows:
             item = ZoteroItem(
                 item_id=row['itemID'],
                 key=row['key'],
@@ -816,7 +815,7 @@ class LocalZoteroReader:
                 doi=row['doi'],
                 title=row['title'],
                 abstract=row['abstract'],
-                creators=row['creators'],
+                creators=creators_map.get(row['itemID']),
                 fulltext=(res := (self._extract_fulltext_for_item(row['itemID']) if include_fulltext else None)) and (res[0] if res[1] != "timeout" else None),
                 fulltext_source=res[1] if include_fulltext and res and res[1] != "timeout" else None,
                 notes=row['notes'],
@@ -827,6 +826,74 @@ class LocalZoteroReader:
             items.append(item)
 
         return items
+
+    def _fetch_creators_for_items(
+        self, item_ids: list[int], creator_types: tuple[str, ...] = ("author",)
+    ) -> dict[int, str]:
+        """
+        Batch-load ordered creator lists for a set of Zotero item IDs.
+
+        Returns a mapping ``{itemID: "LastA, FirstA; LastB, FirstB; ..."}``.
+
+        SQLite's ``GROUP_CONCAT`` does not guarantee aggregation order, which
+        is why this is a separate query instead of a JOIN in the main SELECT:
+        we need ``ORDER BY ic.orderIndex`` to reconstruct the paper's actual
+        author sequence. Creator types are filtered (default ``author``) so
+        that editors / translators / contributors are not misreported as
+        authors in downstream display.
+
+        Args:
+            item_ids: Zotero internal itemIDs to load creators for.
+            creator_types: Tuple of ``creatorTypes.creatorType`` values to
+                include. Defaults to ``("author",)``. Pass a wider tuple to
+                also include editors, translators, etc. when that is
+                semantically appropriate.
+
+        Returns:
+            Dict mapping itemID to the formatted creator string. Items with
+            no matching creators are omitted from the result.
+        """
+        if not item_ids:
+            return {}
+
+        conn = self._get_connection()
+
+        # Chunk IDs to stay well under SQLite's default parameter limit (999).
+        CHUNK = 500
+        type_placeholders = ",".join("?" * len(creator_types))
+        result: dict[int, list[str]] = {}
+
+        for start in range(0, len(item_ids), CHUNK):
+            chunk = item_ids[start : start + CHUNK]
+            id_placeholders = ",".join("?" * len(chunk))
+            sql = f"""
+                SELECT ic.itemID,
+                       c.firstName,
+                       c.lastName,
+                       c.fieldMode
+                FROM itemCreators ic
+                JOIN creators c ON ic.creatorID = c.creatorID
+                JOIN creatorTypes ct ON ic.creatorTypeID = ct.creatorTypeID
+                WHERE ic.itemID IN ({id_placeholders})
+                  AND ct.creatorType IN ({type_placeholders})
+                ORDER BY ic.itemID, ic.orderIndex
+            """
+            for row in conn.execute(sql, (*chunk, *creator_types)):
+                first = (row['firstName'] or "").strip()
+                last = (row['lastName'] or "").strip()
+                # fieldMode == 1 means single-field name (institutional / mononym);
+                # stored in lastName with firstName blank.
+                if last and first:
+                    name = f"{last}, {first}"
+                elif last:
+                    name = last
+                elif first:
+                    name = first
+                else:
+                    continue
+                result.setdefault(row['itemID'], []).append(name)
+
+        return {iid: "; ".join(names) for iid, names in result.items()}
 
     # Public helper to quickly check full text metadata for item
     def get_fulltext_meta_for_item(self, item_id: int) -> tuple[str, str] | None:
