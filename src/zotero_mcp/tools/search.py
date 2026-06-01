@@ -822,11 +822,14 @@ def update_search_database(
         # Create semantic search instance
         search = create_semantic_search(str(config_path))
 
-        # Use fulltext extraction when in local mode (has access to PDFs)
+        # Default MCP updates index parent bibliography items plus local
+        # notes/annotations, but do not embed full paper text. Full papers are
+        # retrieved on demand through zotero_get_item_fulltext; CLI users who
+        # explicitly want fulltext embeddings can run update-db --fulltext.
         stats = search.update_database(
             force_full_rebuild=force_rebuild,
             limit=limit,
-            extract_fulltext=_utils.is_local_mode()
+            extract_fulltext=False
         )
 
         # Format results

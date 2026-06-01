@@ -84,7 +84,8 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
         by a non-OpenAI model_name), uses a conservative character estimate
         since the actual tokenizer may differ significantly.
         """
-        is_native_openai = self.model_name.startswith("text-embedding-")
+        model_name = getattr(self, "model_name", "text-embedding-3-small")
+        is_native_openai = model_name.startswith("text-embedding-")
         if is_native_openai:
             try:
                 import tiktoken

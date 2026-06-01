@@ -73,6 +73,20 @@ def test_get_searchable_text_truncates_at_limit():
     assert "..." in text
 
 
+def test_get_searchable_text_includes_notes_and_annotations():
+    item = ZoteroItem(
+        item_id=1,
+        key="TEST",
+        item_type_id=1,
+        notes="A parent note",
+        annotations="highlight: An annotated passage",
+    )
+    text = item.get_searchable_text()
+
+    assert "Notes: A parent note" in text
+    assert "Annotations: highlight: An annotated passage" in text
+
+
 class TestResolveAttachmentPath:
     """Tests for _resolve_attachment_path handling of various Zotero path formats."""
 
@@ -297,3 +311,82 @@ class TestFetchCreatorsForItems:
         # No itemCreators rows at all
         result = reader._fetch_creators_for_items([999])
         assert result == {}
+
+
+class TestFetchAnnotationsForItems:
+    """Tests for grouping child annotations onto parent bibliography items."""
+
+    def _make_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE items (
+                itemID INTEGER PRIMARY KEY
+            );
+            CREATE TABLE itemAttachments (
+                itemID INTEGER NOT NULL,
+                parentItemID INTEGER NOT NULL
+            );
+            CREATE TABLE itemAnnotations (
+                itemID INTEGER NOT NULL,
+                parentItemID INTEGER NOT NULL,
+                text TEXT,
+                comment TEXT,
+                type INTEGER,
+                pageLabel TEXT
+            );
+            CREATE TABLE deletedItems (
+                itemID INTEGER PRIMARY KEY
+            );
+            """
+        )
+        return conn
+
+    def _make_reader(self, conn: sqlite3.Connection) -> LocalZoteroReader:
+        reader = FakeLocalZoteroReader()
+        reader._connection = conn
+        reader._fetch_annotations_for_items = (
+            LocalZoteroReader._fetch_annotations_for_items.__get__(reader)
+        )
+        reader._get_connection = lambda: conn
+        return reader
+
+    def test_groups_annotations_by_grandparent_item(self):
+        conn = self._make_conn()
+        conn.executescript(
+            """
+            INSERT INTO items VALUES (300);
+            INSERT INTO items VALUES (301);
+            INSERT INTO itemAttachments VALUES (200, 100);
+            INSERT INTO itemAttachments VALUES (201, 101);
+            INSERT INTO itemAnnotations VALUES
+                (300, 200, 'Important passage', 'Use in intro', 1, '12'),
+                (301, 201, 'Other paper passage', NULL, 5, '3');
+            """
+        )
+        conn.commit()
+
+        reader = self._make_reader(conn)
+        result = reader._fetch_annotations_for_items([100, 101])
+
+        assert result == {
+            100: "highlight (p. 12): Important passage | Comment: Use in intro",
+            101: "underline (p. 3): Other paper passage",
+        }
+
+    def test_skips_deleted_annotations(self):
+        conn = self._make_conn()
+        conn.executescript(
+            """
+            INSERT INTO items VALUES (300);
+            INSERT INTO itemAttachments VALUES (200, 100);
+            INSERT INTO itemAnnotations VALUES
+                (300, 200, 'Deleted passage', NULL, 1, '1');
+            INSERT INTO deletedItems VALUES (300);
+            """
+        )
+        conn.commit()
+
+        reader = self._make_reader(conn)
+        assert reader._fetch_annotations_for_items([100]) == {}

@@ -61,6 +61,7 @@ class ZoteroItem:
     fulltext: str | None = None
     fulltext_source: str | None = None  # 'pdf' or 'html'
     notes: str | None = None
+    annotations: str | None = None
     extra: str | None = None
     date_added: str | None = None
     date_modified: str | None = None
@@ -88,6 +89,9 @@ class ZoteroItem:
 
         if self.notes:
             parts.append(f"Notes: {self.notes}")
+
+        if self.annotations:
+            parts.append(f"Annotations: {self.annotations}")
 
         if self.fulltext:
             # Truncate very long fulltext for simple text search
@@ -247,7 +251,7 @@ class LocalZoteroReader:
             return Path(decoded_path)
 
         # Linked file as absolute path: '/Users/me/papers/file.pdf'
-        if os.path.isabs(zotero_path):
+        if os.path.isabs(zotero_path) or zotero_path.startswith("/"):
             return Path(zotero_path)
 
         # Zotero 'attachments:' relative path — resolve against the linked
@@ -804,6 +808,7 @@ class LocalZoteroReader:
         rows = conn.execute(query, params).fetchall()
         item_ids = [row['itemID'] for row in rows]
         creators_map = self._fetch_creators_for_items(item_ids)
+        annotations_map = self._fetch_annotations_for_items(item_ids)
 
         items = []
         for row in rows:
@@ -819,6 +824,7 @@ class LocalZoteroReader:
                 fulltext=(res := (self._extract_fulltext_for_item(row['itemID']) if include_fulltext else None)) and (res[0] if res[1] != "timeout" else None),
                 fulltext_source=res[1] if include_fulltext and res and res[1] != "timeout" else None,
                 notes=row['notes'],
+                annotations=annotations_map.get(row['itemID']),
                 extra=row['extra'],
                 date_added=row['dateAdded'],
                 date_modified=row['dateModified']
@@ -894,6 +900,65 @@ class LocalZoteroReader:
                 result.setdefault(row['itemID'], []).append(name)
 
         return {iid: "; ".join(names) for iid, names in result.items()}
+
+    def _fetch_annotations_for_items(self, item_ids: list[int]) -> dict[int, str]:
+        """Batch-load annotation text/comment grouped by parent Zotero item.
+
+        Zotero stores annotations under attachment items, not directly under
+        paper/book items. This query walks annotation -> attachment -> parent
+        item so semantic indexing can embed annotations into the parent
+        bibliography item instead of creating separate vector records.
+        """
+        if not item_ids:
+            return {}
+
+        conn = self._get_connection()
+        type_map = {1: "highlight", 2: "note", 3: "image", 4: "ink", 5: "underline"}
+        result: dict[int, list[str]] = {}
+
+        CHUNK = 500
+        for start in range(0, len(item_ids), CHUNK):
+            chunk = item_ids[start : start + CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            sql = f"""
+                SELECT iatt.parentItemID as parentItemID,
+                       ia.itemID as annotationItemID,
+                       ia.text,
+                       ia.comment,
+                       ia.type,
+                       ia.pageLabel
+                FROM itemAnnotations ia
+                JOIN items ann ON ann.itemID = ia.itemID
+                JOIN itemAttachments iatt ON ia.parentItemID = iatt.itemID
+                WHERE iatt.parentItemID IN ({placeholders})
+                  AND ann.itemID NOT IN (SELECT itemID FROM deletedItems)
+                ORDER BY iatt.parentItemID, ia.itemID
+            """
+            for row in conn.execute(sql, chunk):
+                text = (row["text"] or "").strip()
+                comment = (row["comment"] or "").strip()
+                if not text and not comment:
+                    continue
+
+                prefix_parts = []
+                ann_type = type_map.get(row["type"], "annotation")
+                if row["pageLabel"]:
+                    prefix_parts.append(f"p. {row['pageLabel']}")
+                prefix = f"{ann_type}"
+                if prefix_parts:
+                    prefix += f" ({', '.join(prefix_parts)})"
+
+                content_parts = []
+                if text:
+                    content_parts.append(text)
+                if comment:
+                    content_parts.append(f"Comment: {comment}")
+
+                result.setdefault(row["parentItemID"], []).append(
+                    f"{prefix}: {' | '.join(content_parts)}"
+                )
+
+        return {iid: "\n".join(lines) for iid, lines in result.items()}
 
     # Public helper to quickly check full text metadata for item
     def get_fulltext_meta_for_item(self, item_id: int) -> tuple[str, str] | None:

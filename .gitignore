@@ -37,6 +37,9 @@ Thumbs.db
 .env
 .env.local
 
+# MCP config (contains API keys)
+.mcp.json
+
 # Lock files
 uv.lock
 

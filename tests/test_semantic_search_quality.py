@@ -113,6 +113,95 @@ class TestCombineStructuredAndFulltext:
         doc = search.chroma_client.upserted_docs[0]
         assert "Only fulltext content." in doc
 
+    def test_notes_and_annotations_are_embedded_in_parent_item(self):
+        search = self._make_search()
+        item = _make_item("K4", title="Parent Paper", abstract="Abstract")
+        item["data"]["notes"] = "<p>My synthesis note</p>"
+        item["data"]["annotations"] = "highlight: Important passage | Comment: Check this"
+
+        stats = search._process_item_batch([item], force_rebuild=True)
+
+        assert stats["processed"] == 1
+        doc = search.chroma_client.upserted_docs[0]
+        assert "Parent Paper" in doc
+        assert "Notes: My synthesis note" in doc
+        assert "Annotations: highlight: Important passage" in doc
+        assert "<p>" not in doc
+
+    def test_fulltext_semantic_cleaning_preserves_toc_and_intro(self):
+        search = self._make_search()
+        fulltext = """
+        Downloaded from publisher.example by University Proxy
+        Copyright 2024 Elsevier. All rights reserved.
+        Contents
+        1 Introduction 1
+        2 Methods 3
+        3 Results 7
+        Journal homepage: www.example.com/journal
+        1 Introduction
+        This introduction should be searchable.
+        Methods
+        This method text follows later.
+        """
+        item = _make_item("K5", title="Cleaned Paper", abstract="Abstract", fulltext=fulltext)
+
+        stats = search._process_item_batch([item], force_rebuild=True)
+
+        assert stats["processed"] == 1
+        doc = search.chroma_client.upserted_docs[0]
+        assert "Table of Contents:" in doc
+        assert "1 Introduction 1" in doc
+        assert "2 Methods 3" in doc
+        assert "Body:" in doc
+        assert "1 Introduction" in doc
+        assert "This introduction should be searchable." in doc
+        assert "Downloaded from" not in doc
+        assert "Copyright 2024" not in doc
+        assert "Journal homepage" not in doc
+
+    def test_fulltext_semantic_cleaning_falls_back_when_no_heading_found(self):
+        search = self._make_search()
+        fulltext = """
+        Published by Example Press.
+        This is the first meaningful paragraph.
+        This is the second meaningful paragraph.
+        """
+        item = _make_item("K6", title="", abstract="", fulltext=fulltext)
+
+        stats = search._process_item_batch([item], force_rebuild=True)
+
+        assert stats["processed"] == 1
+        doc = search.chroma_client.upserted_docs[0]
+        assert "This is the first meaningful paragraph." in doc
+        assert "This is the second meaningful paragraph." in doc
+        assert "Published by Example Press" not in doc
+
+
+class TestApiItemFiltering:
+    def test_get_items_from_api_excludes_annotations(self):
+        class FakeZotero:
+            def __init__(self):
+                self.calls = 0
+
+            def items(self, **kwargs):
+                self.calls += 1
+                if self.calls > 1:
+                    return []
+                return [
+                    {"key": "PAPER1", "data": {"itemType": "journalArticle", "title": "Paper"}},
+                    {"key": "ATT1", "data": {"itemType": "attachment", "title": "Attachment"}},
+                    {"key": "NOTE1", "data": {"itemType": "note", "title": "Note"}},
+                    {"key": "ANN1", "data": {"itemType": "annotation", "title": "Highlight"}},
+                ]
+
+        fake_zotero = FakeZotero()
+        with patch.object(semantic_search, "get_zotero_client", return_value=fake_zotero):
+            search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
+
+        items = search._get_items_from_api()
+
+        assert [item["key"] for item in items] == ["PAPER1"]
+
 
 # ---------------------------------------------------------------------------
 # Fix 2: Gemini query/document embedding asymmetry

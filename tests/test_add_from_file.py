@@ -1,5 +1,6 @@
 """Tests for Feature 10: zotero_add_from_file (server.add_from_file)."""
 
+import os
 import sys
 import types
 import pytest
@@ -91,7 +92,8 @@ def _patch_path_valid(monkeypatch):
     monkeypatch.setattr("os.path.exists", lambda p: True)
     monkeypatch.setattr("os.path.isfile", lambda p: True)
     monkeypatch.setattr("os.path.islink", lambda p: False)
-    monkeypatch.setattr("os.path.isabs", lambda p: p.startswith("/"))
+    monkeypatch.setattr("os.path.isabs", lambda p: os.fspath(p).startswith("/"))
+    monkeypatch.setattr("os.path.realpath", lambda p: os.fspath(p))
 
 
 def _patch_hybrid_mode(monkeypatch, fake_write_zot):
@@ -408,6 +410,7 @@ class TestFileDoesNotExist:
         fake_zot = FakeZoteroForFile()
         _patch_hybrid_mode(monkeypatch, fake_zot)
         monkeypatch.setattr("os.path.isabs", lambda p: True)
+        monkeypatch.setattr("os.path.realpath", lambda p: os.fspath(p))
         monkeypatch.setattr("os.path.exists", lambda p: False)
         monkeypatch.setattr("os.path.isfile", lambda p: False)
         monkeypatch.setattr("os.path.islink", lambda p: False)
@@ -427,6 +430,7 @@ class TestFileDoesNotExist:
         fake_zot = FakeZoteroForFile()
         _patch_hybrid_mode(monkeypatch, fake_zot)
         monkeypatch.setattr("os.path.isabs", lambda p: True)
+        monkeypatch.setattr("os.path.realpath", lambda p: os.fspath(p))
         monkeypatch.setattr("os.path.exists", lambda p: True)
         monkeypatch.setattr("os.path.isfile", lambda p: False)
         monkeypatch.setattr("os.path.islink", lambda p: False)
@@ -467,7 +471,7 @@ class TestNonAbsolutePath:
     def test_dot_relative_path_rejected(self, monkeypatch, dummy_ctx):
         fake_zot = FakeZoteroForFile()
         _patch_hybrid_mode(monkeypatch, fake_zot)
-        monkeypatch.setattr("os.path.isabs", lambda p: not p.startswith("."))
+        monkeypatch.setattr("os.path.isabs", lambda p: not os.fspath(p).startswith("."))
 
         result = server.add_from_file(
             file_path="./Documents/paper.pdf",
@@ -490,6 +494,7 @@ class TestSymlinkRejection:
         fake_zot = FakeZoteroForFile()
         _patch_hybrid_mode(monkeypatch, fake_zot)
         monkeypatch.setattr("os.path.isabs", lambda p: True)
+        monkeypatch.setattr("os.path.realpath", lambda p: os.fspath(p))
         monkeypatch.setattr("os.path.exists", lambda p: True)
         monkeypatch.setattr("os.path.isfile", lambda p: True)
         monkeypatch.setattr("os.path.islink", lambda p: True)

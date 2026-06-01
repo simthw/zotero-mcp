@@ -62,3 +62,28 @@ def test_get_items_from_source_no_abort_without_fulltext(monkeypatch):
     # Should not raise — fulltext not requested
     result = search._get_items_from_source(extract_fulltext=False)
     assert result == []
+
+
+def test_get_items_from_source_uses_local_db_without_fulltext_in_local_mode(monkeypatch):
+    """Local metadata builds should use SQLite for notes/annotations, not PDF fulltext."""
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
+
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
+    calls = []
+
+    def fake_local(*args, **kwargs):
+        calls.append(kwargs)
+        return [{"key": "ITEM1", "data": {"title": "With notes"}}]
+
+    monkeypatch.setattr(search, "_get_items_from_local_db", fake_local)
+    monkeypatch.setattr(
+        search,
+        "_get_items_from_api",
+        lambda *a, **kw: pytest.fail("API should not be used in local mode"),
+    )
+
+    result = search._get_items_from_source(extract_fulltext=False)
+
+    assert result[0]["key"] == "ITEM1"
+    assert calls[0]["extract_fulltext"] is False

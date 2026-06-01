@@ -8,6 +8,7 @@ over research libraries.
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -25,7 +26,7 @@ from pyzotero import zotero
 
 from .chroma_client import ChromaClient, create_chroma_client
 from .client import get_zotero_client
-from .utils import format_creators, is_local_mode
+from .utils import clean_html, format_creators, is_local_mode
 from .local_db import LocalZoteroReader, get_local_zotero_reader
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,117 @@ def _truncate_to_tokens(text: str, max_tokens: int = 8000) -> str:
         if len(text) > max_chars:
             text = text[:max_chars]
     return text
+
+
+_SEMANTIC_BOILERPLATE_RE = re.compile(
+    r"("
+    r"downloaded\s+from|"
+    r"journal\s+homepage|"
+    r"all\s+rights\s+reserved|"
+    r"copyright|"
+    r"terms\s+of\s+use|"
+    r"for\s+personal\s+use\s+only|"
+    r"no\s+reuse\s+allowed|"
+    r"published\s+by|"
+    r"publisher'?s?\s+note|"
+    r"springer\s+nature\s+remains\s+neutral|"
+    r"elsevier|"
+    r"sciencedirect|"
+    r"wiley\s+online\s+library"
+    r")",
+    re.IGNORECASE,
+)
+
+_TOC_HEADING_RE = re.compile(r"^\s*(?:table\s+of\s+contents|contents)\s*$", re.IGNORECASE)
+_TOC_ENTRY_RE = re.compile(r"(\.{2,}|\s+\d{1,4}\s*$)")
+_BODY_START_RE = re.compile(
+    r"^\s*(?:\d+(?:\.\d+)*\.?\s*)?"
+    r"(?:introduction|background|overview|abstract)\b"
+    r"(?:\s*[:.]|\s*)$",
+    re.IGNORECASE,
+)
+_PREFERRED_BODY_START_RE = re.compile(
+    r"^\s*(?:\d+(?:\.\d+)*\.?\s*)?"
+    r"(?:introduction|background|overview)\b"
+    r"(?:\s*[:.]|\s*)$",
+    re.IGNORECASE,
+)
+
+
+def _clean_fulltext_for_semantic_embedding(text: str) -> str:
+    """Remove front-matter noise while preserving TOC and body start.
+
+    This is only for semantic indexing. It does not affect fulltext retrieval
+    tools, which should return the extracted text as faithfully as possible.
+    """
+    if not text or not text.strip():
+        return ""
+
+    raw_lines = [line.strip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in raw_lines
+        if line.strip()
+    ]
+    if not lines:
+        return ""
+
+    cleaned_lines = [
+        line for line in lines
+        if not _SEMANTIC_BOILERPLATE_RE.search(line)
+    ]
+    if not cleaned_lines:
+        return ""
+
+    toc_text = ""
+    toc_range: tuple[int, int] | None = None
+    for idx, line in enumerate(cleaned_lines[:200]):
+        if not _TOC_HEADING_RE.match(line):
+            continue
+
+        toc_lines = [line]
+        char_count = len(line)
+        end_idx = idx + 1
+        for j in range(idx + 1, min(len(cleaned_lines), idx + 90)):
+            candidate = cleaned_lines[j]
+            if (
+                j > idx + 2
+                and _BODY_START_RE.match(candidate)
+                and not _TOC_ENTRY_RE.search(candidate)
+            ):
+                break
+            toc_lines.append(candidate)
+            char_count += len(candidate) + 1
+            end_idx = j + 1
+            if char_count >= 4000:
+                break
+
+        toc_text = "\n".join(toc_lines).strip()
+        toc_range = (idx, end_idx)
+        break
+
+    def _find_start(pattern: re.Pattern[str]) -> int | None:
+        start_after = toc_range[1] if toc_range else 0
+        for i, line in enumerate(cleaned_lines[start_after:], start_after):
+            if pattern.match(line):
+                return i
+        return None
+
+    body_start = _find_start(_PREFERRED_BODY_START_RE)
+    if body_start is None:
+        body_start = _find_start(_BODY_START_RE)
+
+    if body_start is None:
+        body_lines = cleaned_lines
+    else:
+        body_lines = cleaned_lines[body_start:]
+
+    body_text = "\n".join(body_lines).strip()
+    if toc_text and body_text and body_text != toc_text:
+        return f"Table of Contents:\n{toc_text}\n\nBody:\n{body_text}"
+    if body_text:
+        return body_text
+    return toc_text
 
 
 class CrossEncoderReranker:
@@ -203,12 +315,20 @@ class ZoteroSemanticSearch:
             tag_text = " ".join([tag.get("tag", "") for tag in tags])
             extra_fields.append(tag_text)
 
-        # Note content (if available)
-        if note := data.get("note"):
-            # Clean HTML from notes
-            import re
-            note_text = re.sub(r'<[^>]+>', '', note)
-            extra_fields.append(note_text)
+        # Child notes aggregated onto the parent item by the local DB reader.
+        # Keep them near metadata so user-authored notes survive truncation
+        # better than if they were appended after long full text.
+        for note_field in ("note", "notes"):
+            if note := data.get(note_field):
+                note_text = clean_html(str(note), collapse_whitespace=True)
+                if note_text:
+                    extra_fields.append(f"Notes: {note_text}")
+
+        # Child PDF/EPUB annotations aggregated onto the parent item.
+        if annotations := data.get("annotations"):
+            annotation_text = clean_html(str(annotations), collapse_whitespace=True)
+            if annotation_text:
+                extra_fields.append(f"Annotations: {annotation_text}")
 
         # Combine all text fields
         text_parts = [title, creators_text, abstract] + extra_fields
@@ -302,9 +422,10 @@ class ZoteroSemanticSearch:
         """
         Get items from either local database or API.
 
-        When extract_fulltext=True, requires local mode (ZOTERO_LOCAL=true);
-        raises RuntimeError if local mode is not enabled.
-        Otherwise uses API (faster, metadata-only).
+        In local mode, prefer the local SQLite database even without fulltext
+        extraction so child notes and annotations can be aggregated onto their
+        parent bibliography items. Fulltext extraction still only happens when
+        extract_fulltext=True. In non-local mode, use the Zotero API.
 
         Args:
             limit: Optional limit on number of items
@@ -327,8 +448,15 @@ class ZoteroSemanticSearch:
                 chroma_client=chroma_client,
                 force_rebuild=force_rebuild
             )
-        else:
-            return self._get_items_from_api(limit)
+        if is_local_mode():
+            return self._get_items_from_local_db(
+                limit,
+                extract_fulltext=False,
+                chroma_client=chroma_client,
+                force_rebuild=force_rebuild,
+            )
+
+        return self._get_items_from_api(limit)
 
     def _get_items_from_local_db(self, limit: int | None = None, extract_fulltext: bool = False, chroma_client: ChromaClient | None = None, force_rebuild: bool = False) -> list[dict[str, Any]]:
         """
@@ -662,6 +790,8 @@ class ZoteroSemanticSearch:
                     # Add notes if available
                     if item.notes:
                         api_item["data"]["notes"] = item.notes
+                    if item.annotations:
+                        api_item["data"]["annotations"] = item.annotations
 
                     api_items.append(api_item)
 
@@ -745,10 +875,13 @@ class ZoteroSemanticSearch:
             if not items:
                 break
 
-            # Filter out attachments and notes by default
+            # Filter out non-parent items by default. Zotero exposes PDF
+            # annotations as top-level API items, but semantic indexing should
+            # stay focused on bibliography items; otherwise large annotated
+            # libraries inflate the vector DB by thousands of annotation rows.
             filtered_items = [
                 item for item in items
-                if item.get("data", {}).get("itemType") not in ["attachment", "note"]
+                if item.get("data", {}).get("itemType") not in ["attachment", "note", "annotation"]
             ]
 
             all_items.extend(filtered_items)
@@ -948,7 +1081,12 @@ class ZoteroSemanticSearch:
                     fulltext = ""
                 structured_text = self._create_document_text(item)
                 if fulltext.strip():
-                    doc_text = (structured_text + "\n\n" + fulltext) if structured_text.strip() else fulltext
+                    semantic_fulltext = _clean_fulltext_for_semantic_embedding(fulltext)
+                    doc_text = (
+                        (structured_text + "\n\n" + semantic_fulltext)
+                        if structured_text.strip() and semantic_fulltext.strip()
+                        else semantic_fulltext or structured_text
+                    )
                 else:
                     doc_text = structured_text
                 metadata = self._create_metadata(item)
