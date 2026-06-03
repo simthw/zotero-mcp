@@ -6,16 +6,15 @@ when running in local mode.
 """
 
 import json
-import os
-import sqlite3
-import platform
 import logging
+import os
+import platform
+import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from dataclasses import dataclass
-from urllib.parse import urlparse, unquote
 
-from .utils import is_local_mode, _normalize_for_search
+from .utils import _normalize_for_search, is_local_mode
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +239,7 @@ class LocalZoteroReader:
 
         # Linked file as URL: 'file:///path/to/file.pdf'
         if zotero_path.startswith("file://"):
-            from urllib.parse import urlparse, unquote
+            from urllib.parse import unquote, urlparse
             parsed = urlparse(zotero_path)
             decoded_path = unquote(parsed.path or "")
             # file:///C:/... on Windows
@@ -305,12 +304,37 @@ class LocalZoteroReader:
             "sys.stdout.write(extract_text(sys.argv[1], maxpages=int(sys.argv[2])) or '')"
         )
 
+        # Strip API keys from the child's environment: pdfminer does not need
+        # them, and leaking them via crash dumps or /proc/<pid>/environ is
+        # needless exposure. Keep the rest of the env so the interpreter still
+        # finds system libraries, temp dirs, locale, etc.
+        child_env = os.environ.copy()
+        for _k in (
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "ZOTERO_API_KEY",
+        ):
+            child_env.pop(_k, None)
+
+        # Force UTF-8 on the child's stdio. Without this, Windows consoles
+        # default to GBK/cp1252 and pdfminer extracting any non-ASCII text
+        # raises UnicodeEncodeError when ``sys.stdout.write`` flushes —
+        # turning a perfectly readable PDF into a "failed" extraction that
+        # the indexer then refuses to retry until force-rebuild (#286).
+        child_env.setdefault("PYTHONIOENCODING", "utf-8")
+        child_env.setdefault("PYTHONUTF8", "1")
+
         try:
             result = subprocess.run(
                 [sys.executable, "-c", script, str(file_path), str(maxpages)],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
+                env=child_env,
             )
             if result.returncode == 0:
                 return result.stdout
@@ -345,6 +369,36 @@ class LocalZoteroReader:
             return BeautifulSoup(html, "html.parser").get_text(" ")
         except Exception:
             return ""
+
+    # Extensions / MIME types we know we can read as plain text. Used by
+    # ``_is_extractable_attachment`` to gate non-PDF/HTML attachments into
+    # the fulltext extractor. Binary formats (.docx, .pptx, .epub, video,
+    # etc.) are intentionally excluded — ``read_text`` returns garbage for
+    # those and we don't want to pollute the semantic index with it.
+    _TEXTUAL_SUFFIXES = frozenset({
+        ".txt", ".vtt", ".srt", ".sbv", ".md", ".markdown", ".rst",
+        ".csv", ".tsv", ".json", ".xml", ".log", ".text",
+    })
+    _TEXTUAL_CONTENT_TYPES = frozenset({
+        "text/plain", "text/vtt", "text/markdown", "text/csv",
+        "text/tab-separated-values", "text/srt", "application/json",
+        "application/xml", "text/xml",
+    })
+
+    @classmethod
+    def _is_extractable_attachment(cls, file_path: Path, ctype: str | None) -> bool:
+        """Return True when ``_extract_text_from_file`` can return useful text.
+
+        PDF and HTML are handled by their dedicated extractors elsewhere. For
+        anything else, accept the attachment iff its MIME type or extension
+        is in the textual allowlist — never accept arbitrary binaries.
+        """
+        normalized_ctype = (ctype or "").lower()
+        if normalized_ctype.startswith("text/"):
+            return True
+        if normalized_ctype in cls._TEXTUAL_CONTENT_TYPES:
+            return True
+        return file_path.suffix.lower() in cls._TEXTUAL_SUFFIXES
 
     def _extract_text_from_file(self, file_path: Path) -> str:
         """Extract text content from a file based on extension, with fallbacks."""
@@ -511,94 +565,143 @@ class LocalZoteroReader:
 
         return ""
 
-    def _read_zotero_ft_cache(self, cache_path: Path) -> str:
-        """Read Zotero's pre-built full text cache file (.zotero-ft-cache).
+    def _read_zotero_ft_cache(self, attachment_key: str) -> str | None:
+        """Return the text in Zotero's ``.zotero-ft-cache`` for an attachment.
 
-        Zotero writes this file when it indexes an attachment.  Reading it is
-        instant (pure file I/O) and avoids PDF extraction timeouts entirely.
-        Returns the text, or empty string on failure.
+        Zotero writes a plain-text full-text cache next to each indexed PDF /
+        EPUB at ``storage/<attachment_key>/.zotero-ft-cache``. Using it has
+        two upsides:
+        - it's already-extracted text (no pdfminer subprocess needed);
+        - it doesn't depend on filename matching, so it survives Zotero
+          file-naming drift / non-ASCII filename rewrites (#291).
+
+        Returns ``None`` if the cache file is absent, empty, or unreadable.
         """
         try:
-            return cache_path.read_text(encoding="utf-8", errors="replace").strip()
-        except Exception as e:
-            logger.debug(f"Could not read .zotero-ft-cache at {cache_path}: {e}")
-            return ""
+            cache_path = self._get_storage_dir() / attachment_key / ".zotero-ft-cache"
+        except Exception:
+            return None
+        if not cache_path.exists():
+            return None
+        try:
+            text = cache_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+        return text or None
+
+    def _scan_storage_for_attachment(
+        self, attachment_key: str, ctype: str | None
+    ) -> Path | None:
+        """Fallback path resolver: find a likely attachment file on disk.
+
+        ``itemAttachments.path`` in the Zotero sqlite is the filename Zotero
+        recorded at import time, but the on-disk filename can drift (renames,
+        non-ASCII normalization, external sync tools). When the recorded
+        path no longer resolves, scan the attachment's own storage folder
+        and pick the largest file whose extension is consistent with the
+        recorded content type (#291).
+        """
+        try:
+            attachment_dir = self._get_storage_dir() / attachment_key
+        except Exception:
+            return None
+        if not attachment_dir.is_dir():
+            return None
+
+        if ctype == "application/pdf":
+            wanted_suffixes = {".pdf"}
+        elif (ctype or "").startswith("text/html"):
+            wanted_suffixes = {".html", ".htm"}
+        elif (ctype or "").startswith("application/epub"):
+            wanted_suffixes = {".epub"}
+        else:
+            return None
+
+        candidates: list[Path] = [
+            child for child in attachment_dir.iterdir()
+            if child.is_file() and child.suffix.lower() in wanted_suffixes
+        ]
+        if not candidates:
+            return None
+        # Largest file wins — for PDFs this is almost always the body content
+        # rather than a stub or thumbnail.
+        return max(candidates, key=lambda p: p.stat().st_size)
 
     def _extract_fulltext_for_item(self, item_id: int) -> tuple[str, str] | None:
         """Attempt to extract fulltext and source from the item's best attachment.
 
         Priority order:
-        1. content_list.json (MinerU format) - highest quality structured text
-        2. .zotero-ft-cache - Zotero's pre-built index (instant, no timeout risk)
-        3. PDF - extract text using pdfminer
-        4. HTML - extract text using markitdown/BeautifulSoup
+        1. content_list.json (MinerU format) — highest-quality structured text,
+           including LaTeX math. This project's extension; upstream lacks it.
+           Source ``"content_list_json"``.
+        2. ``.zotero-ft-cache`` — Zotero's own already-indexed text. Instant (no
+           subprocess), keyed by attachment so it survives on-disk filename
+           drift (#291). Source ``"zotero-cache"``.
+        3. PDF extraction (pdfminer) — source ``"pdf"``.
+        4. HTML extraction — source ``"html"``.
+        5. Other textual attachments (.txt, .vtt, .srt, …) — source ``"file"``.
 
-        Returns (text, source) where source is 'content_list_json', 'zotero_cache',
-        'pdf', or 'html'.
+        If the sqlite-recorded filename doesn't resolve on disk, scan the
+        attachment's storage folder for a content-type-matching file before
+        giving up (#291, #265).
         """
+        # Priority 1: MinerU content_list.json (structured, highest quality,
+        # incl. LaTeX math via _extract_text_from_mineru_block).
         best_content_list_json = None
-        best_ft_cache = None
-        best_pdf = None
-        best_html = None
-
         for key, path, ctype in self._iter_parent_attachments(item_id):
+            if ctype != "application/pdf" and not (ctype or "").startswith("text/html"):
+                continue
             resolved = self._resolve_attachment_path(key, path or "")
             if not resolved or not resolved.exists():
-                continue
-
-            # Priority 1: Check for content_list.json in the attachment folder
-            if ctype == "application/pdf":
-                content_list = self._find_content_list_json(key, resolved)
-                logger.debug(f"Checking PDF attachment {key}: path={resolved}, content_list={content_list}")
-                if content_list and content_list.exists():
-                    logger.info(f"Found content_list.json: {content_list}")
-                    if best_content_list_json is None:
-                        best_content_list_json = content_list
-                # Priority 2: .zotero-ft-cache alongside the PDF
-                ft_cache = resolved.parent / ".zotero-ft-cache"
-                if ft_cache.exists() and best_ft_cache is None:
-                    best_ft_cache = ft_cache
-                if best_pdf is None:
-                    best_pdf = resolved
-            elif (ctype or "").startswith("text/html"):
-                # Also check for content_list.json alongside HTML
-                content_list = self._find_content_list_json(key, resolved)
-                if content_list and content_list.exists():
-                    if best_content_list_json is None:
-                        best_content_list_json = content_list
-                if best_html is None:
-                    best_html = resolved
-
-        # Priority 1: Use content_list.json if available (highest quality)
-        logger.debug(f"best_content_list_json={best_content_list_json}, best_ft_cache={best_ft_cache}, best_pdf={best_pdf}, best_html={best_html}")
+                resolved = self._scan_storage_for_attachment(key, ctype)
+                if not resolved or not resolved.exists():
+                    continue
+            content_list = self._find_content_list_json(key, resolved)
+            if content_list and content_list.exists():
+                best_content_list_json = content_list
+                break
         if best_content_list_json:
             text = self._extract_text_from_content_list_json(best_content_list_json)
             if text:
                 logger.info(f"Using content_list.json for item {item_id}: {best_content_list_json}")
                 return (text, "content_list_json")
 
-        # Priority 2: Use Zotero's pre-built full text cache (instant, no timeout risk)
-        if best_ft_cache:
-            text = self._read_zotero_ft_cache(best_ft_cache)
-            if text:
-                logger.info(f"Using .zotero-ft-cache for item {item_id}: {best_ft_cache}")
-                return (text, "zotero_cache")
+        # Priority 2: Zotero's own full-text cache — keyed by attachment, so it
+        # survives on-disk filename drift; no pdfminer subprocess needed.
+        for key, _path, _ctype in self._iter_parent_attachments(item_id):
+            cached = self._read_zotero_ft_cache(key)
+            if cached:
+                return (cached, "zotero-cache")
 
-        # Priority 3: Use PDF
-        if best_pdf:
-            text = self._extract_text_from_file(best_pdf)
-            if text == _EXTRACTION_TIMEOUT:
-                return (_EXTRACTION_TIMEOUT, "timeout")
-            if text:
-                return (text, "pdf")
-
-        # Priority 4: Use HTML
-        if best_html:
-            text = self._extract_text_from_file(best_html)
-            if text:
-                return (text, "html")
-
-        return None
+        # Priorities 3–5: resolve the best on-disk attachment and extract.
+        best_pdf = None
+        best_html = None
+        best_other = None
+        for key, path, ctype in self._iter_parent_attachments(item_id):
+            resolved = self._resolve_attachment_path(key, path or "")
+            if not resolved or not resolved.exists():
+                # Filename drift fallback: scan the storage folder.
+                resolved = self._scan_storage_for_attachment(key, ctype)
+                if not resolved or not resolved.exists():
+                    continue
+            if ctype == "application/pdf" and best_pdf is None:
+                best_pdf = resolved
+            elif (ctype or "").startswith("text/html") and best_html is None:
+                best_html = resolved
+            elif best_other is None and self._is_extractable_attachment(resolved, ctype):
+                best_other = resolved
+        # Prefer PDF, then HTML, then any extractable text file.
+        target = best_pdf or best_html or best_other
+        if not target:
+            return None
+        text = self._extract_text_from_file(target)
+        if text == _EXTRACTION_TIMEOUT:
+            return (_EXTRACTION_TIMEOUT, "timeout")
+        if not text:
+            return None
+        # Determine source type
+        source = "pdf" if target.suffix.lower() == ".pdf" else ("html" if target.suffix.lower() in {".html", ".htm"} else "file")
+        return (text, source)
 
     def close(self):
         """Close database connection."""
@@ -801,7 +904,8 @@ class LocalZoteroReader:
         """
 
         if limit:
-            query += f" LIMIT {limit}"
+            query += " LIMIT ?"
+            params.append(limit)
 
         # Materialize rows first so we can batch-fetch creators with a single
         # query keyed on the full set of itemIDs (avoids N+1 on large libraries)
@@ -1005,6 +1109,28 @@ class LocalZoteroReader:
     # Public helper to extract fulltext on demand for a specific item
     def extract_fulltext_for_item(self, item_id: int) -> tuple[str, str] | None:
         return self._extract_fulltext_for_item(item_id)
+
+    def get_attachment_paths(self, parent_key: str) -> list[dict]:
+        """Return resolved filesystem paths for a parent item's attachments.
+
+        Each entry has: ``key`` (attachment key), ``content_type``, ``zotero_path``
+        (the raw stored path like ``storage:foo.pdf``), ``resolved_path`` (a
+        ``Path`` or ``None`` if it could not be resolved), and ``exists`` (bool).
+        """
+        item = self.get_item_by_key(parent_key)
+        if not item:
+            return []
+        out: list[dict] = []
+        for att_key, zotero_path, ctype in self._iter_parent_attachments(item.item_id):
+            resolved = self._resolve_attachment_path(att_key, zotero_path or "")
+            out.append({
+                "key": att_key,
+                "content_type": ctype,
+                "zotero_path": zotero_path,
+                "resolved_path": resolved,
+                "exists": bool(resolved and resolved.exists()),
+            })
+        return out
 
     def get_item_by_key(self, key: str) -> ZoteroItem | None:
         """
