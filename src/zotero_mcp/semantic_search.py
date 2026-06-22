@@ -917,6 +917,18 @@ class ZoteroSemanticSearch:
                                 elif not chroma_has_fulltext and local_has_fulltext:
                                     # Document exists but lacks fulltext - we need to update it
                                     updated_existing += 1
+                                elif (existing_metadata.get("fulltext_source", "") != "content_list_json"
+                                      and reader.has_content_list_json(it.item_id)):
+                                    # MinerU upgrade: a content_list.json is now available
+                                    # but the indexed copy came from a lower-priority source
+                                    # (PDF / zotero-cache / none). Re-extract to upgrade it to
+                                    # the higher-quality structured text.
+                                    logger.info(
+                                        f"content_list.json now available for {it.key} "
+                                        f"(indexed source '{existing_metadata.get('fulltext_source', '')}') "
+                                        "— re-extracting"
+                                    )
+                                    updated_existing += 1
                                 else:
                                     should_extract = False
                                     skipped_existing += 1
