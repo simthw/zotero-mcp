@@ -36,6 +36,7 @@ Thumbs.db
 # Environment variables
 .env
 .env.local
+.pytest_tmp
 
 # Lock files
 uv.lock
@@ -43,3 +44,4 @@ uv.lock
 # Local project docs
 CLAUDE.md
 .claude/
+.mcp.json
