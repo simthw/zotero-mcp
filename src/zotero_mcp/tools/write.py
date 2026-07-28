@@ -3,10 +3,12 @@
 import json
 import os
 import re
+import shutil
 import tempfile
 import time as _time
 import xml.etree.ElementTree as ET
-from typing import Annotated, Literal
+from typing import Annotated, Literal, NamedTuple
+from urllib.parse import unquote, urlparse
 
 import requests
 from pydantic import Field
@@ -21,6 +23,9 @@ from zotero_mcp.tools import _helpers
 
 # Accessed as _helpers.X so that monkeypatch/mock on the module attribute works.
 CROSSREF_TYPE_MAP = _helpers.CROSSREF_TYPE_MAP
+
+# Shared by add_from_file and attach_file. URL attach mode is PDF-only.
+_ATTACH_ALLOWED_EXTS = {".pdf", ".epub", ".djvu", ".doc", ".docx", ".odt", ".rtf"}
 
 
 def _resolve_collections_arg(
@@ -1385,15 +1390,29 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
                     with open(filepath, "wb") as f:
                         for chunk in pdf_resp.iter_content(chunk_size=8192):
                             f.write(chunk)
-                    attach_result = write_zot.attachment_both(
-                        [(filename, filepath)],
-                        parentid=item_key,
+                    webdav_suffix = _helpers._webdav_first_attach(
+                        write_zot,
+                        filename,
+                        filepath,
+                        item_key,
+                        ctx,
+                        content_type="application/pdf",
                     )
-                    # Must run inside the with-block — temp file disappears on exit.
-                    webdav_suffix = _helpers._maybe_upload_to_webdav(
-                        attach_result, filepath, ctx
-                    )
-                pdf_status = "PDF attached" + webdav_suffix
+                    attach_ok = True
+                    if webdav_suffix is None:
+                        attach_ok, webdav_suffix, _key = _helpers._attach_and_verify(
+                            write_zot,
+                            filename,
+                            filepath,
+                            item_key,
+                            ctx,
+                            content_type="application/pdf",
+                        )
+                pdf_status = (
+                    "PDF attached" + webdav_suffix
+                    if attach_ok
+                    else f"no PDF attached ({webdav_suffix})"
+                )
             except Exception as e:
                 ctx.info(f"arXiv PDF attachment failed (non-fatal): {e}")
                 pdf_status = f"no PDF attached ({e})"
@@ -2229,13 +2248,14 @@ def merge_duplicates(
         if not dup_keys:
             return "Error: No duplicate keys to merge (after removing keeper if present)."
 
-        # Fetch all items and children
+        # Fetch all items and children (children() returns only the first
+        # API page without explicit pagination — see _paginate)
         keeper = write_zot.item(keeper_key)
-        keeper_children = write_zot.children(keeper_key)
+        keeper_children = _helpers._paginate(write_zot.children, keeper_key)
         duplicates = []
         for dk in dup_keys:
             dup_item = write_zot.item(dk)
-            dup_children = write_zot.children(dk)
+            dup_children = _helpers._paginate(write_zot.children, dk)
             duplicates.append({"item": dup_item, "children": dup_children})
 
         # Compute what will be merged
@@ -2406,6 +2426,117 @@ def merge_duplicates(
         return f"Error merging duplicates: {e}"
 
 
+# ---------------------------------------------------------------------------
+# PDF outline extraction — isolated from the server process (#372)
+# ---------------------------------------------------------------------------
+
+# Exit code the child uses to report "PyMuPDF is not installed".
+_TOC_EXIT_NO_PYMUPDF = 3
+
+# Seconds to wait for the child before killing it. Reading an outline is
+# fast; keep this under the Zotero API lock's wait bound (45s) so a hung PDF
+# can't cascade into "Zotero API busy" errors on every other tool.
+_TOC_TIMEOUT = 30
+
+# Child script. It imports ONLY fitz — never zotero_mcp — so the subprocess
+# cannot trigger FastMCP server initialization, the same constraint that
+# forced subprocess over multiprocessing in local_db._extract_text_from_pdf
+# (macOS 'spawn' deadlock, #178).
+_TOC_CHILD_SCRIPT = (
+    "import json, sys\n"
+    "try:\n"
+    "    import fitz\n"
+    "except ImportError:\n"
+    f"    sys.exit({_TOC_EXIT_NO_PYMUPDF})\n"
+    "doc = fitz.open(sys.argv[1])\n"
+    "toc = doc.get_toc()\n"
+    "doc.close()\n"
+    "sys.stdout.write(json.dumps(toc))\n"
+)
+
+
+class TocOutcome(NamedTuple):
+    """Result of :func:`_extract_pdf_toc`.
+
+    ``status`` is one of ``ok``, ``no_pymupdf``, ``crashed``, ``timeout`` or
+    ``error``; ``detail`` carries a short human-readable reason for the
+    non-ok statuses.
+    """
+
+    status: str
+    toc: list
+    detail: str = ""
+
+
+def _extract_pdf_toc(pdf_path: str, timeout: int = _TOC_TIMEOUT) -> TocOutcome:
+    """Read a PDF's table of contents in a throwaway child process.
+
+    ``fitz.Document.get_toc()`` segfaults on some born-digital journal PDFs
+    (#372). A segfault cannot be caught in-process: it takes the whole MCP
+    server down ("Server disconnected"), so the call has to run somewhere
+    that is allowed to die. ``subprocess.run`` waits on the child on every
+    exit path — success, crash, and timeout-kill — so no zombies are left
+    behind.
+    """
+    import subprocess
+    import sys
+
+    # Strip API keys from the child's environment: the TOC reader does not
+    # need them, and leaking them via crash dumps (which this child is
+    # expected to produce) or /proc/<pid>/environ is needless exposure.
+    child_env = os.environ.copy()
+    for _key in (
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ZOTERO_API_KEY",
+    ):
+        child_env.pop(_key, None)
+    child_env.setdefault("PYTHONIOENCODING", "utf-8")
+    child_env.setdefault("PYTHONUTF8", "1")
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _TOC_CHILD_SCRIPT, str(pdf_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=child_env,
+        )
+    except subprocess.TimeoutExpired:
+        return TocOutcome("timeout", [], f"no response after {timeout}s")
+    except Exception as exc:
+        return TocOutcome("error", [], str(exc))
+
+    if proc.returncode == 0:
+        try:
+            return TocOutcome("ok", json.loads(proc.stdout or "[]"))
+        except ValueError as exc:
+            return TocOutcome("error", [], f"unreadable outline data: {exc}")
+
+    if proc.returncode == _TOC_EXIT_NO_PYMUPDF:
+        return TocOutcome("no_pymupdf", [])
+
+    # POSIX reports a fatal signal as a negative return code; Windows reports
+    # access violations and friends as NTSTATUS-style codes (0xC0000005, ...).
+    if proc.returncode < 0:
+        import signal
+
+        try:
+            name = signal.Signals(-proc.returncode).name
+        except ValueError:
+            name = f"signal {-proc.returncode}"
+        return TocOutcome("crashed", [], name)
+    if proc.returncode >= 0xC0000000:
+        return TocOutcome("crashed", [], f"exit code 0x{proc.returncode:08X}")
+
+    stderr = (proc.stderr or "").strip()
+    return TocOutcome("error", [], stderr[:300] or f"exit code {proc.returncode}")
+
+
 @mcp.tool(
     name="zotero_get_pdf_outline",
     description=(
@@ -2421,7 +2552,7 @@ def merge_duplicates(
         "are accepted; attachment-to-parent resolution is automatic. "
         "Find the right key with zotero_get_item_children if unsure. "
         "Scope: PDFs only (EPUBs have no outline extraction here). "
-        "Requires PyMuPDF (pip install zotero-mcp-server[pdf]). "
+        "Requires PyMuPDF (the [pdf] extra). "
         "Read-only; works in local or web mode. "
         "Example: zotero_get_pdf_outline(item_key='RTKZQI8E')."
     )
@@ -2436,40 +2567,80 @@ def get_pdf_outline(
         zot = _client.get_zotero_client()
         ctx.info(f"Getting PDF outline for item {item_key}")
 
-        # Find PDF attachment
-        children = zot.children(item_key)
-        pdf_child = None
-        for child in children:
-            if child.get("data", {}).get("contentType") == "application/pdf":
-                pdf_child = child
-                break
+        attachment_key = None
+        filename = "document.pdf"
 
-        if not pdf_child:
+        # The key may name the PDF attachment itself — attachments have no
+        # children, so the parent scan below would find nothing (#372).
+        try:
+            item = zot.item(item_key)
+        except Exception:
+            item = None
+        data = item.get("data", {}) if isinstance(item, dict) else {}
+        if (
+            data.get("itemType") == "attachment"
+            and data.get("contentType") == "application/pdf"
+        ):
+            attachment_key = item.get("key") or data.get("key") or item_key
+            filename = data.get("filename") or f"{attachment_key}.pdf"
+        else:
+            for child in _helpers._paginate(zot.children, item_key):
+                child_data = child.get("data", {})
+                if child_data.get("contentType") == "application/pdf":
+                    attachment_key = child["key"]
+                    filename = child_data.get("filename") or "document.pdf"
+                    break
+
+        if not attachment_key:
             return f"No PDF attachment found for item `{item_key}`."
 
-        try:
-            import fitz
-        except ImportError:
-            return "Error: PyMuPDF (fitz) is required for PDF outline extraction."
-
-        attachment_key = pdf_child["key"]
-        filename = pdf_child.get("data", {}).get("filename", "document.pdf")
-
-        # Download PDF (works for both local/WebDAV/web storage)
+        # Download via the multi-source downloader so WebDAV- and
+        # local-storage-backed attachments work, not just Zotero cloud.
+        local_mode = _utils.is_local_mode()
         with tempfile.TemporaryDirectory() as tmpdir:
-            zot.dump(attachment_key, filename=filename, path=tmpdir)
-            pdf_path = os.path.join(tmpdir, filename)
-            if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
-                return f"Could not download PDF for attachment `{attachment_key}`."
-            doc = fitz.open(pdf_path)
-            toc = doc.get_toc()
-            doc.close()
+            download = _client.download_attachment_file(
+                attachment_key,
+                tmpdir,
+                os.path.basename(filename),
+                local_client=zot if local_mode else _client.get_local_zotero_client(),
+                web_client=None if local_mode else zot,
+            )
+            pdf_path = download.path
+            if not pdf_path or not pdf_path.exists() or pdf_path.stat().st_size == 0:
+                detail = f" ({'; '.join(download.errors)})" if download.errors else ""
+                return f"Could not download PDF for attachment `{attachment_key}`.{detail}"
 
-        if not toc:
+            outcome = _extract_pdf_toc(str(pdf_path))
+
+        if outcome.status == "no_pymupdf":
+            return (
+                "Error: PyMuPDF (fitz) is required for PDF outline extraction. "
+                f"{_utils.install_hint('pdf')}"
+            )
+        if outcome.status == "crashed":
+            return (
+                f"Could not read the outline of attachment `{attachment_key}`: "
+                f"the PDF reader crashed on this file ({outcome.detail}). The "
+                "crash was contained in a separate process, so the server is "
+                "unaffected. Try zotero_read_pdf_pages or "
+                "zotero_get_item_fulltext for this item instead."
+            )
+        if outcome.status == "timeout":
+            return (
+                f"Timed out reading the outline of attachment "
+                f"`{attachment_key}` ({outcome.detail})."
+            )
+        if outcome.status != "ok":
+            return (
+                f"Error extracting PDF outline for attachment "
+                f"`{attachment_key}`: {outcome.detail}"
+            )
+
+        if not outcome.toc:
             return "This PDF does not contain a table of contents/outline."
 
         lines = [f"# PDF Outline for item `{item_key}`", ""]
-        for level, title, page in toc:
+        for level, title, page in outcome.toc:
             indent = "  " * (level - 1)
             lines.append(f"{indent}- {title} (p. {page})")
 
@@ -2551,7 +2722,7 @@ def add_from_file(
             return f"Error: {e}"
 
         ext = os.path.splitext(file_path)[1].lower()
-        allowed_exts = {".pdf", ".epub", ".djvu", ".doc", ".docx", ".odt", ".rtf"}
+        allowed_exts = _ATTACH_ALLOWED_EXTS
         if ext not in allowed_exts:
             return f"Error: Unsupported file type '{ext}'. Allowed: {', '.join(sorted(allowed_exts))}"
 
@@ -2632,13 +2803,8 @@ def add_from_file(
         try:
             display_name = os.path.basename(file_path)
             if item_reused:
-                try:
-                    kids = write_zot.children(parent_key)
-                except Exception:
-                    kids = []
-                if any(
-                    (k.get("data", {}) or {}).get("filename") == display_name
-                    for k in kids
+                if _helpers._attachment_filename_exists(
+                    write_zot, parent_key, display_name
                 ):
                     return (
                         f"{result_msg}\n"
@@ -2647,13 +2813,28 @@ def add_from_file(
                         "zotero_update_search_database._"
                     )
 
-            attach_result = write_zot.attachment_both(
-                [(display_name, file_path)],
-                parentid=parent_key,
+            webdav_suffix = _helpers._webdav_first_attach(
+                write_zot,
+                display_name,
+                file_path,
+                parent_key,
+                ctx,
+                content_type=_helpers._guess_content_type(display_name),
             )
+            attach_ok = True
+            if webdav_suffix is None:
+                attach_ok, webdav_suffix, _key = _helpers._attach_and_verify(
+                    write_zot,
+                    display_name,
+                    file_path,
+                    parent_key,
+                    ctx,
+                    content_type=_helpers._guess_content_type(display_name),
+                )
             attach_info = (
-                f"File attached: {display_name}"
-                + _helpers._maybe_upload_to_webdav(attach_result, file_path, ctx)
+                f"File attached: {display_name}" + webdav_suffix
+                if attach_ok
+                else f"Item created but file attachment FAILED: {webdav_suffix}"
             )
         except Exception as e:
             attach_info = f"Item created but file attachment failed: {e}"
@@ -2669,6 +2850,221 @@ def add_from_file(
     except Exception as e:
         ctx.error(f"Error adding from file: {e}")
         return f"Error adding from file: {e}"
+
+
+def _upload_attachment(write_zot, item_key, display_name, filepath, ctx):
+    """Dedupe-checked upload of ``filepath`` onto ``item_key``.
+
+    Returns the user-facing markdown message. Idempotent: if the item
+    already has a child attachment stored under ``display_name`` or with
+    identical content (MD5), nothing is uploaded.
+    """
+    file_md5 = _helpers._file_md5(filepath)
+    existing = _helpers._find_child_attachment(
+        write_zot,
+        item_key,
+        filename=display_name,
+        file_md5=file_md5,
+    )
+    if existing is not None:
+        data = existing.get("data", {}) or {}
+        existing_key = existing.get("key") or data.get("key")
+        key_note = f" (key `{existing_key}`)" if existing_key else ""
+        existing_name = data.get("filename")
+        if existing_name == display_name:
+            msg = (
+                f"Attachment already present on `{item_key}`: {display_name}"
+                f"{key_note} — not re-uploaded."
+            )
+            if file_md5 and data.get("md5") and data["md5"] != file_md5:
+                msg += (
+                    " Note: the local file's content differs from the stored "
+                    "copy — delete the existing attachment first to replace it."
+                )
+            return msg
+        return (
+            f"Identical file (same MD5) already attached to `{item_key}` as "
+            f"'{existing_name}'{key_note} — '{display_name}' not re-uploaded."
+        )
+    ok, suffix, attachment_key = _helpers._attach_and_verify(
+        write_zot,
+        display_name,
+        filepath,
+        item_key,
+        ctx,
+        content_type=_helpers._guess_content_type(display_name),
+    )
+    if not ok:
+        return (
+            f"Error: upload of '{display_name}' to `{item_key}` failed: {suffix}"
+        )
+    key_note = f" (key `{attachment_key}`)" if attachment_key else ""
+    return (
+        f"File attached to `{item_key}`: {display_name}{key_note}{suffix}\n\n"
+        "_Note: To include this item in semantic search, run "
+        "zotero_update_search_database._"
+    )
+
+
+@mcp.tool(
+    name="zotero_attach_file",
+    description=(
+        "Attach a file to an EXISTING Zotero item as an imported child "
+        "attachment (uploads the file bytes). Use when the item is already "
+        "in the library and you have its key — e.g. attaching a PDF you "
+        "found for a reference. To create a NEW item from a file, use "
+        "zotero_add_from_file instead. "
+        "item_key: key of the existing REGULAR item. Passing an "
+        "attachment/note key fails with a hint to use its parent. "
+        "file_path: ABSOLUTE local path (.pdf, .epub, .djvu, .doc, .docx, "
+        ".odt, .rtf). "
+        "url: direct http(s) link, downloaded server-side — PDF-only; for "
+        "other formats download locally and use file_path. Exactly one of "
+        "file_path/url must be given. "
+        "filename: optional stored-filename override; defaults to the "
+        "file's basename or the URL's last path segment (falling back to "
+        "<item_key>.pdf); a missing extension is appended automatically. "
+        "Returns the created attachment's key. Idempotent: if the item "
+        "already has an attachment with the same filename or identical "
+        "content (MD5), nothing is re-uploaded. Requires a writable library "
+        "(fails in local-only mode). Uploads count against the Zotero "
+        "cloud storage quota unless WebDAV sync is configured. Run "
+        "zotero_update_search_database afterwards to index the new file "
+        "for semantic search. "
+        "Example: zotero_attach_file(item_key='ABCD2345', "
+        "file_path='/Users/me/smith-2020.pdf')."
+    ),
+)
+@with_zotero_api_lock
+def attach_file(
+    item_key: str,
+    file_path: str | None = None,
+    url: str | None = None,
+    filename: str | None = None,
+    *,
+    ctx: Context,
+) -> str:
+    try:
+        _read_zot, write_zot = _helpers._get_write_client(ctx)
+    except ValueError as e:
+        return str(e)
+
+    try:
+        if bool(file_path) == bool(url):
+            return "Error: Provide exactly one of file_path or url."
+
+        # Validate the parent item before touching any file.
+        try:
+            item = write_zot.item(item_key)
+        except Exception as e:
+            return f"Error: Item '{item_key}' not found ({e})."
+        item_data = item.get("data", {}) or {}
+        item_type = item_data.get("itemType")
+        if item_type in ("attachment", "note", "annotation"):
+            parent = item_data.get("parentItem")
+            hint = f" Use its parent item key '{parent}' instead." if parent else ""
+            return (
+                f"Error: '{item_key}' has itemType '{item_type}', not a "
+                f"regular item — attachments must go on the parent item.{hint}"
+            )
+
+        if filename:
+            # Strip any path components from a caller-supplied name.
+            filename = os.path.basename(filename.strip())
+
+        if file_path:
+            # Path validation — check symlink BEFORE resolving
+            if os.path.islink(file_path):
+                return "Error: Symlinks are not allowed for security reasons."
+            if not os.path.isabs(file_path):
+                return "Error: file_path must be an absolute path."
+            file_path = os.path.realpath(file_path)
+            if not os.path.isfile(file_path):
+                return f"Error: File not found: {file_path}"
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext not in _ATTACH_ALLOWED_EXTS:
+                return (
+                    f"Error: Unsupported file type '{ext}'. "
+                    f"Allowed: {', '.join(sorted(_ATTACH_ALLOWED_EXTS))}"
+                )
+            if filename and not filename.lower().endswith(ext):
+                # Mirror the URL branch's .pdf enforcement: an override
+                # without the source's extension would strip it from the
+                # stored file (and break the MIME-type guess).
+                filename += ext
+            display_name = filename or os.path.basename(file_path)
+            ctx.info(f"Attaching local file to {item_key}: {display_name}")
+            if filename and filename != os.path.basename(file_path):
+                # pyzotero's attachment_both() derives the *stored* filename
+                # from the real file's basename, not the title tuple element
+                # — stage the file under the override name in a scratch dir
+                # so the override actually controls what gets stored (and so
+                # the dedupe check in _upload_attachment, which compares
+                # against stored filenames, converges on re-run).
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    staged_path = os.path.join(tmpdir, filename)
+                    shutil.copy2(file_path, staged_path)
+                    # Must run inside the with-block — temp file disappears on exit.
+                    return _upload_attachment(
+                        write_zot, item_key, display_name, staged_path, ctx
+                    )
+            return _upload_attachment(write_zot, item_key, display_name, file_path, ctx)
+
+        return _attach_from_url(write_zot, item_key, url, filename, ctx)
+
+    except Exception as e:
+        ctx.error(f"Error attaching file: {e}")
+        return f"Error attaching file: {e}"
+
+
+def _attach_from_url(write_zot, item_key, url, filename, ctx):
+    """Download ``url`` (PDF-only) and attach it to ``item_key``.
+
+    The URL is user/LLM-supplied, so it goes through ``_guarded_pdf_get``
+    (SSRF guard + per-hop redirect re-validation) like the third-party
+    OA-PDF URLs elsewhere in the codebase.
+    """
+    if not url.lower().startswith(("http://", "https://")):
+        return "Error: url must be an http(s) URL."
+
+    ctx.info(f"Downloading PDF for {item_key}: {url}")
+    resp = _helpers._guarded_pdf_get(url, ctx)
+    if resp is None:
+        return (
+            "Error: URL rejected (unreachable, resolves to a private "
+            "network, or too many redirects)."
+        )
+    try:
+        resp.raise_for_status()
+    except Exception as e:
+        return f"Error: Download failed: {e}"
+
+    content_type = resp.headers.get("Content-Type", "")
+    if "pdf" not in content_type and "octet-stream" not in content_type:
+        return (
+            f"Error: URL did not return a PDF (Content-Type: "
+            f"{content_type}). For non-PDF formats, download the file "
+            "locally and use file_path."
+        )
+
+    if not filename:
+        seg = os.path.basename(unquote(urlparse(url).path))
+        filename = seg if seg.lower().endswith(".pdf") else f"{item_key}.pdf"
+    elif not filename.lower().endswith(".pdf"):
+        filename += ".pdf"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        filepath = os.path.join(tmpdir, filename)
+        with open(filepath, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+        if os.path.getsize(filepath) < 1000:
+            return (
+                "Error: Downloaded file is under 1 KB — likely an error "
+                "page, not a real PDF."
+            )
+        # Must run inside the with-block — temp file disappears on exit.
+        return _upload_attachment(write_zot, item_key, filename, filepath, ctx)
 
 
 def _build_relation_uri(library_type: str, library_id: str, item_key: str) -> str:

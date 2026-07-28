@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from zotero_mcp.utils import install_hint, suppress_stdout
+
 try:
     import chromadb
     from chromadb import Documents, EmbeddingFunction, Embeddings
@@ -18,11 +20,8 @@ try:
     from chromadb.utils.embedding_functions import register_embedding_function
 except ImportError as e:
     raise ImportError(
-        "chromadb is required for semantic search. "
-        "Install it with: pip install 'zotero-mcp-server[semantic]'"
+        f"chromadb is required for semantic search. {install_hint('semantic')}"
     ) from e
-
-from zotero_mcp.utils import suppress_stdout
 
 logger = logging.getLogger(__name__)
 
@@ -80,14 +79,26 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
             "base_url": self.base_url,
             "request_batch_size": self.request_batch_size,
             "rate_limit_rps": self.rate_limit_rps,
+            # ChromaDB's built-in EF of the same registered name rebuilds from
+            # {api_key_env_var, model_name, api_base, ...} and asserts ("This
+            # code should not be reached") when those are missing. Persisting
+            # its spellings too keeps the stored config buildable by whichever
+            # class wins the registry lookup (issue #382).
+            "api_key_env_var": "OPENAI_API_KEY",
+            "api_base": self.base_url,
         }
 
     @staticmethod
     def build_from_config(config: dict[str, Any]) -> "OpenAIEmbeddingFunction":
+        # Accept either key spelling so a config written by ChromaDB's built-in
+        # (api_base / api_key_env_var) rebuilds here too.
+        api_key = config.get("api_key")
+        if not api_key and config.get("api_key_env_var"):
+            api_key = os.getenv(config["api_key_env_var"])
         return OpenAIEmbeddingFunction(
             model_name=config.get("model_name", "text-embedding-3-small"),
-            api_key=config.get("api_key"),
-            base_url=config.get("base_url"),
+            api_key=api_key,
+            base_url=config.get("base_url") or config.get("api_base"),
             request_batch_size=config.get("request_batch_size"),
             rate_limit_rps=config.get("rate_limit_rps"),
         )
@@ -334,7 +345,14 @@ class HuggingFaceEmbeddingFunction(EmbeddingFunction):
         return "huggingface"
 
     def get_config(self) -> dict[str, Any]:
-        return {"model_name": self.model_name}
+        return {
+            "model_name": self.model_name,
+            # ChromaDB's built-in "huggingface" EF requires api_key_env_var in
+            # addition to model_name and asserts without it. Persisting the key
+            # keeps the config buildable by either class (issue #382); our own
+            # build_from_config ignores it (we embed locally, no API key).
+            "api_key_env_var": "HUGGINGFACE_API_KEY",
+        }
 
     @staticmethod
     def build_from_config(config: dict[str, Any]) -> "HuggingFaceEmbeddingFunction":
@@ -378,42 +396,78 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
     # Ollama models vary; use a conservative, char-based fallback budget.
     max_input_tokens = 8000
 
-    def __init__(self, model_name: str = "qwen3-embedding", base_url: str | None = None):
+    # HTTP timeout (seconds) for /api/embed. Persisted in get_config() because
+    # ChromaDB's built-in ollama EF requires a ``timeout`` key.
+    DEFAULT_TIMEOUT = 120
+
+    def __init__(self, model_name: str = "qwen3-embedding", base_url: str | None = None,
+                 url: str | None = None, timeout: int | None = None):
         self.model_name = model_name
-        self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434").rstrip("/")
+        # ``url`` is ChromaDB's built-in spelling of ``base_url``; accept both
+        # so a config written by either class rebuilds here (issue #382).
+        self.base_url = (
+            base_url or url or os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434"
+        ).rstrip("/")
+        # Mirror the attribute under the built-in's name as well.
+        self.url = self.base_url
+        self.timeout = int(timeout) if timeout else self.DEFAULT_TIMEOUT
 
     @staticmethod
     def name() -> str:
         return "ollama"
 
     def get_config(self) -> dict[str, Any]:
-        return {"model_name": self.model_name, "base_url": self.base_url}
+        return {
+            "model_name": self.model_name,
+            "base_url": self.base_url,
+            # ChromaDB ships its own OllamaEmbeddingFunction registered under
+            # the same name "ollama". Whichever class wins the registry lookup
+            # gets this dict when the persisted collection config is rebuilt at
+            # query time; the built-in reads url/model_name/timeout and asserts
+            # "This code should not be reached" when any is missing (#382).
+            # Carrying both spellings makes the config valid for both classes.
+            "url": self.base_url,
+            "timeout": self.timeout,
+        }
 
     @staticmethod
     def build_from_config(config: dict[str, Any]) -> "OllamaEmbeddingFunction":
         return OllamaEmbeddingFunction(
             model_name=config.get("model_name", "qwen3-embedding"),
-            base_url=config.get("base_url"),
+            base_url=config.get("base_url") or config.get("url"),
+            timeout=config.get("timeout"),
         )
 
     def __call__(self, input: Documents) -> Embeddings:
-        """Generate embeddings using Ollama's local embeddings endpoint."""
+        """Generate embeddings using Ollama's /api/embed endpoint.
+
+        Unlike the deprecated /api/embeddings route (single ``prompt`` -> single
+        ``embedding``), /api/embed accepts a batch via ``input`` and returns a
+        list under ``embeddings``, so the whole batch is sent in one request
+        instead of one request per document.
+        """
         try:
             import requests
         except ImportError:
             raise ImportError("requests package is required for Ollama embeddings")
 
-        embeddings = []
-        endpoint = f"{self.base_url}/api/embeddings"
-        for text in input:
-            response = requests.post(
-                endpoint,
-                json={"model": self.model_name, "prompt": text},
-                timeout=120,
+        texts = list(input)
+        if not texts:
+            return []
+
+        endpoint = f"{self.base_url}/api/embed"
+        response = requests.post(
+            endpoint,
+            json={"model": self.model_name, "input": texts},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        data = response.json()
+        embeddings = data.get("embeddings")
+        if embeddings is None:
+            raise ValueError(
+                f"Ollama /api/embed returned no 'embeddings' field: {data}"
             )
-            response.raise_for_status()
-            data = response.json()
-            embeddings.append(data["embedding"])
         return embeddings
 
     def embed_query(self, text: str) -> list[float]:
@@ -426,6 +480,32 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
         if len(text) > max_chars:
             text = text[:max_chars]
         return text
+
+
+#: Our embedding functions, in registration order. Three of the four names
+#: ("openai", "huggingface", "ollama") collide with ChromaDB built-ins.
+CUSTOM_EMBEDDING_FUNCTIONS = (
+    OpenAIEmbeddingFunction,
+    GeminiEmbeddingFunction,
+    HuggingFaceEmbeddingFunction,
+    OllamaEmbeddingFunction,
+)
+
+
+def ensure_embedding_functions_registered() -> None:
+    """(Re-)claim our embedding-function names in ChromaDB's registry.
+
+    ``known_embedding_functions`` is a plain last-write-wins dict, so import
+    order decides whether a colliding name resolves to our class or to
+    ChromaDB's built-in. Re-registering immediately before a collection is
+    opened means a built-in that got imported after this module still cannot
+    shadow us and mis-handle our persisted config (issue #382).
+    """
+    for cls in CUSTOM_EMBEDDING_FUNCTIONS:
+        try:
+            register_embedding_function(cls)
+        except Exception as e:  # pragma: no cover - registry API change
+            logger.debug(f"Could not re-register {cls.__name__}: {e}")
 
 
 class ChromaClient:
@@ -457,6 +537,11 @@ class ChromaClient:
             persist_directory = str(config_dir / "chroma_db")
 
         self.persist_directory = persist_directory
+
+        # Make sure our classes — not ChromaDB's same-named built-ins — answer
+        # the registry lookup used when a persisted collection config is
+        # rebuilt below (issue #382).
+        ensure_embedding_functions_registered()
 
         # Initialize ChromaDB client with stdout suppression
         with suppress_stdout():
@@ -628,11 +713,19 @@ class ChromaClient:
             ids: List of unique IDs for each document
         """
         try:
-            self.collection.upsert(
-                documents=documents,
-                metadatas=metadatas,
-                ids=ids
-            )
+            # ChromaDB rejects batches larger than its max_batch_size
+            # (~5461). With passage-chunking enabled a batch of 25 books
+            # easily exceeds that, so split instead of failing.
+            try:
+                max_batch = int(self.client.get_max_batch_size())
+            except Exception:
+                max_batch = 5000
+            for i in range(0, len(ids), max_batch):
+                self.collection.upsert(
+                    documents=documents[i:i + max_batch],
+                    metadatas=metadatas[i:i + max_batch],
+                    ids=ids[i:i + max_batch]
+                )
             logger.info(f"Upserted {len(documents)} documents to ChromaDB collection")
         except Exception as e:
             logger.error(f"Error upserting documents to ChromaDB: {e}")
@@ -783,16 +876,22 @@ class ChromaClient:
 
     def get_document_metadata(self, doc_id: str) -> dict[str, Any] | None:
         """
-        Get metadata for a document if it exists.
+        Get metadata for an item if it is indexed.
+
+        With passage chunking enabled, an item is stored only under its chunk
+        ids (``<key>#<n>``) and never under the bare item key, so an exact-id
+        lookup on the key alone misses every chunked item. Chunk 0 carries the
+        same item-level metadata (``date_modified``, ``has_fulltext``) that
+        callers need, so fall back to it.
 
         Args:
-            doc_id: Document ID to look up
+            doc_id: Item key (or full document id) to look up
 
         Returns:
-            Metadata dictionary if document exists, None otherwise
+            Metadata dictionary if the item is indexed, None otherwise
         """
         try:
-            result = self.collection.get(ids=[doc_id], include=["metadatas"])
+            result = self.collection.get(ids=[doc_id, f"{doc_id}#0"], include=["metadatas"])
             if result['ids'] and result['metadatas']:
                 return result['metadatas'][0]
             return None
@@ -929,13 +1028,34 @@ class _NoEmbeddingFunction(EmbeddingFunction):
     for the default backend, eagerly downloads the ~80MB ONNX MiniLM model.
     Counting rows never embeds anything, so this is never actually called; it
     raises if it ever is, to make misuse loud rather than silently wrong.
+
+    ``name()`` MUST return ``"default"``. ChromaDB >=1.x validates the supplied
+    embedding function against the collection's persisted config in
+    ``validate_embedding_function_conflict_on_get`` and raises a ``ValueError``
+    whenever the supplied ``name()`` differs from the persisted one — *unless*
+    the supplied name is ``"default"``, which short-circuits the check. Without
+    this, opening a collection that was built with any real backend (default,
+    openai, gemini, ...) raises a conflict; ``read_collection_status`` then
+    swallowed that error and reported "0 documents / not initialized" against a
+    fully populated database (issue #362).
     """
+
+    def __init__(self):
+        pass
 
     def __call__(self, input: Documents) -> Embeddings:  # pragma: no cover - never invoked
         raise RuntimeError("embedding is unavailable in status-only mode")
 
+    @staticmethod
+    def name() -> str:
+        return "default"
 
-def read_collection_status(config_path: str | None = None) -> dict[str, Any]:
+
+def read_collection_status(
+    config_path: str | None = None,
+    *,
+    persist_directory: str | None = None,
+) -> dict[str, Any]:
     """Read ChromaDB collection stats WITHOUT loading an embedding model.
 
     The full :class:`ChromaClient` constructor builds the embedding function,
@@ -945,6 +1065,9 @@ def read_collection_status(config_path: str | None = None) -> dict[str, Any]:
     configured model name, neither of which requires the model itself. This
     opens the persisted database directly and reads the count, mirroring the
     shape returned by :meth:`ChromaClient.get_collection_info`.
+
+    ``persist_directory`` defaults to ``ChromaClient``'s location
+    (``~/.config/zotero-mcp/chroma_db``); it is parameterised for testing.
     """
     collection_name = "zotero_library"
     embedding_model = "default"
@@ -964,7 +1087,8 @@ def read_collection_status(config_path: str | None = None) -> dict[str, Any]:
     if env_model and embedding_model in (None, "default"):
         embedding_model = env_model
 
-    persist_directory = str(Path.home() / ".config" / "zotero-mcp" / "chroma_db")
+    if persist_directory is None:
+        persist_directory = str(Path.home() / ".config" / "zotero-mcp" / "chroma_db")
     base = {
         "name": collection_name,
         "embedding_model": embedding_model,

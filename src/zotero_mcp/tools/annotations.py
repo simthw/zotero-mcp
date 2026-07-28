@@ -232,7 +232,12 @@ def get_annotations(
                                                     "annotationComment": processed.get("comment", ""),
                                                     "annotationColor": processed.get("color", ""),
                                                     "parentItem": item_key,
-                                                    "tags": [],
+                                                    # Better BibTeX hands tags back as
+                                                    # bare strings; normalize to Zotero's
+                                                    # {"tag": ...} shape so they render (#377).
+                                                    "tags": _helpers._normalize_item_tags(
+                                                        processed.get("tags") or anno.get("tags")
+                                                    ),
                                                     "_pdf_page": processed.get("page", 0),
                                                     "_pageLabel": processed.get("pageLabel", ""),
                                                     "_attachment_title": attachment.get("title", ""),
@@ -295,7 +300,7 @@ def get_annotations(
                     # Ensure PDF annotation tool is installed
                     if ensure_pdfannots_installed():
                         # Get PDF attachments via the resolved parent key
-                        children = zot.children(parent_item_key)
+                        children = _helpers._paginate(zot.children, parent_item_key)
                         pdf_attachments = [
                             item for item in children
                             if item.get("data", {}).get("contentType") == "application/pdf"
@@ -330,7 +335,9 @@ def get_annotations(
                                                 "annotationComment": ext.get("comment", ""),
                                                 "annotationColor": ext.get("color", ""),
                                                 "parentItem": item_key,
-                                                "tags": [],
+                                                # pdfannots2json only emits tags for some
+                                                # annotation kinds; carry them when present (#377).
+                                                "tags": _helpers._normalize_item_tags(ext.get("tags")),
                                                 "_pdf_page": ext.get("page", 0),
                                                 "_from_pdf_extraction": True,
                                                 "_attachment_title": attachment.get("data", {}).get("title", "PDF")
@@ -444,11 +451,10 @@ def get_annotations(
             if "_image_path" in data and os.path.exists(data["_image_path"]):
                 output.append("**Image:** This annotation includes an image (not displayed in this interface)")
 
-            # Tags
-            if tags := data.get("tags"):
+            # Tags (normalized so a non-web-API source can't KeyError here)
+            if tags := _helpers._normalize_item_tags(data.get("tags")):
                 tag_list = [f"`{t['tag']}`" for t in tags]
-                if tag_list:
-                    output.append(f"**Tags:** {' '.join(tag_list)}")
+                output.append(f"**Tags:** {' '.join(tag_list)}")
 
             output.append("")  # Empty line between annotations
 
@@ -1212,7 +1218,7 @@ def delete_note(
         "color: hex color (default '#ffd400' yellow). "
         "comment: optional note attached to the highlight. "
         "tags: optional list of tag strings to apply to the annotation. "
-        "Requires PyMuPDF (pip install zotero-mcp-server[pdf]) and a "
+        "Requires PyMuPDF (the [pdf] extra) and a "
         "writable library (web API key or hybrid mode). "
         "Example: zotero_create_annotation(attachment_key='NHZFE5A7', "
         "page=4, text='mindfulness-based therapy', comment='definition to "

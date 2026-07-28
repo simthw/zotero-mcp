@@ -1,68 +1,19 @@
 """Shared private helpers used across tool modules."""
 
+import hashlib
 import json
 import os
 import re
 import socket
 import tempfile
 from ipaddress import ip_address
-from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import requests
 
 from zotero_mcp import client as _client
 from zotero_mcp import utils as _utils
-
-# ---------------------------------------------------------------------------
-# Config file
-# ---------------------------------------------------------------------------
-
-ZOTERO_MCP_CONFIG_PATH = Path.home() / ".config" / "zotero-mcp" / "config.json"
-
-
-def _load_zotero_mcp_config() -> dict:
-    """Return the parsed ``~/.config/zotero-mcp/config.json``, or ``{}``.
-
-    Missing file or parse errors yield an empty dict so callers can use
-    ``.get(...)`` chains without guarding.
-    """
-    if not ZOTERO_MCP_CONFIG_PATH.exists():
-        return {}
-    try:
-        with open(ZOTERO_MCP_CONFIG_PATH, encoding="utf-8") as f:
-            return json.load(f) or {}
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-# ---------------------------------------------------------------------------
-# Pagination helper
-# ---------------------------------------------------------------------------
-
-def _paginate(zot_method, *args, max_items=None, **kwargs):
-    """Fetch all results from a pyzotero method using manual pagination.
-
-    Avoids zot.everything() which can cause RLock pickling in MCP contexts.
-    Accepts the same positional and keyword arguments as the wrapped method,
-    plus an optional max_items to cap the total results.
-    """
-    items = []
-    start = 0
-    page_size = 100
-    while True:
-        batch = zot_method(*args, start=start, limit=page_size, **kwargs)
-        if not batch:
-            break
-        items.extend(batch)
-        if len(batch) < page_size:
-            break
-        start += page_size
-        if max_items and len(items) >= max_items:
-            items = items[:max_items]
-            break
-    return items
-
+from zotero_mcp.utils import _paginate
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -122,6 +73,33 @@ def _get_write_client(ctx):
         return read_zot, web_zot
     raise ValueError(
         "Cannot perform write operations in local-only mode. "
+        "Add ZOTERO_API_KEY and ZOTERO_LIBRARY_ID to enable hybrid mode."
+    )
+
+
+def _get_bibliography_client(ctx=None):
+    """Return a client able to render CSL bibliographies/citations.
+
+    Zotero's local HTTP API has no citation engine — any request carrying
+    ``content=bib`` / ``citation`` / ``bibtex`` is rejected with "Local API
+    does not support Atom output" (#371). Only the web API can render, so
+    mirror the hybrid pattern in ``_get_write_client``: render through the
+    web client whenever web credentials are configured (applying the active
+    library override so a switched-to group library is targeted), and raise
+    an actionable ValueError in local-only mode instead of surfacing the raw
+    Atom error.
+    """
+    if not _utils.is_local_mode():
+        return _client.get_zotero_client()
+    web_zot = _client.get_web_zotero_client()
+    if web_zot is not None:
+        apply_library_override(web_zot, _client.get_active_library())
+        if ctx is not None:
+            ctx.info("Routing bibliography rendering through the Zotero web API")
+        return web_zot
+    raise ValueError(
+        "Bibliography and citation rendering requires Zotero's web API CSL "
+        "engine; the local API has no citation engine. "
         "Add ZOTERO_API_KEY and ZOTERO_LIBRARY_ID to enable hybrid mode."
     )
 
@@ -241,6 +219,33 @@ def _normalize_limit(limit: int | str | None, default: int = 10, max_val: int = 
     return max(1, min(limit, max_val))
 
 
+def _parse_library_id_param(value: int | str | None) -> int | None:
+    """Parse a `library_id` filter param into a group_id (0=personal library).
+
+    Accepts an int, a numeric string (the Zotero groupID), "0"/"user" for
+    the personal library, or None (no filter — search all indexed
+    libraries). This is the single-parameter convention `zotero_semantic_search`
+    exposes; `zotero_switch_library` instead takes separate library_id +
+    library_type args since it must also validate library_type ("feed" has
+    no meaning here — feed libraries are never semantically indexed).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if stripped.lower() == "user":
+            return 0
+        try:
+            return int(stripped)
+        except ValueError:
+            raise ValueError(
+                f"Invalid library_id: {value!r}. Use an integer groupID, 0, or 'user'."
+            ) from None
+    return int(value)
+
+
 def _normalize_str_list_input(value, field_name="value"):
     """Normalize list-like user input into a list of non-empty strings."""
     if value is None:
@@ -318,6 +323,47 @@ def _normalize_tag_filter(value):
             return [s] if s else []
         return []
     return []
+
+
+def _normalize_item_tags(value):
+    """Normalize tags read off an item/annotation into Zotero's dict shape.
+
+    Zotero stores tags as ``[{"tag": "name", "type": 1}, ...]`` and the
+    rendering layers index them with ``t["tag"]``. Annotation sources other
+    than the web API hand tags back in looser shapes — Better BibTeX's
+    JSON-RPC returns bare strings, pdfannots2json omits the field entirely —
+    so normalize to the dict shape (preserving ``type`` when present) and
+    drop empties rather than letting a renderer KeyError (#377).
+    """
+    if not value:
+        return []
+    if isinstance(value, (str, dict)):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+
+    normalized: list[dict] = []
+    for entry in value:
+        if isinstance(entry, dict):
+            name = next(
+                (
+                    str(entry[key]).strip()
+                    for key in ("tag", "name", "value")
+                    if entry.get(key) is not None and str(entry[key]).strip()
+                ),
+                "",
+            )
+            if not name:
+                continue
+            tag = {"tag": name}
+            if entry.get("type") is not None:
+                tag["type"] = entry["type"]
+            normalized.append(tag)
+            continue
+        name = str(entry).strip()
+        if name:
+            normalized.append({"tag": name})
+    return normalized
 
 
 def _resolve_collection_names(zot, names, ctx=None):
@@ -805,18 +851,34 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
                 ctx.info("Downloaded file too small, likely not a real PDF")
                 return None
 
-            attach_result = write_zot.attachment_both(
-                [(filename, filepath)],
-                parentid=item_key,
+            suffix = _webdav_first_attach(
+                write_zot,
+                filename,
+                filepath,
+                item_key,
+                ctx,
+                content_type="application/pdf",
             )
-            # Must run inside the with-block — temp file disappears on exit.
-            return _maybe_upload_to_webdav(attach_result, filepath, ctx)
+            if suffix is not None:
+                return suffix
+            ok, suffix, _key = _attach_and_verify(
+                write_zot,
+                filename,
+                filepath,
+                item_key,
+                ctx,
+                content_type="application/pdf",
+            )
+            if not ok:
+                ctx.info(f"PDF attach failed: {suffix}")
+                return None
+            return suffix
     except Exception as e:
         ctx.info(f"PDF download/attach failed: {e}")
         return None
 
 
-def _maybe_upload_to_webdav(attach_result, file_path, ctx):
+def _maybe_upload_to_webdav(attach_result, file_path, ctx, write_zot=None):
     """Suffix to append to a user-facing 'file attached' message.
 
     PR #279 added WebDAV-aware upload to ``zotero_add_from_file``. The same
@@ -837,16 +899,7 @@ def _maybe_upload_to_webdav(attach_result, file_path, ctx):
     if not _webdav.is_webdav_configured():
         return ""
 
-    attachment_key = None
-    if isinstance(attach_result, dict):
-        for status in ("success", "unchanged"):
-            for entry in attach_result.get(status, []) or []:
-                if isinstance(entry, dict) and entry.get("key"):
-                    attachment_key = entry["key"]
-                    break
-            if attachment_key:
-                break
-
+    attachment_key = _extract_attachment_key(attach_result)
     if not attachment_key:
         return ""
 
@@ -859,10 +912,296 @@ def _maybe_upload_to_webdav(attach_result, file_path, ctx):
         return f" (uploaded to WebDAV as {attachment_key}.zip)"
     except Exception as e:
         ctx.info(f"WebDAV PUT failed for {attachment_key}: {e}")
-        return (
-            f" (WARNING: WebDAV upload failed — {e}; "
-            f"attachment {attachment_key} exists but has no file bytes on WebDAV)"
+        # A failed PUT leaves the attachment item with no file bytes — an
+        # orphan that confuses the Zotero UI and breaks sync. Clean it up,
+        # and only fall back to the "no file bytes" warning if the delete
+        # itself fails.
+        try:
+            attachment_version = next(
+                (
+                    entry.get("version")
+                    for status in ("success", "unchanged")
+                    for entry in (attach_result.get(status, []) or [])
+                    if isinstance(entry, dict) and entry.get("key") == attachment_key
+                ),
+                None,
+            )
+            if write_zot is not None:
+                if attachment_version is None:
+                    attachment_version = write_zot.item(attachment_key)["version"]
+                write_zot.delete_item({"key": attachment_key, "version": attachment_version})
+                ctx.info(f"Cleaned up orphan attachment {attachment_key}")
+                return f" (WARNING: WebDAV upload failed — {e}; attachment {attachment_key} was deleted)"
+            raise RuntimeError("no writable client available for cleanup")
+        except Exception as del_err:
+            ctx.info(f"Cleanup of orphan attachment {attachment_key} failed: {del_err}")
+            return (
+                f" (WARNING: WebDAV upload failed — {e}; "
+                f"attachment {attachment_key} exists but has no file bytes on WebDAV "
+                f"and could not be deleted: {del_err})"
+            )
+
+
+def _guess_content_type(filename):
+    """Guess a Zotero ``contentType`` from a filename's extension.
+
+    Covers the file types ``add_from_file`` accepts (PDF, EPUB, DJVU, plus a
+    few common extras). Returns ``None`` when there is no useful guess so the
+    caller can leave the field unset and let Zotero fall back.
+    """
+    if not filename:
+        return None
+    ext = os.path.splitext(filename)[1].lower().lstrip(".")
+    return {
+        "pdf": "application/pdf",
+        "epub": "application/epub+zip",
+        "djvu": "image/vnd.djvu",
+        "html": "text/html",
+        "txt": "text/plain",
+        "doc": "application/msword",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "rtf": "application/rtf",
+        "odt": "application/vnd.oasis.opendocument.text",
+    }.get(ext)
+
+
+def _webdav_first_attach(write_zot, filename, file_path, parent_key, ctx, content_type=None):
+    """Create attachment shell + WebDAV upload when WebDAV is configured; else return None.
+
+    Returns a user-facing suffix or None (caller falls back to attachment_both).
+    ``content_type``, when given, is written to the attachment shell's
+    ``contentType`` field so Zotero renders and opens the file correctly
+    (e.g. ``application/pdf``).
+    """
+    from zotero_mcp import webdav as _webdav
+
+    if not _webdav.is_webdav_configured():
+        return None
+
+    template = write_zot.item_template("attachment", linkmode="imported_file")
+    template["title"] = filename
+    template["filename"] = filename
+    template["parentItem"] = parent_key
+    if content_type:
+        template["contentType"] = content_type
+    result = write_zot.create_items([template])
+    if not (isinstance(result, dict) and result.get("success")):
+        return " (WARNING: could not create attachment shell)"
+    attachment_key = next(iter(result["success"].values()))
+    # successVersions is keyed in parallel to success; delete_item() needs the
+    # version for its If-Unmodified-Since-Version header. Older pyzotero may
+    # omit the field, so fall back to a fetch.
+    success_versions = result.get("successVersions") or {}
+    attachment_version = next(iter(success_versions.values()), None)
+
+    try:
+        _webdav.upload_attachment_to_webdav(attachment_key=attachment_key, file_path=file_path)
+        ctx.info(f"WebDAV PUT: {attachment_key}.zip uploaded")
+        return f" (uploaded to WebDAV as {attachment_key}.zip)"
+    except Exception as e:
+        ctx.info(f"WebDAV PUT failed for {attachment_key}: {e}")
+        # A failed PUT leaves the shell with no file bytes — an orphan that
+        # confuses the Zotero UI and breaks sync. Clean it up, and only fall
+        # back to the "no file bytes" warning if the delete itself fails.
+        try:
+            if attachment_version is None:
+                attachment_version = write_zot.item(attachment_key)["version"]
+            write_zot.delete_item({"key": attachment_key, "version": attachment_version})
+            ctx.info(f"Cleaned up orphan attachment shell {attachment_key}")
+            return f" (WARNING: WebDAV upload failed — {e}; attachment shell {attachment_key} was deleted)"
+        except Exception as del_err:
+            ctx.info(f"Cleanup of orphan shell {attachment_key} failed: {del_err}")
+            return (
+                f" (WARNING: WebDAV upload failed — {e}; "
+                f"attachment {attachment_key} exists but has no file bytes on WebDAV "
+                f"and could not be deleted: {del_err})"
+            )
+
+
+def _extract_attachment_key(attach_result):
+    """First attachment key in a pyzotero upload result, or ``None``.
+
+    ``Zupload.upload()`` returns ``{"success": [...], "failure": [...],
+    "unchanged": [...]}`` with the registered key on each payload entry.
+    """
+    if not isinstance(attach_result, dict):
+        return None
+    for status in ("success", "unchanged"):
+        for entry in attach_result.get(status, []) or []:
+            if isinstance(entry, dict) and entry.get("key"):
+                return entry["key"]
+    return None
+
+
+def _describe_attach_failure(attach_result):
+    """Short reason string for a pyzotero upload result that landed no file.
+
+    ``attachment_both()`` reports client-side rejections by returning the
+    payload in ``failure`` rather than raising (#403), so a caller that
+    only checks for exceptions reports success for a file that never
+    landed. Returns ``None`` when the result did register an attachment.
+    """
+    if _extract_attachment_key(attach_result) is not None:
+        return None
+    if not isinstance(attach_result, dict):
+        return f"unexpected upload result: {attach_result!r}"
+    failures = attach_result.get("failure") or []
+    if failures:
+        return f"upload rejected by pyzotero: {failures}"
+    return "upload returned no attachment key"
+
+
+def _assert_upload_capable(write_zot):
+    """Raise ValueError if *write_zot* cannot upload file bytes.
+
+    Zotero's local HTTP API has no attachment/upload endpoints — the
+    template fetch that starts ``attachment_both()`` 404s against
+    ``localhost:23119`` (#403). Failing fast here beats a confusing
+    "No endpoint found" deep inside pyzotero.
+    """
+    if getattr(write_zot, "local", False):
+        raise ValueError(
+            "Cannot upload file bytes through Zotero's local API — it has no "
+            "attachment endpoints. Add ZOTERO_API_KEY and ZOTERO_LIBRARY_ID "
+            "to enable hybrid mode (local reads, web-API writes)."
         )
+
+
+def _two_step_attach(write_zot, filename, file_path, parent_key, ctx, content_type=None):
+    """Create the attachment item, then upload its bytes; verify md5 landed.
+
+    Fallback for the case in #403 where ``attachment_both()`` fails
+    client-side (it puts the full filesystem path in ``filename`` and
+    leaves ``md5`` unset). Creating the item with the basename and only
+    then uploading with the full path succeeds where the combined call
+    does not. Returns ``(attachment_key, None)`` on success or
+    ``(None, reason)`` on failure, cleaning up the orphaned shell so a
+    failed upload doesn't leave a fileless attachment behind.
+    """
+    template = write_zot.item_template("attachment", linkmode="imported_file")
+    template["title"] = filename
+    template["filename"] = filename
+    template["parentItem"] = parent_key
+    if content_type:
+        template["contentType"] = content_type
+
+    result = write_zot.create_items([template])
+    if not (isinstance(result, dict) and result.get("success")):
+        return None, f"could not create attachment item: {result}"
+    attachment_key = next(iter(result["success"].values()))
+    success_versions = result.get("successVersions") or {}
+    attachment_version = next(iter(success_versions.values()), None)
+
+    try:
+        attachment = write_zot.item(attachment_key)["data"]
+        # The full path is only correct for the upload step; the stored
+        # filename stays the basename set on the template above.
+        attachment["filename"] = file_path
+        upload = write_zot.upload_attachments([attachment])
+        if isinstance(upload, dict) and upload.get("failure"):
+            raise RuntimeError(f"upload rejected: {upload['failure']}")
+        # Only md5 on the stored item proves the bytes actually landed.
+        if not write_zot.item(attachment_key)["data"].get("md5"):
+            raise RuntimeError("upload reported success but no md5 was stored")
+        return attachment_key, None
+    except Exception as e:
+        try:
+            if attachment_version is None:
+                attachment_version = write_zot.item(attachment_key)["version"]
+            write_zot.delete_item(
+                {"key": attachment_key, "version": attachment_version}
+            )
+            ctx.info(f"Cleaned up orphan attachment shell {attachment_key}")
+        except Exception as del_err:
+            ctx.info(f"Cleanup of orphan shell {attachment_key} failed: {del_err}")
+            return None, (
+                f"{e}; attachment {attachment_key} exists but has no file "
+                f"bytes and could not be deleted: {del_err}"
+            )
+        return None, str(e)
+
+
+def _attach_and_verify(
+    write_zot, filename, file_path, parent_key, ctx, content_type=None
+):
+    """Upload *file_path* onto *parent_key*, confirming the file landed.
+
+    Returns ``(ok, suffix, attachment_key)``. ``suffix`` is the user-facing
+    tail to append to a "file attached" message when ``ok``; when not
+    ``ok`` it is the reason the attach failed, and the caller must NOT
+    claim success (#403, the root cause behind #278 / #306 / #399).
+    """
+    _assert_upload_capable(write_zot)
+
+    attach_result = write_zot.attachment_both(
+        [(filename, file_path)],
+        parentid=parent_key,
+    )
+    reason = _describe_attach_failure(attach_result)
+    if reason is None:
+        suffix = _maybe_upload_to_webdav(
+            attach_result, file_path, ctx, write_zot=write_zot
+        )
+        return True, suffix, _extract_attachment_key(attach_result)
+
+    ctx.info(f"attachment_both failed ({reason}); retrying as create + upload")
+    attachment_key, fallback_reason = _two_step_attach(
+        write_zot, filename, file_path, parent_key, ctx, content_type=content_type
+    )
+    if attachment_key is None:
+        return False, f"{reason}; two-step retry also failed: {fallback_reason}", None
+
+    suffix = _maybe_upload_to_webdav(
+        {"success": [{"key": attachment_key}]}, file_path, ctx, write_zot=write_zot
+    )
+    return True, suffix, attachment_key
+
+
+def _file_md5(path):
+    """MD5 hex digest of ``path``, or ``None`` if unreadable.
+
+    Non-fatal so content dedupe degrades to filename-only rather than
+    failing the attach.
+    """
+    try:
+        digest = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _find_child_attachment(write_zot, parent_key, filename=None, file_md5=None):
+    """First child of ``parent_key`` stored as ``filename`` or hashing to ``file_md5``.
+
+    Either criterion matching returns the child dict; ``None`` criteria are
+    skipped (a child without an ``md5`` field never matches ``file_md5=None``).
+    Paginates past the API's default page size and ignores trashed children
+    (``deleted`` flag), so a match beyond the first page isn't missed and a
+    trashed attachment doesn't count as "already attached".
+    Non-fatal: errors while listing children count as "no match", so attach
+    flows degrade to re-uploading rather than failing outright.
+    """
+    try:
+        kids = _paginate(write_zot.children, parent_key)
+    except Exception:
+        return None
+    for kid in kids:
+        data = kid.get("data", {}) or {}
+        if data.get("deleted"):
+            continue
+        if filename is not None and data.get("filename") == filename:
+            return kid
+        if file_md5 is not None and data.get("md5") == file_md5:
+            return kid
+    return None
+
+
+def _attachment_filename_exists(write_zot, parent_key, filename):
+    """True if ``parent_key`` already has a child attachment stored as ``filename``."""
+    return _find_child_attachment(write_zot, parent_key, filename=filename) is not None
 
 
 def _attach_pdf_linked_url(write_zot, pdf_url, parent_key, ctx):

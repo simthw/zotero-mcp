@@ -9,17 +9,38 @@ import json
 import logging
 import os
 import platform
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
+from .config import load_config
 from .utils import _normalize_for_search, is_local_mode
 
 logger = logging.getLogger(__name__)
 
 # Sentinel returned by _extract_text_from_pdf on timeout
 _EXTRACTION_TIMEOUT = "__EXTRACTION_TIMEOUT__"
+
+# Library identity used throughout zotero-mcp (ChromaDB metadata, the
+# `zotero_switch_library` tool, etc.): 0 for the personal ("user") library,
+# else the Zotero server-assigned groupID. This matches Zotero's own
+# sentinel for the account-less personal library.
+PERSONAL_LIBRARY_GROUP_ID = 0
+
+
+class KeyGroupMap(NamedTuple):
+    """Result of :meth:`LocalZoteroReader.get_key_group_map`.
+
+    ``groups`` maps every non-deleted item key in the database to its
+    library's group_id. ``excluded_keys`` holds keys from libraries with no
+    group_id equivalent (feeds, "My Publications") — these are excluded from
+    the semantic index and global search rather than mis-tagged as personal.
+    """
+
+    groups: dict[str, int]
+    excluded_keys: set[str]
 
 
 def _extract_pdf_worker(file_path: str, maxpages: int, result_queue):
@@ -42,6 +63,67 @@ def _extract_pdf_worker(file_path: str, maxpages: int, result_queue):
 
 
 
+def _read_string_pref(prefs_path: Path, pref: str) -> str | None:
+    """Read a string preference from a Zotero prefs.js file.
+
+    Returns None if the file cannot be read or the preference is absent.
+    """
+    try:
+        text = prefs_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(
+        r'user_pref\("' + re.escape(pref) + r'",\s*"([^"]*)"\)',
+        text,
+    )
+    if not m:
+        return None
+    raw = m.group(1)
+    # prefs.js values are JavaScript string literals; unescape backslash
+    # sequences so Windows paths like C:\\Users\\... resolve correctly.
+    try:
+        return json.loads(f'"{raw}"')
+    except ValueError:
+        return raw
+
+
+def _zotero_profiles_dirs() -> list[Path]:
+    """Return OS-specific directories that may contain Zotero profiles."""
+    system = platform.system()
+    home = Path.home()
+    if system == "Darwin":
+        return [home / "Library" / "Application Support" / "Zotero" / "Profiles"]
+    if system == "Windows":
+        appdata = os.getenv("APPDATA")
+        return [Path(appdata) / "Zotero" / "Zotero" / "Profiles"] if appdata else []
+    # Linux and others: profile folders live directly under ~/.zotero/zotero
+    return [home / ".zotero" / "zotero"]
+
+
+def _profile_prefs_files() -> list[Path]:
+    """Return prefs.js files from all Zotero profiles found on this system."""
+    prefs_files: list[Path] = []
+    for profiles_dir in _zotero_profiles_dirs():
+        if profiles_dir.is_dir():
+            prefs_files.extend(sorted(profiles_dir.glob("*/prefs.js")))
+    return prefs_files
+
+
+def _data_dirs_from_profiles() -> list[Path]:
+    """Collect custom data directories declared in Zotero profiles.
+
+    A user-configured data directory is stored as the
+    ``extensions.zotero.dataDir`` preference in the profile directory's
+    prefs.js — not inside the data directory itself.
+    """
+    data_dirs: list[Path] = []
+    for prefs_path in _profile_prefs_files():
+        data_dir = _read_string_pref(prefs_path, "extensions.zotero.dataDir")
+        if data_dir:
+            data_dirs.append(Path(data_dir))
+    return data_dirs
+
+
 @dataclass
 class ZoteroItem:
     """Represents a Zotero item with text content for semantic search."""
@@ -54,7 +136,7 @@ class ZoteroItem:
     abstract: str | None = None
     creators: str | None = None
     fulltext: str | None = None
-    fulltext_source: str | None = None  # 'pdf' or 'html'
+    fulltext_source: str | None = None  # content_list_json, zotero-cache, pdf, html, or file
     notes: str | None = None
     extra: str | None = None
     date_added: str | None = None
@@ -122,7 +204,13 @@ class LocalZoteroReader:
 
     def _find_zotero_db(self) -> str:
         """
-        Auto-detect the Zotero database location based on OS.
+        Auto-detect the Zotero database location.
+
+        Resolution order:
+        1. The ``ZOTERO_DB_PATH`` environment variable.
+        2. A custom data directory configured in Zotero's preferences
+           (``extensions.zotero.dataDir`` in the profile's prefs.js).
+        3. The default data directory (``~/Zotero``).
 
         Returns:
             Path to zotero.sqlite file.
@@ -130,26 +218,47 @@ class LocalZoteroReader:
         Raises:
             FileNotFoundError: If database cannot be located.
         """
-        system = platform.system()
-
-        if system == "Darwin":  # macOS
-            db_path = Path.home() / "Zotero" / "zotero.sqlite"
-        elif system == "Windows":
-            # Try Windows 7+ location first
-            db_path = Path.home() / "Zotero" / "zotero.sqlite"
-            if not db_path.exists():
-                # Fallback to XP/2000 location
-                db_path = Path(os.path.expanduser("~/Documents and Settings")) / os.getenv("USERNAME", "") / "Zotero" / "zotero.sqlite"
-        else:  # Linux and others
-            db_path = Path.home() / "Zotero" / "zotero.sqlite"
-
-        if not db_path.exists():
+        env_path = os.getenv("ZOTERO_DB_PATH")
+        if env_path:
+            db_path = Path(env_path).expanduser()
+            if db_path.is_file():
+                return str(db_path)
             raise FileNotFoundError(
-                f"Zotero database not found at {db_path}. "
-                "Please ensure Zotero is installed and has been run at least once."
+                f"ZOTERO_DB_PATH is set to {db_path}, but no file exists there."
             )
 
-        return str(db_path)
+        # A data directory configured in Zotero's own preferences is
+        # authoritative; a leftover ~/Zotero from an old install is not.
+        candidates = [
+            data_dir / "zotero.sqlite" for data_dir in _data_dirs_from_profiles()
+        ]
+        candidates.append(Path.home() / "Zotero" / "zotero.sqlite")
+        if platform.system() == "Windows":
+            # Fallback to XP/2000 location
+            candidates.append(
+                Path(os.path.expanduser("~/Documents and Settings"))
+                / os.getenv("USERNAME", "")
+                / "Zotero"
+                / "zotero.sqlite"
+            )
+
+        seen: set[str] = set()
+        checked: list[Path] = []
+        for db_path in candidates:
+            if str(db_path) in seen:
+                continue
+            seen.add(str(db_path))
+            checked.append(db_path)
+            if db_path.is_file():
+                return str(db_path)
+
+        raise FileNotFoundError(
+            "Could not locate the Zotero database (checked: "
+            + ", ".join(str(c) for c in checked)
+            + "). If Zotero stores its data in a custom location, set the "
+            "ZOTERO_DB_PATH environment variable to your zotero.sqlite file "
+            "or configure the path by running `zotero-mcp setup`."
+        )
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get database connection, creating if needed."""
@@ -173,22 +282,20 @@ class LocalZoteroReader:
         """Read the linked attachment base directory from Zotero's prefs.js.
 
         Returns the configured ``extensions.zotero.baseAttachmentPath`` or
-        ``None`` if the preference is not set or the file cannot be read.
+        ``None`` if the preference is not set or cannot be read. The
+        preference lives in the profile directory's prefs.js; a prefs.js
+        next to the database is also checked for unusual setups.
         """
-        prefs_path = Path(self.db_path).parent / "prefs.js"
-        if not prefs_path.exists():
-            return None
-        try:
-            import re
-            text = prefs_path.read_text(encoding="utf-8", errors="replace")
-            m = re.search(
-                r'user_pref\("extensions\.zotero\.baseAttachmentPath",\s*"([^"]+)"\)',
-                text,
+        prefs_files = [Path(self.db_path).parent / "prefs.js"]
+        prefs_files.extend(_profile_prefs_files())
+        for prefs_path in prefs_files:
+            if not prefs_path.exists():
+                continue
+            value = _read_string_pref(
+                prefs_path, "extensions.zotero.baseAttachmentPath"
             )
-            if m:
-                return Path(m.group(1))
-        except Exception:
-            pass
+            if value:
+                return Path(value)
         return None
 
     def _iter_parent_attachments(self, parent_item_id: int):
@@ -475,7 +582,8 @@ class LocalZoteroReader:
         # rather than a stub or thumbnail.
         return max(candidates, key=lambda p: p.stat().st_size)
 
-    def _find_content_list_json(self, attachment_key: str, resolved_path: Path) -> Path | None:
+    @staticmethod
+    def _find_content_list_json(resolved_path: Path) -> Path | None:
         """Find MinerU content_list.json file in the attachment folder.
 
         Looks for files matching patterns:
@@ -483,27 +591,47 @@ class LocalZoteroReader:
         - *_content_list.json (MinerU standard naming)
 
         Args:
-            attachment_key: The Zotero attachment item key
             resolved_path: The resolved attachment file path
 
         Returns:
             Path to content_list.json if found, None otherwise
         """
-        if resolved_path and resolved_path.exists():
-            # Check the same directory as the attachment
-            parent_dir = resolved_path.parent
+        if not resolved_path.exists():
+            return None
 
-            # For Zotero storage format: storage/KEY/filename.pdf
-            # The content_list.json should be in the same folder
+        parent_dir = resolved_path.parent
+        try:
+            # Prefer MinerU's document-specific standard name over the generic
+            # fallback, and sort so multiple outputs resolve deterministically.
+            named_outputs = sorted(
+                (
+                    candidate
+                    for candidate in parent_dir.iterdir()
+                    if candidate.is_file() and candidate.name.endswith("_content_list.json")
+                ),
+                key=lambda candidate: candidate.name.casefold(),
+            )
+            if named_outputs:
+                return named_outputs[0]
 
-            # Priority 1: Look for *_content_list.json pattern (MinerU standard)
-            for f in parent_dir.iterdir():
-                if f.is_file() and f.name.endswith('_content_list.json'):
-                    return f
-
-            # Priority 2: Look for exact content_list.json
             content_list = parent_dir / "content_list.json"
-            if content_list.exists():
+            if content_list.is_file():
+                return content_list
+        except OSError as e:
+            logger.debug(f"Could not inspect MinerU output next to {resolved_path}: {e}")
+        return None
+
+    def _get_content_list_json_path(self, item_id: int) -> Path | None:
+        """Return the best MinerU output available for an item's attachments."""
+        for key, path, ctype in self._iter_parent_attachments(item_id):
+            if ctype != "application/pdf" and not (ctype or "").startswith("text/html"):
+                continue
+            resolved = self._resolve_attachment_path(key, path or "")
+            if not resolved or not resolved.exists():
+                resolved = self._scan_storage_for_attachment(key, ctype)
+                if not resolved or not resolved.exists():
+                    continue
+            if content_list := self._find_content_list_json(resolved):
                 return content_list
         return None
 
@@ -530,7 +658,7 @@ class LocalZoteroReader:
             Extracted text content, or empty string on failure
         """
         try:
-            with open(json_path, 'r', encoding='utf-8') as f:
+            with json_path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
 
             # Handle root-level list format (MinerU standard)
@@ -538,7 +666,7 @@ class LocalZoteroReader:
                 content_list = data
             else:
                 # Handle dict format with 'content' or 'data' key
-                content_list = data.get('content') or data.get('data') or []
+                content_list = data.get("content") or data.get("data") or []
 
             if isinstance(content_list, list):
                 text_parts = []
@@ -560,11 +688,11 @@ class LocalZoteroReader:
                             text_parts.append(item.strip())
 
                 if text_parts:
-                    return '\n\n'.join(text_parts)
+                    return "\n\n".join(text_parts)
 
             # Fallback: try to extract any text-like content from dict
             if isinstance(data, dict):
-                for key in ['text', 'content', 'fulltext', 'body']:
+                for key in ["text", "content", "fulltext", "body"]:
                     if key in data and isinstance(data[key], str):
                         return data[key]
 
@@ -587,34 +715,34 @@ class LocalZoteroReader:
             return ""
 
         # Skip non-text block types (headers, footers, page numbers)
-        block_type = block.get('type', '')
-        if block_type in ('page_header', 'page_footer', 'page_number'):
+        block_type = block.get("type", "")
+        if block_type in ("page_header", "page_footer", "page_number"):
             return ""
 
         # Format 1: nested content dict (MinerU pages format)
-        content = block.get('content')
+        content = block.get("content")
         if isinstance(content, dict):
             # Equation blocks: {"math_content": "LaTeX", "math_type": "latex"}
-            math = content.get('math_content')
+            math = content.get("math_content")
             if isinstance(math, str) and math.strip():
                 return f"$$ {math.strip()} $$"
 
             # Text blocks: {"paragraph_content": [{"type": "text", "content": "..."}]}
             for key, spans in content.items():
-                if key in ('level', 'math_type', 'image_source'):
+                if key in ("level", "math_type", "image_source"):
                     continue
                 if isinstance(spans, list):
                     parts = []
                     for span in spans:
                         if isinstance(span, dict):
-                            t = span.get('content', '')
+                            t = span.get("content", "")
                             if isinstance(t, str) and t.strip():
                                 parts.append(t.strip())
                     if parts:
-                        return ' '.join(parts)
+                        return " ".join(parts)
 
         # Format 2: flat format with 'text' key
-        text = block.get('text', '')
+        text = block.get("text", "")
         if isinstance(text, str) and text.strip():
             return text.strip()
 
@@ -639,23 +767,11 @@ class LocalZoteroReader:
         """
         # 1. MinerU content_list.json (structured, highest quality, incl. LaTeX
         # math via _extract_text_from_mineru_block).
-        best_content_list_json = None
-        for key, path, ctype in self._iter_parent_attachments(item_id):
-            if ctype != "application/pdf" and not (ctype or "").startswith("text/html"):
-                continue
-            resolved = self._resolve_attachment_path(key, path or "")
-            if not resolved or not resolved.exists():
-                resolved = self._scan_storage_for_attachment(key, ctype)
-                if not resolved or not resolved.exists():
-                    continue
-            content_list = self._find_content_list_json(key, resolved)
-            if content_list and content_list.exists():
-                best_content_list_json = content_list
-                break
-        if best_content_list_json:
-            text = self._extract_text_from_content_list_json(best_content_list_json)
+        content_list_json = self._get_content_list_json_path(item_id)
+        if content_list_json:
+            text = self._extract_text_from_content_list_json(content_list_json)
             if text:
-                logger.info(f"Using content_list.json for item {item_id}: {best_content_list_json}")
+                logger.info(f"Using content_list.json for item {item_id}: {content_list_json}")
                 return (text, "content_list_json")
 
         # 2. Zotero's own full-text cache — use it whenever present.
@@ -840,12 +956,55 @@ class LocalZoteroReader:
         rows = conn.execute("SELECT key FROM items").fetchall()
         return {row[0] for row in rows}
 
-    def get_items_with_text(self, limit: int | None = None, include_fulltext: bool = False, key_filter: str | None = None) -> list[ZoteroItem]:
+    def get_key_group_map(self) -> KeyGroupMap:
+        """Map every non-deleted item key to its library's group_id.
+
+        Runs a single query joining ``items`` -> ``libraries`` -> ``groups``,
+        translating each item's ``libraryID`` to the codebase-wide group_id
+        (``0`` for the personal library, else the Zotero ``groupID``) in SQL.
+        Items in libraries with no group_id equivalent (feed subscriptions,
+        "My Publications") are returned in ``excluded_keys`` instead, so
+        callers can drop them from the semantic index rather than silently
+        mis-attribute them to the personal library.
+        """
+        conn = self._get_connection()
+        rows = conn.execute(
+            """
+            SELECT i.key AS item_key, l.type AS lib_type, g.groupID AS group_id
+            FROM items i
+            JOIN libraries l ON i.libraryID = l.libraryID
+            LEFT JOIN groups g ON l.libraryID = g.libraryID
+            WHERE i.itemID NOT IN (SELECT itemID FROM deletedItems)
+            """
+        ).fetchall()
+
+        groups: dict[str, int] = {}
+        excluded_keys: set[str] = set()
+        for row in rows:
+            key = row["item_key"]
+            lib_type = row["lib_type"]
+            group_id = row["group_id"]
+            if lib_type == "user":
+                groups[key] = PERSONAL_LIBRARY_GROUP_ID
+            elif lib_type == "group" and group_id is not None:
+                groups[key] = int(group_id)
+            else:
+                # Feeds, "My Publications", or any other non-group/user
+                # library type have no group_id equivalent — exclude rather
+                # than mis-attribute to the personal library.
+                excluded_keys.add(key)
+
+        return KeyGroupMap(groups, excluded_keys)
+
+    def get_items_with_text(self, limit: int | None = None, include_fulltext: bool = False, key_filter: str | None = None, collection_keys: list[str] | None = None) -> list[ZoteroItem]:
         """
         Get all items with their text content for semantic search.
 
         Args:
             limit: Optional limit on number of items to return.
+            collection_keys: Optional list of collection keys; when set, only
+                items in those collections (or any of their subcollections)
+                are returned.
 
         Returns:
             List of ZoteroItem objects with text content.
@@ -907,6 +1066,24 @@ class LocalZoteroReader:
         """
 
         params = []
+        if collection_keys:
+            # Restrict the corpus to the configured collections, including
+            # all of their subcollections (resolved recursively).
+            all_collection_ids = []
+            for ckey in collection_keys:
+                root = conn.execute("SELECT collectionID FROM collections WHERE key = ?", (ckey,)).fetchone()
+                if root:
+                    to_process = [root[0]]
+                    while to_process:
+                        cid = to_process.pop()
+                        all_collection_ids.append(cid)
+                        for sub in conn.execute("SELECT collectionID FROM collections WHERE parentCollectionID = ?", (cid,)).fetchall():
+                            to_process.append(sub[0])
+            if all_collection_ids:
+                placeholders = ','.join('?' * len(all_collection_ids))
+                query += f" AND i.itemID IN (SELECT DISTINCT itemID FROM collectionItems WHERE collectionID IN ({placeholders}))"
+                params.extend(all_collection_ids)
+
         if key_filter:
             query += " AND i.key = ?"
             params.append(key_filter)
@@ -946,8 +1123,9 @@ class LocalZoteroReader:
 
         return items
 
-    # Public helper to quickly check full text metadata for item
-    def get_fulltext_meta_for_item(self, item_id: int) -> tuple[str, str] | None:
+    # Public helper to quickly check full text metadata for item.
+    # Returns one [key, path, content_type] row per attachment of the item.
+    def get_fulltext_meta_for_item(self, item_id: int) -> list[list[str | None]]:
         return self._get_fulltext_meta_for_item(item_id)
 
     # Public helper to extract fulltext on demand for a specific item
@@ -957,27 +1135,11 @@ class LocalZoteroReader:
     def has_content_list_json(self, item_id: int) -> bool:
         """Check if the item has a MinerU content_list.json file in its
         attachment folder (higher-quality fulltext source than PDF/cache)."""
-        for key, path, ctype in self._iter_parent_attachments(item_id):
-            resolved = self._resolve_attachment_path(key, path or "")
-            if not resolved or not resolved.exists():
-                continue
-            if ctype == "application/pdf":
-                content_list = self._find_content_list_json(key, resolved)
-                if content_list and content_list.exists():
-                    return True
-        return False
+        return self._get_content_list_json_path(item_id) is not None
 
     def get_content_list_json_path(self, item_id: int) -> Path | None:
         """Get the path to MinerU content_list.json for an item, or None."""
-        for key, path, ctype in self._iter_parent_attachments(item_id):
-            resolved = self._resolve_attachment_path(key, path or "")
-            if not resolved or not resolved.exists():
-                continue
-            if ctype == "application/pdf":
-                content_list = self._find_content_list_json(key, resolved)
-                if content_list and content_list.exists():
-                    return content_list
-        return None
+        return self._get_content_list_json_path(item_id)
 
     def get_attachment_paths(self, parent_key: str) -> list[dict]:
         """Return resolved filesystem paths for a parent item's attachments.
@@ -1000,6 +1162,49 @@ class LocalZoteroReader:
                 "exists": bool(resolved and resolved.exists()),
             })
         return out
+
+    def get_attachment_by_key(self, attachment_key: str) -> dict | None:
+        """Return the attachment row addressed by its OWN key.
+
+        ``get_item_by_key`` cannot see attachments: the query behind it
+        excludes the 'attachment', 'note' and 'annotation' item types. So a
+        key that names a PDF attachment directly (rather than its parent)
+        needs its own lookup — without it, callers scan the attachment's
+        (always empty) child list and conclude there is no PDF (#372).
+
+        Each entry has: ``key``, ``content_type``, ``zotero_path`` (the raw
+        stored path like ``storage:foo.pdf``), ``title`` and ``parent_key``.
+        Returns ``None`` if the key does not name a live attachment.
+        """
+        conn = self._get_connection()
+        row = conn.execute(
+            """
+            SELECT att.key as attachmentKey,
+                   ia.path as path,
+                   ia.contentType as contentType,
+                   title_val.value as title,
+                   parent.key as parentKey
+            FROM itemAttachments ia
+            JOIN items att ON att.itemID = ia.itemID
+            LEFT JOIN items parent ON parent.itemID = ia.parentItemID
+            LEFT JOIN itemData title_data
+                ON title_data.itemID = att.itemID AND title_data.fieldID = 1
+            LEFT JOIN itemDataValues title_val
+                ON title_data.valueID = title_val.valueID
+            WHERE att.key = ?
+            AND att.itemID NOT IN (SELECT itemID FROM deletedItems)
+            """,
+            (attachment_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "key": row["attachmentKey"],
+            "content_type": row["contentType"],
+            "zotero_path": row["path"],
+            "title": row["title"],
+            "parent_key": row["parentKey"],
+        }
 
     def get_item_by_key(self, key: str) -> ZoteroItem | None:
         """
@@ -1131,7 +1336,7 @@ def get_local_zotero_reader() -> LocalZoteroReader | None:
         return None
 
     try:
-        return LocalZoteroReader()
+        return LocalZoteroReader(db_path=load_config().resolve_zotero_db_path())
     except FileNotFoundError:
         return None
 

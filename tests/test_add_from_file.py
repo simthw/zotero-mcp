@@ -1,13 +1,13 @@
 """Tests for Feature 10: zotero_add_from_file (server.add_from_file)."""
 
+import os
 import sys
 import types
-import pytest
-from unittest.mock import patch, MagicMock, PropertyMock
+from unittest.mock import MagicMock
+
+from conftest import FakeZotero
 
 from zotero_mcp import server
-from conftest import DummyContext, FakeZotero, _FakeResponse
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -88,10 +88,15 @@ def _make_fake_fitz_module(doc):
 
 def _patch_path_valid(monkeypatch):
     """Patch os.path functions so the file path appears valid."""
+    native_isabs = os.path.isabs
     monkeypatch.setattr("os.path.exists", lambda p: True)
     monkeypatch.setattr("os.path.isfile", lambda p: True)
     monkeypatch.setattr("os.path.islink", lambda p: False)
-    monkeypatch.setattr("os.path.isabs", lambda p: p.startswith("/"))
+    monkeypatch.setattr(
+        "os.path.isabs",
+        lambda p: str(p).startswith("/") or native_isabs(p),
+    )
+    monkeypatch.setattr("os.path.realpath", lambda p: p)
 
 
 def _patch_hybrid_mode(monkeypatch, fake_write_zot):
@@ -124,7 +129,7 @@ class TestHappyPathNoDoi:
         fake_doc = FakeFitzDocument(metadata={"subject": "", "keywords": ""}, first_page_text="No doi here.")
         _patch_fitz(monkeypatch, fake_doc)
 
-        result = server.add_from_file(
+        server.add_from_file(
             file_path="/Users/test/Documents/paper.pdf",
             title="My Paper",
             item_type="document",
@@ -153,7 +158,7 @@ class TestHappyPathNoDoi:
         fake_doc = FakeFitzDocument(metadata={}, first_page_text="Some text without DOI.")
         _patch_fitz(monkeypatch, fake_doc)
 
-        result = server.add_from_file(
+        server.add_from_file(
             file_path="/Users/test/Documents/report.pdf",
             title=None,
             item_type="document",
@@ -200,7 +205,7 @@ class TestDoiFromMetadata:
 
         monkeypatch.setattr("zotero_mcp.tools.write.add_by_doi", mock_add_by_doi)
 
-        result = server.add_from_file(
+        server.add_from_file(
             file_path="/Users/test/Documents/paper.pdf",
             title=None,
             item_type="document",
@@ -472,7 +477,7 @@ class TestNonAbsolutePath:
     def test_dot_relative_path_rejected(self, monkeypatch, dummy_ctx):
         fake_zot = FakeZoteroForFile()
         _patch_hybrid_mode(monkeypatch, fake_zot)
-        monkeypatch.setattr("os.path.isabs", lambda p: not p.startswith("."))
+        monkeypatch.setattr("os.path.isabs", lambda p: not str(p).startswith("."))
 
         result = server.add_from_file(
             file_path="./Documents/paper.pdf",

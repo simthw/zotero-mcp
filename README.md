@@ -215,6 +215,16 @@ zotero-mcp update-db --force-rebuild
 zotero-mcp db-status
 ```
 
+#### MinerU structured full text
+
+This branch retains the local MinerU extension on top of v0.6.3. Place
+`content_list.json` or `<document>_content_list.json` beside a Zotero PDF/HTML
+attachment, then run `zotero-mcp update-db --fulltext`. The indexer supports
+nested and flat MinerU blocks, preserves `math_content` as LaTeX, and uses this
+source before Zotero's `.zotero-ft-cache` or direct PDF extraction. If MinerU
+output is generated after an item was already indexed, the next full-text
+update automatically upgrades that item without requiring a force rebuild.
+
 **Example Semantic Queries in your AI assistant:**
 - *"Find research similar to machine learning concepts in neuroscience"*
 - *"Papers that discuss climate change impacts on agriculture"*
@@ -235,7 +245,17 @@ Full documentation is available at [Zotero MCP docs](https://stevenyuyy.com/zote
 
 **For ChatGPT setup: see the [Getting Started guide](./docs/getting-started.md).**
 
-### For Claude Desktop (example MCP client)
+### Configure Zotero
+
+The Zotero local API must be enabled for the MCP server to work.
+
+In Zotero 9, the local API toggle is under Settings → Advanced → 'Allow other applications on this computer to communicate with Zotero'.
+
+Here is a screenshot:
+
+![Zotero local API](./docs/zotero-local-api.png)
+
+### For Claude Desktop / Claude Code (MCP client)
 
 #### Configuration
 After installation, either:
@@ -246,7 +266,8 @@ After installation, either:
    ```
 
 2. **Manual configuration**:
-   Add to your `claude_desktop_config.json`:
+   For Claude Desktop, add this to `claude_desktop_config.json`.
+   For Claude Code, add this to `~/.claude.json`:
    ```json
    {
      "mcpServers": {
@@ -262,24 +283,27 @@ After installation, either:
    }
    ```
 
-   For **local read-only use**, `ZOTERO_LOCAL: "true"` is all you need — drop the
-   `ZOTERO_API_KEY` and `ZOTERO_LIBRARY_ID` lines entirely. Add them only to enable
-   **write mode**: the local API is fast but read-only, so the server uses the Zotero
-   web API for write operations.
+   For **local read-only use**, `ZOTERO_LOCAL: "true"` is all you need — drop the `ZOTERO_API_KEY` and `ZOTERO_LIBRARY_ID` lines entirely.
 
-   - Generate an API key from <https://www.zotero.org/settings/security#applications>.
-   - `ZOTERO_LIBRARY_ID` is your numeric **userID**, shown on that same page (for a
-     group library, use the group's ID and also set `ZOTERO_LIBRARY_TYPE: "group"`).
+   The local API is fast but read-only, so the MCP server uses the Zotero web API for write operations.
 
-   > **Tip:** if Claude Desktop reports it can't find the `zotero-mcp` command, use the
+   To enable **write mode**:
+   - Keep `ZOTERO_LOCAL: "true"` — with API credentials set, the server runs in hybrid mode (fast local reads, web API writes)
+   - Click [here](https://www.zotero.org/settings/security#applications) to generate a Zotero API key and replace `YOUR_API_KEY` with it
+   - `ZOTERO_LIBRARY_ID` is your numeric **userID**, shown on that same page (for a group library, use the group's ID and also set `ZOTERO_LIBRARY_TYPE: "group"`).
+
+   > **Important Note**: Environmental variables set in the shell you run `claude` in will override these values.
+
+   > **Tip:** If Claude Desktop reports it can't find the `zotero-mcp` command, use the
    > absolute path instead (run `zotero-mcp setup-info` or `which zotero-mcp` to find it) —
    > GUI apps don't always inherit your shell `PATH`.
 
 #### Usage
 
 1. Start Zotero desktop (make sure local API is enabled in preferences)
-2. Launch Claude Desktop
-3. Access the Zotero-MCP tool through Claude Desktop's tools interface
+2. Launch Claude Desktop / Claude Code
+3. For Claude Desktop, access the Zotero-MCP tool through Claude Desktop's tools interface.
+For Claude Code, run the `/mcp` command, and make sure the Zotero MCP server is connected.
 
 Example prompts:
 - "Search my library for papers on machine learning"
@@ -293,6 +317,16 @@ Example prompts:
 - **"Find papers conceptually similar to deep learning in computer vision"** *(semantic search)*
 - **"Research that relates to the intersection of AI and healthcare"** *(semantic search)*
 - **"Papers that discuss topics similar to this abstract: [paste text]"** *(semantic search)*
+
+### For Autohand Code
+
+After installing Zotero MCP, add a local read-only server with:
+
+```bash
+autohand mcp add zotero env ZOTERO_LOCAL=true zotero-mcp
+```
+
+Add `--scope project` after `add` to keep the server configuration in the current project. For hybrid or web API access, add the credentials described above to the `env` command. See [Autohand Code](https://github.com/autohandai/code-cli/) for current installation and CLI details.
 
 ### For Cherry Studio
 
@@ -352,7 +386,10 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 - `GEMINI_BASE_URL`: Custom Gemini endpoint URL (optional, for use with compatible APIs)
 - `OLLAMA_EMBEDDING_MODEL`: Ollama embedding model name (qwen3-embedding by default)
 - `OLLAMA_BASE_URL`: Ollama server URL (default: http://localhost:11434)
-- `ZOTERO_DB_PATH`: Custom `zotero.sqlite` path (optional)
+- `ZOTERO_DB_PATH`: Custom `zotero.sqlite` path (optional). When unset, the
+  database is located automatically: a data directory configured in Zotero's
+  preferences (read from the profile's `prefs.js`) is tried first, then the
+  default `~/Zotero` location.
 
 ### Command-Line Options
 
@@ -387,6 +424,52 @@ zotero-mcp db-status                       # Show database status and info
 
 # General
 zotero-mcp version                         # Show current version
+```
+
+## 🐳 Docker Images (GHCR)
+
+This repository publishes multi-arch container images to GitHub Container Registry:
+
+- `ghcr.io/<owner>/zotero-mcp:<tag>-core` - lightweight install (no optional extras)
+- `ghcr.io/<owner>/zotero-mcp:<tag>-all` - full install with `[semantic,pdf,scite]`
+- Unsuffixed tags (for example `:latest`, `:vX.Y.Z`) point to the `all` flavor
+
+Detailed publishing and runtime notes are in `docs/docker-images.md`.
+
+Tag strategy:
+
+- Release tags: `vX.Y.Z`, `vX.Y`, `vX` (plus `-core` and `-all` variants)
+- Main branch: `latest` (plus `latest-core` and `latest-all`)
+- Immutable SHA tags: `sha-<shortsha>-core`, `sha-<shortsha>-all` (and unsuffixed SHA for `all`)
+
+### Runtime modes in the container
+
+The image supports both MCP server and standalone CLI modes.
+
+- **Server mode (default)**: runs `zotero-mcp serve --transport stdio`
+- **CLI mode**: set `ZOTERO_APP=cli` and pass normal `zotero-cli` arguments
+
+### Docker env vars and persistence
+
+- Container runtime vars: `ZOTERO_APP` (`server` or `cli`) and `ZOTERO_TRANSPORT` (default: `stdio`)
+- All standard Zotero MCP vars are supported in containers (`ZOTERO_LOCAL`, `ZOTERO_API_KEY`, `ZOTERO_LIBRARY_ID`, embedding provider keys, etc.)
+- ChromaDB persistence path in the container is `/home/app/.config/zotero-mcp/chroma_db/`
+- Persist config + ChromaDB by mounting `/home/app/.config/zotero-mcp`
+
+Examples:
+
+```bash
+# Default MCP server mode (stdio)
+docker run --rm ghcr.io/<owner>/zotero-mcp:latest
+
+# MCP server mode with explicit transport
+docker run --rm ghcr.io/<owner>/zotero-mcp:latest serve --transport streamable-http --host 0.0.0.0 --port 8000
+
+# Standalone CLI mode
+docker run --rm -e ZOTERO_APP=cli ghcr.io/<owner>/zotero-mcp:latest search "machine learning"
+
+# Persist config + ChromaDB across runs
+docker run --rm -v zotero-mcp-data:/home/app/.config/zotero-mcp --env-file .env ghcr.io/<owner>/zotero-mcp:latest
 ```
 
 ## ⌨️ CLI Mode (`zotero-cli`)
@@ -559,6 +642,7 @@ zotero_remove_item_relation(
 - `zotero_add_from_file`: Import a local PDF or EPUB file with automatic DOI extraction
 
 All add tools take a `collections` parameter accepting collection keys, names, or `parent/child` paths — resolved and validated before the item is created, so unknown or ambiguous specs fail with suggestions instead of producing an unfiled item. They also take `if_exists` (`"duplicate"` — default — always creates; `"file"` reuses an existing item matching the DOI/arXiv ID/ISBN/URL, filing it into missing collections and adding missing tags; `"skip"` leaves a match untouched) and `create_missing_collections` (create unknown collection specs, including path chains, instead of failing). The `zotero-cli add` commands default to `--if-exists file`.
+- `zotero_attach_file`: Attach a local file or a PDF URL to an existing item by key (no new item created; returns the attachment key; idempotent per filename and content hash)
 - `zotero_create_collection`: Create a new collection (folder/project) in your library
 - `zotero_search_collections`: Search for collections by name to find their keys
 - `zotero_manage_collections`: Add or remove items from collections (accepts keys, names, or `parent/child` paths)

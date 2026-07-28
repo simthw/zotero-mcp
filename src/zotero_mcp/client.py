@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from markitdown import MarkItDown
 from pyzotero import zotero
 
-from zotero_mcp.utils import format_creators
+from zotero_mcp.utils import _paginate, format_creators
 from zotero_mcp.webdav import (
     WebDAVNotConfiguredError,
     download_attachment_from_webdav,
@@ -111,6 +111,21 @@ def clear_active_library() -> None:
 def get_active_library() -> dict[str, str]:
     """Return the current active library override (empty dict if using defaults)."""
     return dict(_active_library_override)
+
+
+def get_active_group_id() -> int:
+    """group_id (0 = personal, else Zotero groupID) of the library
+    ``get_zotero_client()`` is currently scoped to."""
+
+    override = _active_library_override
+    library_id = override.get("library_id") or os.getenv("ZOTERO_LIBRARY_ID") or "0"
+    library_type = override.get("library_type") or os.getenv("ZOTERO_LIBRARY_TYPE", "user")
+    if library_type == "group":
+        try:
+            return int(library_id)
+        except (TypeError, ValueError):
+            return 0
+    return 0
 
 
 def _make_local_http_client() -> httpx.Client:
@@ -430,6 +445,8 @@ def generate_bibtex(item: dict[str, Any]) -> str:
         ("publisher", "publisher"),
         ("place", "address"),
         ("DOI", "doi"),
+        ("ISBN", "isbn"),
+        ("ISSN", "issn"),
         ("url", "url"),
         ("abstractNote", "abstract")
     ]
@@ -479,7 +496,9 @@ def get_attachment_details(
     """
     data = item.get("data", {})
     item_type = data.get("itemType")
-    item_key = data.get("key")
+    # Top-level "key" is the reliable one: some API responses (and the local
+    # Zotero server) omit it from the nested data object (#372).
+    item_key = data.get("key") or item.get("key")
 
     # Direct attachment
     if item_type == "attachment":
@@ -492,7 +511,7 @@ def get_attachment_details(
 
     # For regular items, look for child attachments
     try:
-        children = zot.children(item_key)
+        children = _paginate(zot.children, item_key)
 
         # Group attachments by content type
         pdfs = []

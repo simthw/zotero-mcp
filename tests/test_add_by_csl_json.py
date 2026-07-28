@@ -215,10 +215,11 @@ class TestFilePath:
         result = server.add_by_csl_json(file_path=str(f), ctx=dummy_ctx)
         assert "Unsupported file extension" in result
 
-    def test_rejects_missing_file(self, monkeypatch, dummy_ctx):
+    def test_rejects_missing_file(self, monkeypatch, dummy_ctx, tmp_path):
         _patch_hybrid(monkeypatch)
         result = server.add_by_csl_json(
-            file_path="/absolutely/no/such/file.json", ctx=dummy_ctx,
+            file_path=str(tmp_path / "missing.json"),
+            ctx=dummy_ctx,
         )
         assert "not found" in result.lower()
 
@@ -229,10 +230,9 @@ class TestFilePath:
 
     def test_rejects_symlink(self, monkeypatch, dummy_ctx, tmp_path):
         _patch_hybrid(monkeypatch)
-        target = tmp_path / "real.json"
-        target.write_text(json.dumps(SAMPLE_ARTICLE), encoding="utf-8")
         link = tmp_path / "linked.json"
-        link.symlink_to(target)
+        link.write_text(json.dumps(SAMPLE_ARTICLE), encoding="utf-8")
+        monkeypatch.setattr("os.path.islink", lambda path: str(path) == str(link))
 
         result = server.add_by_csl_json(file_path=str(link), ctx=dummy_ctx)
         assert "symlink" in result.lower()

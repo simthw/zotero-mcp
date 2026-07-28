@@ -41,6 +41,7 @@ TOOL_BUDGETS = {
     # tools/write.py
     "zotero_batch_update_tags":        (155, 350),
     "zotero_batch_update_extra":       (165, 370),
+    "zotero_attach_file":              (190, 430),
     # tools/search.py
     "zotero_search_items":             (175, 400),
     "zotero_search_by_tag":            (115, 265),
@@ -77,7 +78,7 @@ def _collect_tool_descriptions():
 
     descriptions: dict[str, str] = {}
     for f in files:
-        content = f.read_text()
+        content = f.read_text(encoding="utf-8")
         for m in block_re.finditer(content):
             block = m.group(1)
             name_m = name_re.search(block)

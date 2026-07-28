@@ -232,10 +232,11 @@ class TestFilePath:
         result = server.add_by_bibtex(file_path=str(f), ctx=dummy_ctx)
         assert "Unsupported file extension" in result
 
-    def test_rejects_missing_file(self, monkeypatch, dummy_ctx):
+    def test_rejects_missing_file(self, monkeypatch, dummy_ctx, tmp_path):
         _patch_hybrid(monkeypatch)
         result = server.add_by_bibtex(
-            file_path="/absolutely/no/such/file.bib", ctx=dummy_ctx,
+            file_path=str(tmp_path / "missing.bib"),
+            ctx=dummy_ctx,
         )
         assert "not found" in result.lower()
 
@@ -246,10 +247,9 @@ class TestFilePath:
 
     def test_rejects_symlink(self, monkeypatch, dummy_ctx, tmp_path):
         _patch_hybrid(monkeypatch)
-        target = tmp_path / "real.bib"
-        target.write_text("@article{a, title={T}, year=2020}", encoding="utf-8")
         link = tmp_path / "linked.bib"
-        link.symlink_to(target)
+        link.write_text("@article{a, title={T}, year=2020}", encoding="utf-8")
+        monkeypatch.setattr("os.path.islink", lambda path: str(path) == str(link))
 
         result = server.add_by_bibtex(file_path=str(link), ctx=dummy_ctx)
         assert "symlink" in result.lower()

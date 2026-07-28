@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -27,9 +28,9 @@ except Exception:
 
 from . import openai_batch
 from .chroma_client import ChromaClient, create_chroma_client
-from .client import get_zotero_client
-from .local_db import LocalZoteroReader
-from .utils import format_creators, is_local_mode, suppress_stdout
+from .client import get_active_group_id, get_active_library, get_zotero_client
+from .local_db import PERSONAL_LIBRARY_GROUP_ID, LocalZoteroReader
+from .utils import _paginate, format_creators, is_local_mode, suppress_stdout
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,12 @@ _DEFAULT_UPDATE_CONFIG = {
     "update_days": 7,
 }
 
+# Bumped when the ChromaDB metadata shape changes in a way that requires a
+# one-time migration of existing documents. Version 2 (#163) added the
+# `group_id` field. A persisted collection whose config.json records a lower
+# (or absent, i.e. 0) version gets migrated via `_backfill_group_ids()`.
+_INDEX_SCHEMA_VERSION = 2
+
 
 def load_update_config(config_path: str | None) -> dict[str, Any]:
     """Read the semantic-search ``update_config`` block from disk.
@@ -161,6 +168,50 @@ def load_update_config(config_path: str | None) -> dict[str, Any]:
         except Exception as e:
             logger.warning(f"Error loading update config: {e}")
     return config
+
+
+_DEFAULT_RERANKER_CONFIG: dict[str, Any] = {
+    "enabled": False,
+    "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    "candidate_multiplier": 3,
+}
+
+
+def load_reranker_config(config_path: str | None) -> dict[str, Any]:
+    """Read the semantic-search ``reranker`` block from disk.
+
+    Pure file read with no model load, so the server can consult it (e.g. to
+    decide whether to warm up) without paying the cross-encoder cost.
+    """
+    config = dict(_DEFAULT_RERANKER_CONFIG)
+    if config_path and os.path.exists(config_path):
+        try:
+            with open(config_path) as f:
+                file_config = json.load(f)
+            config.update(file_config.get("semantic_search", {}).get("reranker", {}))
+        except Exception as e:
+            logger.warning(f"Error loading reranker config: {e}")
+    return config
+
+
+def warmup_reranker(config_path: str | None = None) -> bool:
+    """Preload the configured reranker into the process-wide cache.
+
+    Lets the server pay the cross-encoder load cost once at startup (off the
+    request path) so the first real ``zotero_semantic_search`` is fast too
+    (issue #283). Returns ``True`` if a model was warmed, ``False`` if the
+    reranker is disabled. Never raises — a failed warmup must not crash startup.
+    """
+    cfg = load_reranker_config(config_path)
+    if not cfg.get("enabled", False):
+        return False
+    model = cfg.get("model", _DEFAULT_RERANKER_CONFIG["model"])
+    try:
+        get_cached_reranker(model)
+        return True
+    except Exception as e:
+        logger.warning(f"Reranker warmup failed for '{model}': {e}")
+        return False
 
 
 def should_update(update_config: dict[str, Any]) -> bool:
@@ -328,6 +379,33 @@ class CrossEncoderReranker:
         return [(i, float(scores[i])) for i in ranked[:top_k]]
 
 
+# Process-wide reranker cache (issue #283).
+#
+# The MCP search path builds a fresh ``ZoteroSemanticSearch`` per request, so a
+# reranker held on the instance (``self._reranker``) was reloaded from disk on
+# *every* call — the cross-encoder load dominates at ~tens of seconds and blew
+# past client timeouts. The weights are immutable for a given ``model_name``, so
+# caching the loaded reranker at module scope keeps it warm across requests and
+# instances. The lock prevents two concurrent first-calls from double-loading.
+_RERANKER_CACHE: dict[str, CrossEncoderReranker] = {}
+_RERANKER_CACHE_LOCK = threading.Lock()
+
+
+def get_cached_reranker(model_name: str) -> CrossEncoderReranker:
+    """Return a process-wide cached reranker, loading it once per ``model_name``."""
+    cached = _RERANKER_CACHE.get(model_name)
+    if cached is not None:
+        return cached
+    with _RERANKER_CACHE_LOCK:
+        # Re-check under the lock: another thread may have loaded it while we
+        # waited, and the model load is far too expensive to repeat.
+        cached = _RERANKER_CACHE.get(model_name)
+        if cached is None:
+            cached = CrossEncoderReranker(model_name=model_name)
+            _RERANKER_CACHE[model_name] = cached
+        return cached
+
+
 class ZoteroSemanticSearch:
     """Semantic search interface for Zotero libraries using ChromaDB."""
 
@@ -390,27 +468,20 @@ class ZoteroSemanticSearch:
 
     def _load_reranker_config(self) -> dict[str, Any]:
         """Load reranker configuration from file or use defaults."""
-        config: dict[str, Any] = {
-            "enabled": False,
-            "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-            "candidate_multiplier": 3,
-        }
-        if self.config_path and os.path.exists(self.config_path):
-            try:
-                with open(self.config_path) as f:
-                    file_config = json.load(f)
-                    config.update(file_config.get("semantic_search", {}).get("reranker", {}))
-            except Exception as e:
-                logger.warning(f"Error loading reranker config: {e}")
-        return config
+        return load_reranker_config(self.config_path)
 
     def _get_reranker(self) -> CrossEncoderReranker | None:
-        """Get the reranker instance, lazily initializing if enabled."""
+        """Get the reranker, reusing the process-wide cache if enabled.
+
+        Each MCP request builds a new ``ZoteroSemanticSearch``, so the model is
+        fetched from :func:`get_cached_reranker` (loaded once per process) rather
+        than reloaded per instance (issue #283).
+        """
         if not self._reranker_config.get("enabled", False):
             return None
         if self._reranker is None:
-            model = self._reranker_config.get("model", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-            self._reranker = CrossEncoderReranker(model_name=model)
+            model = self._reranker_config.get("model", _DEFAULT_RERANKER_CONFIG["model"])
+            self._reranker = get_cached_reranker(model)
         return self._reranker
 
     def _load_update_config(self) -> dict[str, Any]:
@@ -460,26 +531,90 @@ class ZoteroSemanticSearch:
         requested = self._load_openai_batch_enabled() if use_openai_batch is None else use_openai_batch
         return bool(requested and self.chroma_client.embedding_model == "openai")
 
-    def _load_last_sync_version(self) -> int:
-        """Last Zotero library version fully indexed into ChromaDB.
+    def _active_library_key(self) -> str:
+        """Config key for the library ``self.zotero_client`` is scoped to.
 
-        Zero means "no prior successful sync; bootstrap required". Used to
-        drive since-based incremental ingest via pyzotero's
-        `item_versions(since=V)` and `new_fulltext(since=V)`.
+        Same identity as the ``group_id`` stamped on indexed documents:
+        ``"0"`` is the personal library, anything else a Zotero groupID.
+        """
+        return str(get_active_group_id())
+
+    def _migrate_legacy_sync_version(self, legacy: Any, library_key: str) -> int:
+        """Interpret a pre-#393 scalar ``last_sync_version`` for one library.
+
+        The scalar carries no record of which library produced it, so it can
+        only be reused where provenance is unambiguous: when no runtime
+        library override is active, the client is scoped to the
+        env-configured default library, which is the only library a config
+        could have been tracking across restarts (``zotero_switch_library``
+        overrides live in memory and are never persisted). That covers every
+        existing single-library user, who keeps their watermark and avoids a
+        needless full re-scan on upgrade.
+
+        When a switch *is* active the scalar is discarded: a redundant full
+        scan is cheap next to trusting a foreign library's counter, which
+        makes ``item_versions(since=...)`` return nothing and silently skips
+        the entire library.
+        """
+        if legacy is None:
+            return 0
+        if get_active_library():
+            logger.info(
+                "Ignoring legacy last_sync_version while a library override is "
+                f"active (library {library_key}); bootstrapping this library's "
+                "own sync watermark instead."
+            )
+            return 0
+        try:
+            return int(legacy)
+        except (TypeError, ValueError):
+            return 0
+
+    def _load_last_sync_version(self) -> int:
+        """Last Zotero library version fully indexed into ChromaDB for the
+        library the Zotero client is currently scoped to.
+
+        Zero means "no prior successful sync for this library; bootstrap
+        required". Used to drive since-based incremental ingest via
+        pyzotero's `item_versions(since=V)` and `new_fulltext(since=V)`.
+
+        Watermarks are stored per library under `last_sync_versions`, keyed
+        by group_id ("0" = personal). Every Zotero library has its own
+        independent, monotonically increasing version counter, so the single
+        shared scalar this replaces corrupted sync state for both libraries
+        after `zotero_switch_library` (#393).
         """
         if not self.config_path or not os.path.exists(self.config_path):
             return 0
         try:
             with open(self.config_path) as f:
-                file_config = json.load(f)
-                value = file_config.get("semantic_search", {}).get("last_sync_version", 0)
-                return int(value) if value is not None else 0
+                section = json.load(f).get("semantic_search", {}) or {}
         except Exception as e:
             logger.warning(f"Error loading last_sync_version: {e}")
             return 0
 
-    def _save_update_config(self, last_sync_version: int | None = None) -> None:
-        """Save update configuration and optionally update last_sync_version."""
+        library_key = self._active_library_key()
+        versions = section.get("last_sync_versions")
+        if isinstance(versions, dict):
+            # The map is authoritative once written: a library absent from it
+            # has never been synced, so it must bootstrap rather than inherit
+            # another library's counter.
+            try:
+                return int(versions.get(library_key) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return self._migrate_legacy_sync_version(
+            section.get("last_sync_version"), library_key
+        )
+
+    def _save_update_config(
+        self,
+        last_sync_version: int | None = None,
+        library_key: str | None = None,
+    ) -> None:
+        """Save update configuration and optionally update the sync watermark
+        of ``library_key`` (defaults to the currently active library)."""
         if not self.config_path:
             return
 
@@ -501,13 +636,117 @@ class ZoteroSemanticSearch:
 
         full_config["semantic_search"]["update_config"] = self.update_config
         if last_sync_version is not None:
-            full_config["semantic_search"]["last_sync_version"] = int(last_sync_version)
+            key = str(library_key) if library_key is not None else self._active_library_key()
+            versions = full_config["semantic_search"].get("last_sync_versions")
+            if not isinstance(versions, dict):
+                versions = {}
+            versions[key] = int(last_sync_version)
+            full_config["semantic_search"]["last_sync_versions"] = versions
+            # Back-compat mirror of the pre-#393 scalar, personal library
+            # only: an older zotero-mcp (or a downgrade) reads that key and
+            # applies it to whatever library it is pointed at, so a group's
+            # counter must never leak into it.
+            if key == str(PERSONAL_LIBRARY_GROUP_ID):
+                full_config["semantic_search"]["last_sync_version"] = int(last_sync_version)
 
         try:
             with open(self.config_path, "w") as f:
                 json.dump(full_config, f, indent=2)
         except Exception as e:
             logger.error(f"Error saving update config: {e}")
+
+    def _load_index_schema_version(self) -> int:
+        """Schema version of the persisted ChromaDB collection's metadata shape."""
+        if not self.config_path or not os.path.exists(self.config_path):
+            return 0
+        try:
+            with open(self.config_path) as f:
+                value = json.load(f).get("semantic_search", {}).get("index_schema_version", 0)
+                return int(value) if value is not None else 0
+        except Exception as e:
+            logger.warning(f"Error loading index_schema_version: {e}")
+            return 0
+
+    def _save_index_schema_version(self, version: int) -> None:
+        """Record that the collection's metadata now matches ``version``."""
+        if not self.config_path:
+            return
+        config_dir = Path(self.config_path).parent
+        config_dir.mkdir(parents=True, exist_ok=True)
+        full_config = {}
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path) as f:
+                    full_config = json.load(f)
+            except Exception:
+                pass
+        full_config.setdefault("semantic_search", {})["index_schema_version"] = int(version)
+        try:
+            with open(self.config_path, "w") as f:
+                json.dump(full_config, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving index_schema_version: {e}")
+
+    def _backfill_group_ids(self) -> dict[str, int]:
+        """One-time metadata-only migration: tag pre-#163 docs with ``group_id``.
+
+        Docs indexed before #163 carry no ``group_id`` metadata key. This
+        pages through the collection and attaches one via
+        ``ChromaClient.update_metadatas()`` — metadata-only, so no
+        re-embedding and no doc-id change. Local mode attributes each doc
+        via ``LocalZoteroReader.get_key_group_map()`` (ground truth from the
+        live database, keyed by ``item_key``); web mode — and any local-mode
+        item missing from the live DB (e.g. since deleted) — falls back to
+        the currently active library's group_id, since a pre-#163
+        collection only ever held one library's docs at a time. Idempotent:
+        docs that already carry ``group_id`` are left untouched, so a
+        partial/interrupted run just resumes on the next call.
+
+        Returns ``{"scanned": N, "migrated": N}``.
+        """
+        stats = {"scanned": 0, "migrated": 0}
+
+        key_group_map: dict[str, int] | None = None
+        if is_local_mode():
+            try:
+                zotero_db_path = self.db_path
+                if not zotero_db_path and self.config_path and os.path.exists(self.config_path):
+                    with open(self.config_path) as f:
+                        zotero_db_path = (
+                            json.load(f).get("semantic_search", {}).get("zotero_db_path")
+                        )
+                with LocalZoteroReader(db_path=zotero_db_path) as reader:
+                    key_group_map, _ = reader.get_key_group_map()
+            except Exception as e:
+                logger.warning(
+                    f"group_id backfill: could not read local database, "
+                    f"falling back to active-library attribution: {e}"
+                )
+                key_group_map = None
+
+        fallback_group_id = get_active_group_id()
+
+        for ids, metadatas in self.chroma_client.iter_metadatas():
+            stats["scanned"] += len(ids)
+            update_ids: list[str] = []
+            update_metas: list[dict[str, Any]] = []
+            for doc_id, meta in zip(ids, metadatas):
+                meta = dict(meta or {})
+                if "group_id" in meta:
+                    continue
+                item_key = meta.get("item_key") or doc_id.split("#", 1)[0]
+                if key_group_map is not None and item_key in key_group_map:
+                    group_id = key_group_map[item_key]
+                else:
+                    group_id = fallback_group_id
+                meta["group_id"] = int(group_id)
+                update_ids.append(doc_id)
+                update_metas.append(meta)
+            if update_ids:
+                self.chroma_client.update_metadatas(update_ids, update_metas)
+                stats["migrated"] += len(update_ids)
+
+        return stats
 
     def _create_document_text(self, item: dict[str, Any]) -> str:
         """
@@ -606,6 +845,11 @@ class ZoteroSemanticSearch:
             "publication": data.get("publicationTitle", ""),
             "url": data.get("url", ""),
             "doi": data.get("DOI", ""),
+            # Library attribution (#163): 0 = personal, else groupID. Every
+            # item-producing path (local scan, API scan, incremental API
+            # fetch) stamps data["group_id"] before this runs; default to
+            # personal only for the hypothetical case of an untagged caller.
+            "group_id": int(data.get("group_id", PERSONAL_LIBRARY_GROUP_ID) or 0),
         }
         # If fulltext was extracted (or attempted), mark it so incremental
         # updates don't keep re-trying items that failed extraction
@@ -617,6 +861,12 @@ class ZoteroSemanticSearch:
             # Extraction was attempted but failed (timeout, empty, etc.)
             # Mark so we don't retry on every incremental update
             metadata["has_fulltext"] = "failed"
+
+        # Record the attachment-key set (local mode only) so update runs can
+        # retry a "failed" item once its attachments change — attaching a file
+        # does not bump the parent's dateModified.
+        if (att_keys := data.get("attachmentKeys")) is not None:
+            metadata["attachment_keys"] = att_keys
 
         # Add tags as a single string
         if tags := data.get("tags"):
@@ -708,6 +958,7 @@ class ZoteroSemanticSearch:
             pdf_max_pages = None
             pdf_timeout = 30
             zotero_db_path = self.db_path  # CLI override takes precedence
+            collection_keys = None
             # If semantic_search config file exists, prefer its setting
             try:
                 if self.config_path and os.path.exists(self.config_path):
@@ -717,6 +968,7 @@ class ZoteroSemanticSearch:
                         extraction_cfg = semantic_cfg.get("extraction", {})
                         pdf_max_pages = extraction_cfg.get("pdf_max_pages")
                         pdf_timeout = extraction_cfg.get("pdf_timeout", 30)
+                        collection_keys = semantic_cfg.get("collection_keys")
                         # Use config db_path only if no CLI override
                         if not zotero_db_path:
                             zotero_db_path = semantic_cfg.get("zotero_db_path")
@@ -735,9 +987,19 @@ class ZoteroSemanticSearch:
                 # actually see — a fresh read taken later could already
                 # include rows from a WAL checkpoint that landed mid-scan.
                 self._last_scan_snapshot_keys = reader.get_all_item_keys()
+                # Library attribution (#163): map every item key to its
+                # group_id (0 = personal, else Zotero groupID) via direct SQL
+                # on the same connection this scan uses. Feed/publications
+                # items have no group_id equivalent and are dropped below
+                # rather than mis-tagged as personal.
+                key_group_map, excluded_keys = reader.get_key_group_map()
                 # Phase 1: fetch metadata only (fast)
                 sys.stderr.write("Scanning local Zotero database for items...\n")
-                local_items = reader.get_items_with_text(limit=limit, include_fulltext=False)
+                if collection_keys:
+                    sys.stderr.write(f"Filtering to collections: {collection_keys}\n")
+                local_items = reader.get_items_with_text(limit=limit, include_fulltext=False, collection_keys=collection_keys)
+                if excluded_keys:
+                    local_items = [it for it in local_items if it.key not in excluded_keys]
                 candidate_count = len(local_items)
                 sys.stderr.write(f"Found {candidate_count} candidate items.\n")
 
@@ -894,31 +1156,58 @@ class ZoteroSemanticSearch:
 
                         should_extract = True
 
+                        # Current attachment-key set, stored in metadata so a
+                        # later run can detect attachment changes. Attaching a
+                        # file does NOT bump the parent's dateModified, so the
+                        # date check alone never clears a "failed" marker.
+                        att_keys = ",".join(
+                            sorted(k for k, _p, _c in reader.get_fulltext_meta_for_item(it.item_id))
+                        )
+                        it._attachment_keys = att_keys
+
                         # CHECK IF ITEM ALREADY EXISTS (unless force_rebuild or no client)
                         if chroma_client and not force_rebuild:
+                            # With passage-chunking the stored ids are
+                            # "<key>#<n>"; get_document_metadata falls back to
+                            # chunk 0 so chunked items are still recognized.
                             existing_metadata = chroma_client.get_document_metadata(it.key)
                             if existing_metadata:
                                 chroma_has_fulltext = existing_metadata.get("has_fulltext", False)
-                                local_has_fulltext = len(reader.get_fulltext_meta_for_item(it.item_id)) > 0
+                                local_has_fulltext = bool(att_keys)
+                                mineru_upgrade = (
+                                    existing_metadata.get("fulltext_source", "")
+                                    != "content_list_json"
+                                    and reader.has_content_list_json(it.item_id)
+                                )
 
-                                # Skip if extraction previously failed AND the item hasn't been
-                                # modified since (handles case where user replaces a bad PDF)
+                                # Skip if extraction previously failed AND neither the item
+                                # nor its attachment set has changed since (handles both a
+                                # replaced bad PDF and a PDF newly attached to an item that
+                                # was indexed metadata-only). A newly generated MinerU output
+                                # must also clear the failure even though neither Zotero field
+                                # changes when content_list.json appears beside an attachment.
                                 if chroma_has_fulltext == "failed":
                                     chroma_date = existing_metadata.get("date_modified", "")
                                     item_date = getattr(it, "date_modified", "") or ""
-                                    if chroma_date == item_date:
-                                        # Same modification date — don't retry failed extraction
+                                    stored_att_keys = existing_metadata.get("attachment_keys")
+                                    if (
+                                        chroma_date == item_date
+                                        and stored_att_keys == att_keys
+                                        and not mineru_upgrade
+                                    ):
+                                        # Nothing changed since the failure — don't retry
                                         should_extract = False
                                         skipped_existing += 1
                                         _skipped_failed.append(display or f"item {it.key}")
                                     else:
-                                        # Item was modified since last failure — retry
+                                        # Item or its attachments changed since last
+                                        # failure (legacy records without attachment_keys
+                                        # retry once, then converge) — retry
                                         updated_existing += 1
                                 elif not chroma_has_fulltext and local_has_fulltext:
                                     # Document exists but lacks fulltext - we need to update it
                                     updated_existing += 1
-                                elif (existing_metadata.get("fulltext_source", "") != "content_list_json"
-                                      and reader.has_content_list_json(it.item_id)):
+                                elif mineru_upgrade:
                                     # MinerU upgrade: a content_list.json is now available
                                     # but the indexed copy came from a lower-priority source
                                     # (PDF / zotero-cache / none). Re-extract to upgrade it to
@@ -1000,7 +1289,9 @@ class ZoteroSemanticSearch:
                                 sys.stderr.write(f"    - {name}\n")
                             if len(_skipped_failed) > 5:
                                 sys.stderr.write(f"    ... and {len(_skipped_failed) - 5} more\n")
-                            sys.stderr.write("  (To retry these, run with --force-rebuild)\n")
+                            sys.stderr.write(
+                                "  (To retry these, attach or replace the PDF, or run with --force-rebuild)\n"
+                            )
                     except Exception:
                         pass
 
@@ -1033,8 +1324,18 @@ class ZoteroSemanticSearch:
                             "dateAdded": item.date_added,
                             "dateModified": item.date_modified,
                             "creators": self._parse_creators_string(item.creators) if item.creators else [],
+                            # Library attribution (#163): 0 = personal, else
+                            # groupID. Ground truth from get_key_group_map();
+                            # defaults to personal for the rare item missing
+                            # from the map (e.g. added mid-scan).
+                            "group_id": key_group_map.get(item.key, PERSONAL_LIBRARY_GROUP_ID),
                         },
                     }
+                    # Attachment-key set (computed during the extraction scan);
+                    # persisted to metadata so incremental runs can detect
+                    # newly attached files on previously-failed items.
+                    if (att := getattr(item, "_attachment_keys", None)) is not None:
+                        api_item["data"]["attachmentKeys"] = att
 
                     # Add notes if available
                     if item.notes:
@@ -1113,7 +1414,7 @@ class ZoteroSemanticSearch:
 
         # 2. Walk PDF attachment children and try each in order.
         try:
-            children = self.zotero_client.children(item_key) or []
+            children = _paginate(self.zotero_client.children, item_key) or []
         except Exception as e:
             logger.debug(f"children({item_key}) failed: {e}")
             children = []
@@ -1176,6 +1477,20 @@ class ZoteroSemanticSearch:
         except Exception:
             pass
 
+    def _tag_group_id(self, items: list[dict[str, Any]]) -> None:
+        """Stamp every item's ``data.group_id`` with the active library, in place.
+
+        Web-API item/version fetches always cover exactly one library — the
+        one ``get_zotero_client()`` is currently pointed at (override or env
+        vars) — so every item an API-mode scan or incremental fetch returns
+        can be tagged with the correct library via
+        ``client.get_active_group_id()``, the same lookup the search-tool
+        fallback cascade uses.
+        """
+        group_id = get_active_group_id()
+        for item in items:
+            item.setdefault("data", {})["group_id"] = group_id
+
     def _get_items_from_api(self, limit: int | None = None, include_fulltext: bool = False) -> list[dict[str, Any]]:
         """
         Get items from Zotero API (original implementation).
@@ -1235,6 +1550,8 @@ class ZoteroSemanticSearch:
         if include_fulltext:
             self._attach_web_fulltext(all_items)
 
+        self._tag_group_id(all_items)
+
         logger.info(f"Retrieved {len(all_items)} items from API")
         return all_items
 
@@ -1287,6 +1604,8 @@ class ZoteroSemanticSearch:
 
         if include_fulltext and changed_items:
             self._attach_web_fulltext(changed_items)
+
+        self._tag_group_id(changed_items)
 
         return changed_items, current_keys
 
@@ -1405,6 +1724,7 @@ class ZoteroSemanticSearch:
             config_path=self.config_path,
             force_full_rebuild=force_full_rebuild,
             target_sync_version=target_sync_version,
+            group_id=get_active_group_id(),
         )
         stats["batch_submitted"] = True
         stats["batch_run_id"] = manifest["run_id"]
@@ -1490,6 +1810,29 @@ class ZoteroSemanticSearch:
             return stats
 
         try:
+            # One-time metadata migration (#163): tag any pre-existing docs
+            # that lack group_id. Skipped on a force rebuild — the reset
+            # below wipes the collection anyway, so every doc gets tagged
+            # fresh via the normal indexing path.
+            if not force_full_rebuild and self._load_index_schema_version() < _INDEX_SCHEMA_VERSION:
+                try:
+                    backfill_stats = self._backfill_group_ids()
+                    if backfill_stats["migrated"]:
+                        try:
+                            sys.stderr.write(
+                                f"Migrated {backfill_stats['migrated']} existing document(s) "
+                                "to the multi-library index format.\n"
+                            )
+                        except Exception:
+                            pass
+                    self._save_index_schema_version(_INDEX_SCHEMA_VERSION)
+                except Exception as e:
+                    logger.error(
+                        f"group_id metadata backfill failed ({e}); existing documents "
+                        "may be missing library attribution. Run with --force-rebuild "
+                        "to fully reindex, or retry the update."
+                    )
+
             # Resolve include_fulltext default from config if not specified
             if include_fulltext is None:
                 include_fulltext = self._load_include_fulltext_setting()
@@ -1514,6 +1857,31 @@ class ZoteroSemanticSearch:
                 not force_full_rebuild and not extract_fulltext and limit is None and last_sync_version > 0
             )
 
+            # When a collection filter is configured, skip the API-based
+            # incremental path: it fetches changed items from the WHOLE
+            # library and its deletion pass compares against all library
+            # keys, both of which would bypass the filter. The local
+            # full-scan path applies collection_keys and skips
+            # already-indexed items, so filtered updates stay cheap.
+            configured_collection_keys = None
+            try:
+                if self.config_path and os.path.exists(self.config_path):
+                    with open(self.config_path) as _f:
+                        configured_collection_keys = (
+                            json.load(_f).get("semantic_search", {}).get("collection_keys")
+                        )
+            except Exception:
+                pass
+            if configured_collection_keys and use_incremental:
+                use_incremental = False
+                try:
+                    sys.stderr.write(
+                        f"Collection filter active ({configured_collection_keys}); "
+                        "using local full scan instead of API incremental update.\n"
+                    )
+                except Exception:
+                    pass
+
             target_sync_version: int | None = None
             all_items: list[dict[str, Any]] = []
             if use_incremental:
@@ -1522,6 +1890,20 @@ class ZoteroSemanticSearch:
                 except Exception as e:
                     logger.warning(f"last_modified_version() failed, falling back to full scan: {e}")
                     use_incremental = False
+
+            if use_incremental and last_sync_version > (target_sync_version or 0):
+                # A library's version counter never decreases, so a watermark
+                # ahead of it cannot have come from this library (e.g. a
+                # legacy scalar migrated from a differently-scoped install).
+                # Trusting it would make item_versions(since=...) return an
+                # empty dict and silently skip the whole library (#393).
+                logger.warning(
+                    f"Stored sync watermark ({last_sync_version}) is ahead of "
+                    f"library {self._active_library_key()}'s current version "
+                    f"({target_sync_version}); falling back to a full scan."
+                )
+                use_incremental = False
+                last_sync_version = 0
 
             if use_incremental and target_sync_version == last_sync_version:
                 # No changes since last sync; skip ingest but still touch last_update
@@ -2033,7 +2415,13 @@ class ZoteroSemanticSearch:
             openai_batch.save_manifest(manifest)
             if all(batch.get("imported_at") for batch in all_batches):
                 self.update_config["last_update"] = datetime.now().isoformat()
-                self._save_update_config(last_sync_version=manifest.get("target_sync_version"))
+                # Promote the watermark of the library the batch was submitted
+                # against, not whichever library happens to be active now.
+                manifest_group_id = manifest.get("group_id")
+                self._save_update_config(
+                    last_sync_version=manifest.get("target_sync_version"),
+                    library_key=None if manifest_group_id is None else str(manifest_group_id),
+                )
             return stats
         finally:
             lock_cm.__exit__(None, None, None)
@@ -2041,7 +2429,8 @@ class ZoteroSemanticSearch:
     def search(self,
                query: str,
                limit: int = 10,
-               filters: dict[str, Any] | None = None) -> dict[str, Any]:
+               filters: dict[str, Any] | None = None,
+               group_id: int | None = None) -> dict[str, Any]:
         """
         Perform semantic search over the Zotero library.
 
@@ -2049,6 +2438,10 @@ class ZoteroSemanticSearch:
             query: Search query text
             limit: Maximum number of results to return
             filters: Optional metadata filters
+            group_id: Restrict results to one library (0 = personal, else
+                groupID). ``None`` (default) searches every indexed library —
+                DB-side filtering via a ChromaDB ``where`` clause, never a
+                Python post-filter.
 
         Returns:
             Search results with Zotero item details
@@ -2066,8 +2459,13 @@ class ZoteroSemanticSearch:
                 multiplier = self._reranker_config.get("candidate_multiplier", 3)
                 fetch_limit = max(fetch_limit, limit * multiplier)
 
+            where = filters
+            if group_id is not None:
+                group_clause = {"group_id": int(group_id)}
+                where = {"$and": [filters, group_clause]} if filters else group_clause
+
             # Perform semantic search
-            results = self.chroma_client.search(query_texts=[query], n_results=fetch_limit, where=filters)
+            results = self.chroma_client.search(query_texts=[query], n_results=fetch_limit, where=where)
 
             # Re-rank results with cross-encoder if enabled. With chunking we
             # rerank ALL candidates (grouping to `limit` items happens in
@@ -2088,6 +2486,7 @@ class ZoteroSemanticSearch:
                 "query": query,
                 "limit": limit,
                 "filters": filters,
+                "group_id": group_id,
                 "results": enriched_results,
                 "total_found": len(enriched_results),
             }
@@ -2098,6 +2497,7 @@ class ZoteroSemanticSearch:
                 "query": query,
                 "limit": limit,
                 "filters": filters,
+                "group_id": group_id,
                 "results": [],
                 "total_found": 0,
                 "error": str(e),

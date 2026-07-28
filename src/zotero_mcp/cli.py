@@ -56,22 +56,26 @@ def load_claude_desktop_env_vars():
     # Global guard to skip Claude detection entirely
     if str(os.environ.get("ZOTERO_NO_CLAUDE", "")).lower() in ("1", "true", "yes"):
         return {}
-    from zotero_mcp.setup_helper import find_claude_config
+    from zotero_mcp.setup_helper import find_existing_claude_configs
 
     try:
-        config_path = find_claude_config()
-        if not config_path or not config_path.exists():
-            return {}
+        # More than one Claude Desktop build can be installed (issue #392);
+        # use the first config that actually configures the zotero server.
+        for config_path in find_existing_claude_configs():
+            try:
+                with open(config_path) as f:
+                    config = json.load(f)
+            except Exception:
+                continue
 
-        with open(config_path) as f:
-            config = json.load(f)
+            # Extract Zotero MCP server environment variables
+            mcp_servers = config.get("mcpServers", {})
+            zotero_config = mcp_servers.get("zotero", {})
+            env_vars = zotero_config.get("env", {})
+            if env_vars:
+                return env_vars
 
-        # Extract Zotero MCP server environment variables
-        mcp_servers = config.get("mcpServers", {})
-        zotero_config = mcp_servers.get("zotero", {})
-        env_vars = zotero_config.get("env", {})
-
-        return env_vars
+        return {}
 
     except Exception:
         return {}
@@ -122,12 +126,8 @@ def _save_zotero_db_path_to_config(config_path: Path, db_path: str) -> None:
             except Exception:
                 pass
 
-        # Ensure semantic_search section exists
-        if "semantic_search" not in full_config:
-            full_config["semantic_search"] = {}
-
-        # Save the db_path
-        full_config["semantic_search"]["zotero_db_path"] = db_path
+        # Save the db_path at the top level
+        full_config["zotero_db_path"] = db_path
 
         # Write back to file
         with open(config_path, 'w') as f:
@@ -147,6 +147,30 @@ def _save_zotero_db_path_to_config(config_path: Path, db_path: str) -> None:
 
 def _semantic_config_path(path_arg: str | None) -> Path:
     return Path(path_arg) if path_arg else Path.home() / ".config" / "zotero-mcp" / "config.json"
+
+
+def _warmup_reranker_in_background() -> None:
+    """Preload the reranker (if enabled) off the request path — see issue #283.
+
+    Runs in a daemon thread so server startup is never delayed and a failed or
+    slow model load can never crash the server. No-op when the optional
+    ``[semantic]`` extra isn't installed or the reranker is disabled.
+    """
+    import threading
+
+    def _run() -> None:
+        try:
+            from zotero_mcp.semantic_search import warmup_reranker
+        except Exception:
+            return  # semantic extra not installed
+        try:
+            config_path = str(_semantic_config_path(None))
+            if warmup_reranker(config_path):
+                print("Reranker warmed up.", file=sys.stderr)
+        except Exception:
+            pass  # best-effort: never let warmup break serving
+
+    threading.Thread(target=_run, daemon=True, name="zmcp-reranker-warmup").start()
 
 
 def _print_update_stats(stats: dict) -> None:
@@ -624,6 +648,11 @@ def main():
 
         from zotero_mcp.semantic_search import create_semantic_search
 
+        # Batch size for paginated collection scans (see _iter_all_metadatas).
+        # Keeps each col.get() well under SQLite's bound-variable ceiling
+        # regardless of collection size.
+        DB_INSPECT_BATCH_SIZE = 500
+
         # Determine config path
         config_path = args.config_path
         if not config_path:
@@ -636,27 +665,54 @@ def main():
             client = search.chroma_client
             col = client.collection
 
+            def _iter_all_metadatas(batch_size=DB_INSPECT_BATCH_SIZE, include_documents=False):
+                """Paginate through the whole collection in bounded batches.
+
+                A single unbounded ``col.get(include=[...])`` call (no limit/offset)
+                asks Chroma's SQLite backend to bind one parameter per row for the
+                entire collection; past roughly a few tens of thousands of rows this
+                exceeds SQLite's bound-variable ceiling and raises
+                ``too many SQL variables``. Fetching in small batches keeps every
+                query well under that limit regardless of collection size, and lets
+                filtering scan the *whole* collection instead of silently being
+                limited to whatever the first raw batch happened to contain.
+                """
+                inc = ["metadatas", "documents"] if include_documents else ["metadatas"]
+                total = col.count()
+                offset = 0
+                while offset < total:
+                    batch = col.get(limit=batch_size, offset=offset, include=inc)
+                    metas = batch.get("metadatas", [])
+                    if not metas:
+                        break
+                    docs = batch.get("documents", [None] * len(metas)) if include_documents else [None] * len(metas)
+                    for m, d in zip(metas, docs):
+                        yield (m or {}), d
+                    offset += batch_size
+
             if args.stats:
-                # Show aggregate stats (merged from former db-stats)
-                meta = col.get(include=["metadatas"])  # type: ignore
-                metas = meta.get("metadatas", [])
+                # Show aggregate stats (merged from former db-stats).
+                #
+                # Single streaming pass over _iter_all_metadatas(): only the
+                # small aggregates below (counters) are held in memory, never
+                # a list of the collection's ~100k+ metadata dicts.
                 print("=== Semantic DB Inspection (Stats) ===")
                 info = client.get_collection_info()
                 print(f"Collection: {info.get('name')} @ {info.get('persist_directory')}")
                 print(f"Count: {info.get('count')}")
 
-                # Item type distribution
-                item_types = [ (m or {}).get("item_type", "") for m in metas ]
-                ct_types = Counter(item_types)
-                print("Item types:")
-                for t, c in ct_types.most_common(20):
-                    print(f"  {t or '(missing)'}: {c}")
-
-                # Fulltext coverage by type (pdf/html)
+                ct_types = Counter()
+                ct_titles = Counter()
                 coverage = {}
-                for m in metas:
+                for m, _ in _iter_all_metadatas():
                     m = m or {}
                     t = m.get("item_type", "") or "(missing)"
+                    ct_types[t] += 1
+
+                    title = m.get("title", "")
+                    if title:
+                        ct_titles[title] += 1
+
                     cov = coverage.setdefault(t, {"total": 0, "with_fulltext": 0, "pdf": 0, "html": 0})
                     cov["total"] += 1
                     if m.get("has_fulltext"):
@@ -666,36 +722,33 @@ def main():
                             cov["pdf"] += 1
                         elif src == "html":
                             cov["html"] += 1
+
+                print("Item types:")
+                for t, c in ct_types.most_common(20):
+                    print(f"  {t or '(missing)'}: {c}")
+
                 print("Fulltext coverage (by type):")
                 for t, cov in coverage.items():
                     print(f"  {t}: {cov['with_fulltext']}/{cov['total']} (pdf:{cov['pdf']}, html:{cov['html']})")
 
-                # Common titles (may indicate duplicates)
-                titles = [ (m or {}).get("title", "") for m in metas ]
-                from collections import Counter as _Counter
-                ct_titles = _Counter([t for t in titles if t])
-                common = [(t,c) for t,c in ct_titles.most_common(10)]
+                common = ct_titles.most_common(10)
                 if common:
                     print("Common titles:")
                     for t, c in common:
                         print(f"  {t[:80]}{'...' if len(t)>80 else ''}: {c}")
                 return
 
-            include = ["metadatas"]
-            if args.show_documents:
-                include.append("documents")
-
-            # Fetch up to limit; filter client-side if requested
-            data = col.get(limit=args.limit, include=include)
-
             print("=== Semantic DB Inspection ===")
             total = client.get_collection_info().get("count", 0)
             print(f"Total documents: {total}")
             print(f"Showing up to: {args.limit}")
 
+            # Scan the whole collection in batches (not just the first raw batch),
+            # so --filter actually finds matches wherever they live in a large
+            # collection instead of only checking whatever `limit` records the
+            # backend happened to return first.
             shown = 0
-            for i, meta in enumerate(data.get("metadatas", [])):
-                meta = meta or {}
+            for meta, doc in _iter_all_metadatas(include_documents=args.show_documents):
                 title = meta.get("title", "")
                 creators = meta.get("creators", "")
                 if args.filter_text:
@@ -704,10 +757,10 @@ def main():
                         continue
                 print(f"- {title} | {creators}")
                 if args.show_documents:
-                    doc = (data.get("documents", [""])[i] or "").strip()
-                    snippet = doc[:200].replace("\n", " ") + ("..." if len(doc) > 200 else "")
+                    full = (doc or "").strip()
+                    snippet = full[:200].replace("\n", " ")
                     if snippet:
-                        print(f"  doc: {snippet}")
+                        print(f"  doc: {snippet}{'...' if len(full) > 200 else ''}")
                 shown += 1
                 if shown >= args.limit:
                     break
@@ -773,6 +826,11 @@ def main():
         transport = getattr(args, "transport", "stdio")
         # Ensure environment is initialized (Claude config or standalone config)
         setup_zotero_environment()
+        # If the reranker is enabled, warm it up in the background so the first
+        # semantic search doesn't pay the ~tens-of-seconds model load inside the
+        # request path and time out (issue #283). Daemon thread: never blocks
+        # startup, never crashes the server if loading fails.
+        _warmup_reranker_in_background()
         if transport == "stdio":
             mcp.run(transport="stdio")
         elif transport == "streamable-http":

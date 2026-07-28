@@ -98,52 +98,117 @@ def find_executable():
     return None
 
 
-def find_claude_config(verbose: bool = False):
-    """Find Claude Desktop config file path."""
+CLAUDE_CONFIG_FILENAME = "claude_desktop_config.json"
+
+# Directory names used by the different Claude Desktop builds. "Claude" is the
+# classic/documented one, "Claude Desktop" has been probed here for a long time,
+# and "Claude-3p" is the alternate build reported in issue #392 (seen on Windows
+# under %LOCALAPPDATA% and on macOS under ~/Library/Application Support).
+CLAUDE_APP_DIR_NAMES = ("Claude", "Claude Desktop", "Claude-3p")
+
+
+def claude_config_candidates() -> list:
+    """Return every known Claude Desktop config location for this platform.
+
+    The list is ordered by likelihood but is used for *probing*: we only ever
+    write to a candidate that already exists (see ``find_all_claude_configs``),
+    so listing an extra directory costs nothing. Issue #392: some builds keep
+    their config in ``Claude-3p`` rather than ``Claude``, and writing to the
+    wrong one silently has no effect.
+    """
     config_paths = []
 
     # macOS
     if sys.platform == "darwin":
-        # Try both old and new paths
-        config_paths.append(Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json")
-        config_paths.append(Path.home() / "Library" / "Application Support" / "Claude Desktop" / "claude_desktop_config.json")
+        app_support = Path.home() / "Library" / "Application Support"
+        for name in CLAUDE_APP_DIR_NAMES:
+            config_paths.append(app_support / name / CLAUDE_CONFIG_FILENAME)
 
     # Windows
     elif sys.platform == "win32":
         appdata = os.environ.get("APPDATA")
         if appdata:
-            config_paths.append(Path(appdata) / "Claude" / "claude_desktop_config.json")
-            config_paths.append(Path(appdata) / "Claude Desktop" / "claude_desktop_config.json")
+            for name in CLAUDE_APP_DIR_NAMES:
+                config_paths.append(Path(appdata) / name / CLAUDE_CONFIG_FILENAME)
+        # The Claude-3p build in issue #392 lives under %LOCALAPPDATA%, not
+        # %APPDATA%, so probe the local app data root as well.
+        localappdata = os.environ.get("LOCALAPPDATA")
+        if localappdata:
+            config_paths.append(Path(localappdata) / "Claude-3p" / CLAUDE_CONFIG_FILENAME)
 
     # Linux
     else:
         config_home = os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')
-        config_paths.append(Path(config_home) / "Claude" / "claude_desktop_config.json")
-        config_paths.append(Path(config_home) / "Claude Desktop" / "claude_desktop_config.json")
+        for name in CLAUDE_APP_DIR_NAMES:
+            config_paths.append(Path(config_home) / name / CLAUDE_CONFIG_FILENAME)
 
-    # Check all possible locations
+    # De-duplicate while preserving order (e.g. APPDATA == LOCALAPPDATA).
+    seen = set()
+    unique_paths = []
     for path in config_paths:
-        if path.exists():
-            if verbose:
-                print(f"Found Claude Desktop config at: {path}")
-            return path
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            unique_paths.append(path)
+    return unique_paths
 
-    # Return the default path for the platform if not found
-    # We'll use the newer "Claude Desktop" path as default
+
+def default_claude_config_path() -> Path:
+    """Path used when no Claude Desktop config exists yet (fresh install)."""
     if sys.platform == "darwin":  # macOS
-        default_path = Path.home() / "Library" / "Application Support" / "Claude Desktop" / "claude_desktop_config.json"
-    elif sys.platform == "win32":  # Windows
+        return Path.home() / "Library" / "Application Support" / "Claude Desktop" / CLAUDE_CONFIG_FILENAME
+    if sys.platform == "win32":  # Windows
         appdata = os.environ.get("APPDATA", "")
-        default_path = Path(appdata) / "Claude Desktop" / "claude_desktop_config.json"
-    else:  # Linux and others
-        config_home = os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')
-        default_path = Path(config_home) / "Claude Desktop" / "claude_desktop_config.json"
+        return Path(appdata) / "Claude Desktop" / CLAUDE_CONFIG_FILENAME
+    # Linux and others
+    config_home = os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')
+    return Path(config_home) / "Claude Desktop" / CLAUDE_CONFIG_FILENAME
 
+
+def find_existing_claude_configs(verbose: bool = False) -> list:
+    """Return every candidate Claude Desktop config that actually exists."""
+    found = [path for path in claude_config_candidates() if path.exists()]
+    if verbose:
+        for path in found:
+            print(f"Found Claude Desktop config at: {path}")
+    return found
+
+
+def find_all_claude_configs(verbose: bool = False) -> list:
+    """Return the config path(s) setup should write to (never empty).
+
+    Every existing config is returned: a machine can have more than one Claude
+    Desktop build installed and picking just one is how issue #392 happened
+    (setup reported success against a file the running app never reads).
+    If none exists we fall back to the historical default path.
+    """
+    found = find_existing_claude_configs(verbose=verbose)
+    if found:
+        if verbose and len(found) > 1:
+            print(f"Multiple Claude Desktop configs detected ({len(found)}).")
+        return found
+
+    default_path = default_claude_config_path()
     if verbose:
         print(f"Claude Desktop config not found. Using default path: {default_path}")
-    return default_path
+    return [default_path]
 
-def setup_semantic_search(existing_semantic_config: dict | None = None, semantic_config_only_arg: bool = False) -> dict:
+
+def find_claude_config(verbose: bool = False):
+    """Find the Claude Desktop config file path to read from.
+
+    Returns the first existing candidate, or the platform default if none
+    exists. Callers that *write* config should use ``find_all_claude_configs``
+    so they do not miss a second installed build.
+    """
+    return find_all_claude_configs(verbose=verbose)[0]
+
+
+def setup_semantic_search(
+    existing_semantic_config: dict | None = None,
+    semantic_config_only_arg: bool = False,
+    existing_db_path: str | None = None,
+) -> tuple[dict, str | None]:
     """Interactive setup for semantic search configuration."""
     print("\n=== Semantic Search Configuration ===")
 
@@ -152,7 +217,7 @@ def setup_semantic_search(existing_semantic_config: dict | None = None, semantic
         model = existing_semantic_config.get("embedding_model", "unknown")
         name = existing_semantic_config.get("embedding_config", {}).get("model_name", "unknown")
         update_freq = existing_semantic_config.get("update_config", {}).get("update_frequency", "unknown")
-        db_path = existing_semantic_config.get("zotero_db_path", "auto-detect")
+        db_path = existing_db_path or existing_semantic_config.get("zotero_db_path") or "auto-detect"
         openai_batch = existing_semantic_config.get("openai_batch", {}).get("enabled", False)
         print("Found existing semantic search configuration:")
         print(f"  - Embedding model: {model}")
@@ -165,7 +230,7 @@ def setup_semantic_search(existing_semantic_config: dict | None = None, semantic
         print("If you change to a new configuration, a database rebuild is advised.")
         print("Would you like to keep your existing configuration? (y/n): ", end="")
         if input().strip().lower() in ['y', 'yes']:
-            return existing_semantic_config
+            return existing_semantic_config, existing_db_path
 
     print("Configure embedding models for semantic search over your Zotero library.")
 
@@ -348,7 +413,7 @@ def setup_semantic_search(existing_semantic_config: dict | None = None, semantic
     print("\n=== Zotero Database Path ===")
     print("By default, zotero-mcp auto-detects the Zotero database location.")
     print("If Zotero is installed in a custom location, you can specify the path here.")
-    default_db_path = existing_semantic_config.get("zotero_db_path", "") if existing_semantic_config else ""
+    default_db_path = existing_db_path or (existing_semantic_config.get("zotero_db_path", "") if existing_semantic_config else "")
     db_path_hint = default_db_path if default_db_path else "auto-detect"
     raw_db_path = input(f"Zotero database path [{db_path_hint}]: ").strip()
 
@@ -399,13 +464,14 @@ def setup_semantic_search(existing_semantic_config: dict | None = None, semantic
             "overlap": 200,
             "max_chunks_per_item": 20,
         })
-    if zotero_db_path:
-        config["zotero_db_path"] = zotero_db_path
-
-    return config
+    return config, zotero_db_path
 
 
-def save_semantic_search_config(config: dict, semantic_config_path: Path) -> bool:
+def save_semantic_search_config(
+    config: dict,
+    semantic_config_path: Path,
+    zotero_db_path: str | None = None,
+) -> bool:
     """Save semantic search configuration to file."""
     try:
         # Ensure config directory exists
@@ -424,6 +490,10 @@ def save_semantic_search_config(config: dict, semantic_config_path: Path) -> boo
         # Add semantic search config
         full_semantic_config["semantic_search"] = config
 
+        # Store zotero_db_path at the top level (not under semantic_search)
+        if zotero_db_path:
+            full_semantic_config["zotero_db_path"] = zotero_db_path
+
         # Write config
         with open(semantic_config_path, 'w') as f:
             json.dump(full_semantic_config, f, indent=2)
@@ -435,6 +505,17 @@ def save_semantic_search_config(config: dict, semantic_config_path: Path) -> boo
     except Exception as e:
         print(f"Error saving semantic search config: {e}")
         return False
+
+def load_top_level_db_path(config_path: Path) -> str | None:
+    """Load the top-level ``zotero_db_path`` from the config file."""
+    if not config_path.exists():
+        return None
+    try:
+        with open(config_path) as f:
+            return json.load(f).get("zotero_db_path")
+    except Exception:
+        return None
+
 
 def load_semantic_search_config(semantic_config_path: Path) -> dict:
     """Load existing semantic search configuration."""
@@ -613,16 +694,17 @@ def main(cli_args=None):
     semantic_config_dir = Path.home() / ".config" / "zotero-mcp"
     semantic_config_path = semantic_config_dir / "config.json"
     existing_semantic_config = load_semantic_search_config(semantic_config_path)
+    existing_db_path = load_top_level_db_path(semantic_config_path)
     semantic_config_changed = False
 
     # Handle semantic search only configuration
     if args.semantic_config_only:
         print("Configuring semantic search only...")
-        new_semantic_config = setup_semantic_search(existing_semantic_config)
+        new_semantic_config, zotero_db_path = setup_semantic_search(existing_semantic_config, existing_db_path=existing_db_path)
         semantic_config_changed = existing_semantic_config != new_semantic_config
         # only save if semantic config changed
         if semantic_config_changed:
-            if save_semantic_search_config(new_semantic_config, semantic_config_path):
+            if save_semantic_search_config(new_semantic_config, semantic_config_path, zotero_db_path):
                 print("\nSemantic search configuration complete!")
                 print(f"Configuration saved to: {semantic_config_path}")
                 print("\nTo initialize the database, run: zotero-mcp update-db")
@@ -641,16 +723,15 @@ def main(cli_args=None):
         return 1
     print(f"Using zotero-mcp at: {exe_path}")
 
-    # Find Claude Desktop config unless --no-claude
-    config_path = None
+    # Find Claude Desktop config(s) unless --no-claude
+    config_paths = []
     if not args.no_claude:
-        config_path = args.config_path
-        if not config_path:
-            config_path = find_claude_config(verbose=True)
+        if args.config_path:
+            print(f"Using specified config path: {args.config_path}")
+            config_paths = [Path(args.config_path)]
         else:
-            print(f"Using specified config path: {config_path}")
-            config_path = Path(config_path)
-        if not config_path:
+            config_paths = find_all_claude_configs(verbose=True)
+        if not config_paths:
             print("Error: Could not determine Claude Desktop config path.")
             return 1
 
@@ -683,11 +764,11 @@ def main(cli_args=None):
             print("\nWould you like to configure semantic search? (y/n): ", end="")
         # Either way:
         if input().strip().lower() in ['y', 'yes']:
-            new_semantic_config = setup_semantic_search(existing_semantic_config)
+            new_semantic_config, zotero_db_path = setup_semantic_search(existing_semantic_config, existing_db_path=existing_db_path)
             if existing_semantic_config != new_semantic_config:
                 semantic_config_changed = True
                 existing_semantic_config = new_semantic_config  # Update the config to use
-                save_semantic_search_config(existing_semantic_config, semantic_config_path)
+                save_semantic_search_config(existing_semantic_config, semantic_config_path, zotero_db_path)
 
     print("\nSetup with the following settings:")
     print(f"  Local API: {use_local}")
@@ -739,17 +820,38 @@ def main(cli_args=None):
                 print("  zotero-mcp update-db --force-rebuild")
             return 0
         else:
-            updated_config_path = update_claude_config(
-                config_path,
-                exe_path,
-                local=use_local,
-                api_key=api_key,
-                library_id=library_id,
-                library_type=library_type,
-                semantic_config=semantic_config
-            )
-            if updated_config_path:
+            updated_paths = []
+            failed_paths = []
+            for candidate in config_paths:
+                result = update_claude_config(
+                    candidate,
+                    exe_path,
+                    local=use_local,
+                    api_key=api_key,
+                    library_id=library_id,
+                    library_type=library_type,
+                    semantic_config=semantic_config
+                )
+                if result:
+                    updated_paths.append(result)
+                else:
+                    failed_paths.append(candidate)
+
+            if updated_paths:
                 print("\nSetup complete!")
+                # Always show the absolute path(s) actually written so a
+                # mismatch with the running Claude Desktop build is obvious
+                # (issue #392).
+                if len(updated_paths) == 1:
+                    print(f"Claude Desktop config written to: {updated_paths[0].resolve()}")
+                else:
+                    print("Claude Desktop config written to every detected location:")
+                    for path in updated_paths:
+                        print(f"  - {path.resolve()}")
+                    print("(Multiple Claude Desktop builds were detected, so all of their "
+                          "configs were updated.)")
+                for path in failed_paths:
+                    print(f"Warning: could not write config to: {path}")
                 print("To use Zotero in Claude Desktop:")
                 print("1. Restart Claude Desktop if it's running")
                 print("2. In Claude, type: /tools zotero")
