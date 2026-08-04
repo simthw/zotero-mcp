@@ -1360,6 +1360,17 @@ class ZoteroSemanticSearch:
                                 elif not chroma_has_fulltext and local_has_fulltext:
                                     # Document exists but lacks fulltext - we need to update it
                                     updated_existing += 1
+                                elif (
+                                    reader.has_content_list_json(it.item_id)
+                                    and existing_metadata.get("fulltext_source") != "content_list_json"
+                                ):
+                                    # MinerU content_list.json is now available
+                                    # (a higher-quality source than whatever
+                                    # produced the stored embedding) — re-extract.
+                                    logger.info(
+                                        f"content_list.json found for item {it.key}, will re-extract"
+                                    )
+                                    updated_existing += 1
                                 elif _attachment_priority_changed(
                                     existing_metadata, priority_tag
                                 ):
@@ -2829,7 +2840,36 @@ class ZoteroSemanticSearch:
                 enriched_result["passage_offset"] = passage_offset
 
             try:
-                enriched_result["zotero_item"] = self.zotero_client.item(item_key)
+                if is_local_mode():
+                    # Local mode fast path: build the result entirely from
+                    # ChromaDB metadata. Every field needed to render a search
+                    # result is persisted at indexing time, so this avoids one
+                    # HTTP request per hit — the local Zotero HTTP server
+                    # (port 23119) saturates quickly and returns 502 at even
+                    # modest result counts.
+                    m = meta if isinstance(meta, dict) else {}
+                    creators_str = m.get("creators", "") or ""
+                    tags_raw = m.get("tags", "") or ""
+                    tags = [{"tag": t} for t in tags_raw.split(" ") if t]
+                    zotero_item = {
+                        "key": item_key,
+                        "data": {
+                            "key": item_key,
+                            "itemType": m.get("item_type", "") or "",
+                            "title": m.get("title", "") or "",
+                            "date": m.get("date", "") or "",
+                            "dateAdded": m.get("date_added", "") or "",
+                            "dateModified": m.get("date_modified", "") or "",
+                            "creators": [creators_str] if creators_str else [],
+                            "publicationTitle": m.get("publication", "") or "",
+                            "url": m.get("url", "") or "",
+                            "DOI": m.get("doi", "") or "",
+                            "tags": tags,
+                        },
+                    }
+                else:
+                    zotero_item = self.zotero_client.item(item_key)
+                enriched_result["zotero_item"] = zotero_item
             except Exception as e:
                 logger.error(f"Error enriching result for item {item_key}: {e}")
                 enriched_result["error"] = f"Could not fetch full item data: {e}"

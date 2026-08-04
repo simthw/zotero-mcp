@@ -49,13 +49,15 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
 
     def __init__(self, model_name: str = "text-embedding-3-small", api_key: str | None = None,
                  base_url: str | None = None, request_batch_size: int | None = None,
-                 rate_limit_rps: float | None = None):
+                 rate_limit_rps: float | None = None, max_input_tokens: int | None = None):
         import threading
         self.model_name = model_name
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
         self.request_batch_size = int(request_batch_size) if request_batch_size else self.DEFAULT_REQUEST_BATCH_SIZE
         self.rate_limit_rps: float | None = float(rate_limit_rps) if rate_limit_rps else None
+        if max_input_tokens is not None:
+            self.max_input_tokens = max_input_tokens
         self._rate_lock = threading.Lock()
         self._last_request_ts: float = 0.0
         if not self.api_key:
@@ -80,6 +82,7 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
             "base_url": self.base_url,
             "request_batch_size": self.request_batch_size,
             "rate_limit_rps": self.rate_limit_rps,
+            "max_input_tokens": getattr(self, "max_input_tokens", None),
             # ChromaDB's built-in EF of the same registered name rebuilds from
             # {api_key_env_var, model_name, api_base, ...} and asserts ("This
             # code should not be reached") when those are missing. Persisting
@@ -102,6 +105,7 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
             base_url=config.get("base_url") or config.get("api_base"),
             request_batch_size=config.get("request_batch_size"),
             rate_limit_rps=config.get("rate_limit_rps"),
+            max_input_tokens=config.get("max_input_tokens"),
         )
 
     def _wait_for_rate_limit(self) -> None:
@@ -149,19 +153,36 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
         return self.__call__([text])[0]
 
     def truncate(self, text: str, max_tokens: int) -> str:
-        """Truncate using tiktoken cl100k_base (correct for OpenAI models)."""
-        try:
-            import tiktoken
-            if not hasattr(self, '_tokenizer'):
-                self._tokenizer = tiktoken.get_encoding("cl100k_base")
-            tokens = self._tokenizer.encode(text, disallowed_special=())
-            if len(tokens) > max_tokens:
-                tokens = tokens[:max_tokens]
-                text = self._tokenizer.decode(tokens)
-        except ImportError:
-            max_chars = max_tokens * 3
-            if len(text) > max_chars:
-                text = text[:max_chars]
+        """Truncate text to fit within the token limit.
+
+        Uses tiktoken cl100k_base when the model is a native OpenAI model.
+        For third-party models served via an OpenAI-compatible API (detected
+        by a non-OpenAI model_name), uses a conservative character estimate
+        since the actual tokenizer may differ significantly.
+        """
+        is_native_openai = getattr(self, "model_name", "text-embedding-3-small").startswith(
+            "text-embedding-"
+        )
+        if is_native_openai:
+            try:
+                import tiktoken
+                if not hasattr(self, '_tokenizer'):
+                    self._tokenizer = tiktoken.get_encoding("cl100k_base")
+                tokens = self._tokenizer.encode(text, disallowed_special=())
+                if len(tokens) > max_tokens:
+                    tokens = tokens[:max_tokens]
+                    text = self._tokenizer.decode(tokens)
+                return text
+            except ImportError:
+                pass
+        # Conservative character-based truncation for non-OpenAI models.
+        # Subword tokenizers (e.g. bge-m3's XLMRoberta SentencePiece) can
+        # produce ~1 token per 1.5-2 chars on malformed PDF text with no
+        # whitespace.  Empirically, 16000 chars still exceeds bge-m3's 8192
+        # token limit on such text, so we use 1.5 chars/token for safety.
+        max_chars = int(max_tokens * 1.5)
+        if len(text) > max_chars:
+            text = text[:max_chars]
         return text
 
 
@@ -650,6 +671,7 @@ class ChromaClient:
                 model_name=model_name, api_key=api_key, base_url=base_url,
                 request_batch_size=self.embedding_config.get("request_batch_size"),
                 rate_limit_rps=self.embedding_config.get("rate_limit_rps"),
+                max_input_tokens=self.embedding_config.get("max_input_tokens"),
             )
 
         elif self.embedding_model == "gemini":

@@ -92,6 +92,67 @@ def get_item_metadata(
     _ret_logger = _logging.getLogger("zotero_mcp.retrieval")
     try:
         ctx.info(f"Fetching metadata for item {item_key} in {format} format")
+
+        # Local mode fast path: read metadata from Zotero's SQLite DB directly.
+        # The local Zotero HTTP server (port 23119) has very low concurrency
+        # and frequently returns 502 Bad Gateway under repeated metadata
+        # lookups; the SQLite DB is already on disk, so skip the HTTP hop.
+        # BibTeX export still needs Zotero running (Better BibTeX or API), so
+        # we only take this path for the markdown format.
+        if _utils.is_local_mode() and format != "bibtex":
+            try:
+                from zotero_mcp.local_db import LocalZoteroReader
+
+                config = load_config()
+                with LocalZoteroReader(db_path=config.resolve_zotero_db_path()) as reader:
+                    local_item = reader.get_item_by_key(item_key)
+                    if local_item:
+                        if format == "json":
+                            return json.dumps(
+                                {
+                                    "key": local_item.key,
+                                    "data": {
+                                        "itemType": local_item.item_type or "",
+                                        "title": local_item.title or "",
+                                        "creators": (
+                                            [{"name": c} for c in local_item.creators.split("; ")]
+                                            if local_item.creators else []
+                                        ),
+                                        "DOI": local_item.doi or "",
+                                        "abstractNote": local_item.abstract or "",
+                                        "extra": local_item.extra or "",
+                                        "dateAdded": local_item.date_added or "",
+                                        "dateModified": local_item.date_modified or "",
+                                    },
+                                },
+                                ensure_ascii=False, indent=2, sort_keys=True,
+                            )
+                        md_lines = [
+                            f"# {local_item.title or 'Untitled'}",
+                            f"**Type:** {local_item.item_type or 'unknown'}",
+                            f"**Item Key:** {local_item.key}",
+                        ]
+                        if local_item.creators:
+                            md_lines.append(f"**Authors:** {local_item.creators}")
+                        if local_item.doi:
+                            md_lines.append(f"**DOI:** {local_item.doi}")
+                        if local_item.date_added:
+                            md_lines.append(f"**Added:** {local_item.date_added}")
+                        if local_item.date_modified:
+                            md_lines.append(f"**Modified:** {local_item.date_modified}")
+                        if include_abstract and local_item.abstract:
+                            md_lines.extend(["", "## Abstract", local_item.abstract])
+                        if local_item.extra:
+                            md_lines.extend(["", "## Extra", local_item.extra])
+                        _ret_logger.debug(
+                            f"[METADATA] SQLite fast-path for {item_key} (no HTTP API)"
+                        )
+                        return "\n\n".join(md_lines)
+                    # Item not in local DB — fall through to HTTP API
+                    ctx.info(f"Item {item_key} not in local SQLite; falling back to HTTP API")
+            except Exception as local_err:
+                ctx.info(f"Local metadata fast-path failed: {local_err}")
+
         zot = _client.get_zotero_client()
 
         t0 = _time.monotonic()

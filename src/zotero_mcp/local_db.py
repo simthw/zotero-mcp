@@ -42,11 +42,39 @@ logger = logging.getLogger(__name__)
 # 10 or 50.
 DEFAULT_PDF_MAX_PAGES = 50
 
+# Sentinel returned by PDF extraction when the worker process exceeded its
+# timeout. Never persisted to ChromaDB: callers must treat it as "no text".
+_EXTRACTION_TIMEOUT = "__EXTRACTION_TIMEOUT__"
+
 # Library identity used throughout zotero-mcp (ChromaDB metadata, the
 # `zotero_switch_library` tool, etc.): 0 for the personal ("user") library,
 # else the Zotero server-assigned groupID. This matches Zotero's own
 # sentinel for the account-less personal library.
 PERSONAL_LIBRARY_GROUP_ID = 0
+
+
+def _extract_pdf_worker(file_path: str, maxpages: int, result_queue=None):
+    """Worker: extract text from a PDF in a separate process.
+
+    When called via ProcessPoolExecutor (result_queue is None) the text is
+    returned directly.  The legacy Queue path is kept for compatibility.
+    """
+    try:
+        # Suppress pdfminer warnings about malformed PDF color spaces, fonts, etc.
+        import logging as _logging
+
+        _logging.getLogger("pdfminer").setLevel(_logging.ERROR)
+
+        from pdfminer.high_level import extract_text
+
+        text = extract_text(file_path, maxpages=maxpages) or ""
+        if result_queue is not None:
+            result_queue.put(text)
+        return text
+    except Exception:
+        if result_queue is not None:
+            result_queue.put("")
+        return ""
 
 
 class KeyGroupMap(NamedTuple):
@@ -187,6 +215,7 @@ class LocalZoteroReader:
         db_path: str | None = None,
         pdf_max_pages: int | None = None,
         attachment_priority=None,
+        pdf_timeout: int = 30,
     ):
         """
         Initialize the local database reader.
@@ -197,13 +226,16 @@ class LocalZoteroReader:
             attachment_priority: Order in which attachment kinds are tried
                 for an item with several readable files. None means the
                 default (PDF > HTML > rest).
+            pdf_timeout: Seconds before a single PDF extraction is aborted.
         """
         self.db_path = db_path or self._find_zotero_db()
         self._connection: sqlite3.Connection | None = None
         self.pdf_max_pages: int | None = pdf_max_pages
+        self.pdf_timeout: int = pdf_timeout
         self.attachment_priority: tuple[str, ...] = normalize_attachment_priority(
             attachment_priority
         )
+        self._pdf_pool = None  # Lazy-initialized ProcessPoolExecutor
 
     def _find_zotero_db(self) -> str:
         """
@@ -383,8 +415,70 @@ class LocalZoteroReader:
         except ValueError:
             return DEFAULT_PDF_MAX_PAGES
 
+    def _get_pdf_pool(self):
+        """Lazily create a single-worker ProcessPoolExecutor for PDF extraction."""
+        if self._pdf_pool is None:
+            from concurrent.futures import ProcessPoolExecutor
+
+            self._pdf_pool = ProcessPoolExecutor(max_workers=1)
+        return self._pdf_pool
+
+    def _shutdown_pdf_pool(self, kill: bool = False):
+        """Shutdown the PDF worker pool."""
+        if self._pdf_pool is not None:
+            try:
+                if kill:
+                    self._pdf_pool.shutdown(wait=False, cancel_futures=True)
+                else:
+                    self._pdf_pool.shutdown(wait=False)
+            except Exception:
+                pass
+            self._pdf_pool = None
+
+    def _extract_text_from_pdf(self, file_path: Path) -> str:
+        """Extract text from a PDF using pdfminer in a persistent worker process.
+
+        Uses a single reusable worker process to avoid the per-PDF spawn
+        overhead and multiprocessing Queue deadlocks on Windows. Returns the
+        extracted text, empty string on failure, or _EXTRACTION_TIMEOUT
+        sentinel on timeout.
+        """
+        from concurrent.futures import TimeoutError as FuturesTimeout
+
+        # Page limit (preserve existing fallback chain)
+        if isinstance(self.pdf_max_pages, int) and self.pdf_max_pages > 0:
+            maxpages = self.pdf_max_pages
+        else:
+            try:
+                maxpages = int(os.getenv("ZOTERO_PDF_MAXPAGES") or DEFAULT_PDF_MAX_PAGES)
+            except ValueError:
+                maxpages = DEFAULT_PDF_MAX_PAGES
+
+        timeout = self.pdf_timeout or 30
+
+        try:
+            pool = self._get_pdf_pool()
+            future = pool.submit(_extract_pdf_worker, str(file_path), maxpages)
+            text = future.result(timeout=timeout)
+            return text or ""
+        except FuturesTimeout:
+            logger.warning(f"PDF extraction timed out after {timeout}s: {file_path.name}")
+            # The worker is stuck; kill the pool so the next call gets a fresh one.
+            self._shutdown_pdf_pool(kill=True)
+            return _EXTRACTION_TIMEOUT
+        except Exception as e:
+            logger.warning(f"PDF extraction failed: {file_path.name}: {e}")
+            return ""
+
     def _extract_text_from_file(self, file_path: Path) -> str:
-        """Extract text from an attachment file, or "" if nothing readable."""
+        """Extract text from an attachment file, or "" if nothing readable.
+
+        PDFs go through a timeout-protected worker process (see
+        :meth:`_extract_text_from_pdf`); other formats use the in-process
+        ``extract_file`` dispatcher.
+        """
+        if file_path.suffix.lower() == ".pdf":
+            return self._extract_text_from_pdf(file_path)
         doc = extract_file(file_path, max_pages=self._resolve_pdf_max_pages())
         return doc.text if doc else ""
 
@@ -461,14 +555,158 @@ class LocalZoteroReader:
         # rather than a stub or thumbnail.
         return max(candidates, key=lambda p: p.stat().st_size)
 
+    def _find_content_list_json(self, attachment_key: str, resolved_path: Path) -> Path | None:
+        """Find MinerU content_list.json file in the attachment folder.
+
+        Looks for files matching patterns:
+        - content_list.json
+        - *_content_list.json (MinerU standard naming)
+
+        Args:
+            attachment_key: The Zotero attachment item key
+            resolved_path: The resolved attachment file path
+
+        Returns:
+            Path to content_list.json if found, None otherwise
+        """
+        if resolved_path and resolved_path.exists():
+            parent_dir = resolved_path.parent
+
+            # Priority 1: Look for *_content_list.json pattern (MinerU standard)
+            for f in parent_dir.iterdir():
+                if f.is_file() and f.name.endswith("_content_list.json"):
+                    return f
+
+            # Priority 2: Look for exact content_list.json
+            content_list = parent_dir / "content_list.json"
+            if content_list.exists():
+                return content_list
+        return None
+
+    def _extract_text_from_mineru_block(self, block) -> str:
+        """Extract text from a single MinerU content_list.json block.
+
+        A block has 'type' (paragraph, title, equation_interline, etc.) and
+        'content' which is a dict like:
+            {"paragraph_content": [{"type": "text", "content": "..."}]}
+
+        Also handles the flat format where text is directly in block['text'].
+        """
+        if not isinstance(block, dict):
+            return ""
+
+        # Skip non-text block types (headers, footers, page numbers)
+        block_type = block.get("type", "")
+        if block_type in ("page_header", "page_footer", "page_number"):
+            return ""
+
+        # Format 1: nested content dict (MinerU pages format)
+        content = block.get("content")
+        if isinstance(content, dict):
+            # Equation blocks: {"math_content": "LaTeX", "math_type": "latex"}
+            math = content.get("math_content")
+            if isinstance(math, str) and math.strip():
+                return f"$$ {math.strip()} $$"
+
+            # Text blocks: {"paragraph_content": [{"type": "text", "content": "..."}]}
+            for key, spans in content.items():
+                if key in ("level", "math_type", "image_source"):
+                    continue
+                if isinstance(spans, list):
+                    parts = []
+                    for span in spans:
+                        if isinstance(span, dict):
+                            t = span.get("content", "")
+                            if isinstance(t, str) and t.strip():
+                                parts.append(t.strip())
+                    if parts:
+                        return " ".join(parts)
+
+        # Format 2: flat format with 'text' key
+        text = block.get("text", "")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+        return ""
+
+    def _extract_text_from_content_list_json(self, json_path: Path) -> str:
+        """Extract text content from MinerU content_list.json format.
+
+        Supports multiple MinerU output formats:
+
+        1. Nested pages format (list of lists):
+           Each top-level item is a page (list of blocks). Each block is a dict
+           with 'type' (e.g. 'paragraph', 'title'), 'content' (a dict whose
+           single key like 'paragraph_content' maps to a list of text spans),
+           and 'bbox'.
+
+        2. Flat list of dicts with 'text' key:
+           [{"text": "...", "type": "text", ...}, ...]
+
+        3. Dict wrapper with 'content' or 'data' key containing a list.
+
+        Args:
+            json_path: Path to the content_list.json file
+
+        Returns:
+            Extracted text content, or empty string on failure
+        """
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # Handle root-level list format (MinerU standard)
+            if isinstance(data, list):
+                content_list = data
+            else:
+                # Handle dict format with 'content' or 'data' key
+                content_list = data.get("content") or data.get("data") or []
+
+            if isinstance(content_list, list):
+                text_parts = []
+                for item in content_list:
+                    if isinstance(item, list):
+                        # Nested pages format: each item is a page (list of blocks)
+                        for block in item:
+                            text = self._extract_text_from_mineru_block(block)
+                            if text:
+                                text_parts.append(text)
+                    elif isinstance(item, dict):
+                        # Could be a block directly (single-page) or flat format
+                        text = self._extract_text_from_mineru_block(item)
+                        if text:
+                            text_parts.append(text)
+                    elif isinstance(item, str):
+                        # Simple list format
+                        if item.strip():
+                            text_parts.append(item.strip())
+
+                if text_parts:
+                    return "\n\n".join(text_parts)
+
+            # Fallback: try to extract any text-like content from dict
+            if isinstance(data, dict):
+                # Look for any text content in the dict
+                for key in ["text", "content", "fulltext", "body"]:
+                    if key in data and isinstance(data[key], str):
+                        return data[key]
+
+            return ""
+        except Exception as e:
+            logger.warning(f"Failed to extract text from content_list.json: {e}")
+            return ""
+
     def _extract_fulltext_for_item(self, item_id: int) -> tuple[str, str] | None:
         """Attempt to extract fulltext and source from the item's best attachment.
 
         Preference order:
-        1. Our own extraction of the best attachment on disk, chosen by
+        1. MinerU ``content_list.json`` alongside the attachment — source
+           ``"content_list_json"`` (highest quality structured text).
+        2. Our own extraction of the best attachment on disk, chosen by
            ``attachment_priority`` — source ``"pdf"``, ``"html"`` or
-           ``"file"``.
-        2. ``.zotero-ft-cache`` — source ``"zotero-cache"``.
+           ``"file"``. A PDF that exceeds ``pdf_timeout`` yields no text
+           rather than a sentinel.
+        3. ``.zotero-ft-cache`` — source ``"zotero-cache"``.
 
         Our parser goes first because it is the only path that yields heading
         structure and the page separators chunk provenance needs; the cache is
@@ -482,6 +720,7 @@ class LocalZoteroReader:
         giving up (#291, #265).
         """
         candidates = []
+        best_content_list_json = None
         for key, path, ctype in self._iter_parent_attachments(item_id):
             resolved = self._resolve_attachment_path(key, path or "")
             if not resolved or not resolved.exists():
@@ -498,11 +737,24 @@ class LocalZoteroReader:
                 size = 0
             candidates.append((category, size, resolved))
 
+            # MinerU content_list.json lives next to the attachment file.
+            content_list = self._find_content_list_json(key, resolved)
+            if content_list and content_list.exists():
+                if best_content_list_json is None:
+                    best_content_list_json = content_list
+
+        # 0. MinerU content_list.json, when present, is the highest-quality source.
+        if best_content_list_json:
+            text = self._extract_text_from_content_list_json(best_content_list_json)
+            if text:
+                logger.info(f"Using content_list.json for item {item_id}: {best_content_list_json}")
+                return (text, "content_list_json")
+
         # 1. Best attachment by the configured priority.
         target = pick_by_priority(candidates, self.attachment_priority)
         if target:
             text = self._extract_text_from_file(target)
-            if text:
+            if text and text != _EXTRACTION_TIMEOUT:
                 suffix = target.suffix.lower()
                 if suffix == ".pdf":
                     source = "pdf"
@@ -521,7 +773,8 @@ class LocalZoteroReader:
         return None
 
     def close(self):
-        """Close database connection."""
+        """Close database connection and worker pool."""
+        self._shutdown_pdf_pool()
         if self._connection:
             self._connection.close()
             self._connection = None
@@ -847,6 +1100,44 @@ class LocalZoteroReader:
     # Public helper to extract fulltext on demand for a specific item
     def extract_fulltext_for_item(self, item_id: int) -> tuple[str, str] | None:
         return self._extract_fulltext_for_item(item_id)
+
+    def has_content_list_json(self, item_id: int) -> bool:
+        """Check if the item has a MinerU content_list.json file.
+
+        Args:
+            item_id: The Zotero item ID
+
+        Returns:
+            True if content_list.json exists, False otherwise
+        """
+        for key, path, ctype in self._iter_parent_attachments(item_id):
+            resolved = self._resolve_attachment_path(key, path or "")
+            if not resolved or not resolved.exists():
+                continue
+            if ctype == "application/pdf":
+                content_list = self._find_content_list_json(key, resolved)
+                if content_list and content_list.exists():
+                    return True
+        return False
+
+    def get_content_list_json_path(self, item_id: int) -> Path | None:
+        """Get the path to MinerU content_list.json for an item.
+
+        Args:
+            item_id: The Zotero item ID
+
+        Returns:
+            Path to content_list.json if found, None otherwise
+        """
+        for key, path, ctype in self._iter_parent_attachments(item_id):
+            resolved = self._resolve_attachment_path(key, path or "")
+            if not resolved or not resolved.exists():
+                continue
+            if ctype == "application/pdf":
+                content_list = self._find_content_list_json(key, resolved)
+                if content_list and content_list.exists():
+                    return content_list
+        return None
 
     def get_attachment_paths(self, parent_key: str) -> list[dict]:
         """Return resolved filesystem paths for a parent item's attachments.
