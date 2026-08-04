@@ -4,7 +4,7 @@ import hashlib
 import os
 
 import pytest
-from conftest import DummyContext, FakeZotero, skip_on_windows
+from conftest import DummyContext, FakeZotero
 
 from zotero_mcp import server
 from zotero_mcp.tools import _helpers
@@ -271,7 +271,6 @@ class TestAttachFileValidation:
 
 
 class TestAttachFileLocal:
-    @skip_on_windows
     def test_happy_path_attaches_to_item(self, monkeypatch, dummy_ctx):
         fake = FakeZoteroForAttach()
         _patch_write_client(monkeypatch, fake)
@@ -303,7 +302,6 @@ class TestAttachFileLocal:
         )
         assert fake.attachments[0]["files"][0][0] == "smith-2020.pdf"
 
-    @skip_on_windows
     def test_filename_override_controls_stored_path(self, monkeypatch, dummy_ctx):
         """pyzotero's attachment_both() stores the file under the real file's
         basename, ignoring the title tuple element — so a filename override

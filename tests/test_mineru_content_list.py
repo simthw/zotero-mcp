@@ -21,6 +21,7 @@ class FakeMinerUReader(LocalZoteroReader):
         self._cache_text = cache_text
         self._extracted_text = extracted_text
         self._scanned_path = scanned_path
+        self.attachment_priority = ("pdf", "html", "file")
 
     def _iter_parent_attachments(self, _parent_item_id):
         yield from self._attachments
@@ -120,6 +121,7 @@ def test_invalid_mineru_output_falls_back_to_zotero_cache(tmp_path):
     reader = FakeMinerUReader(
         [("ATTACH01", str(pdf), "application/pdf")],
         cache_text="cached fallback",
+        extracted_text="",
     )
 
     assert reader.extract_fulltext_for_item(1) == (

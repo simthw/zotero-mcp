@@ -555,7 +555,7 @@ class LocalZoteroReader:
         # rather than a stub or thumbnail.
         return max(candidates, key=lambda p: p.stat().st_size)
 
-    def _find_content_list_json(self, attachment_key: str, resolved_path: Path) -> Path | None:
+    def _find_content_list_json(self, resolved_path: Path) -> Path | None:
         """Find MinerU content_list.json file in the attachment folder.
 
         Looks for files matching patterns:
@@ -563,23 +563,47 @@ class LocalZoteroReader:
         - *_content_list.json (MinerU standard naming)
 
         Args:
-            attachment_key: The Zotero attachment item key
             resolved_path: The resolved attachment file path
 
         Returns:
             Path to content_list.json if found, None otherwise
         """
-        if resolved_path and resolved_path.exists():
-            parent_dir = resolved_path.parent
+        if not resolved_path.exists():
+            return None
 
-            # Priority 1: Look for *_content_list.json pattern (MinerU standard)
-            for f in parent_dir.iterdir():
-                if f.is_file() and f.name.endswith("_content_list.json"):
-                    return f
+        parent_dir = resolved_path.parent
+        try:
+            # Prefer MinerU's document-specific standard name over the generic
+            # fallback, and sort so multiple outputs resolve deterministically.
+            named_outputs = sorted(
+                (
+                    candidate
+                    for candidate in parent_dir.iterdir()
+                    if candidate.is_file() and candidate.name.endswith("_content_list.json")
+                ),
+                key=lambda candidate: candidate.name.casefold(),
+            )
+            if named_outputs:
+                return named_outputs[0]
 
-            # Priority 2: Look for exact content_list.json
             content_list = parent_dir / "content_list.json"
-            if content_list.exists():
+            if content_list.is_file():
+                return content_list
+        except OSError as e:
+            logger.debug(f"Could not inspect MinerU output next to {resolved_path}: {e}")
+        return None
+
+    def _get_content_list_json_path(self, item_id: int) -> Path | None:
+        """Return the best MinerU output available for an item's attachments."""
+        for key, path, ctype in self._iter_parent_attachments(item_id):
+            if ctype != "application/pdf" and not (ctype or "").startswith("text/html"):
+                continue
+            resolved = self._resolve_attachment_path(key, path or "")
+            if not resolved or not resolved.exists():
+                resolved = self._scan_storage_for_attachment(key, ctype)
+                if not resolved or not resolved.exists():
+                    continue
+            if content_list := self._find_content_list_json(resolved):
                 return content_list
         return None
 
@@ -720,7 +744,6 @@ class LocalZoteroReader:
         giving up (#291, #265).
         """
         candidates = []
-        best_content_list_json = None
         for key, path, ctype in self._iter_parent_attachments(item_id):
             resolved = self._resolve_attachment_path(key, path or "")
             if not resolved or not resolved.exists():
@@ -737,13 +760,8 @@ class LocalZoteroReader:
                 size = 0
             candidates.append((category, size, resolved))
 
-            # MinerU content_list.json lives next to the attachment file.
-            content_list = self._find_content_list_json(key, resolved)
-            if content_list and content_list.exists():
-                if best_content_list_json is None:
-                    best_content_list_json = content_list
-
         # 0. MinerU content_list.json, when present, is the highest-quality source.
+        best_content_list_json = self._get_content_list_json_path(item_id)
         if best_content_list_json:
             text = self._extract_text_from_content_list_json(best_content_list_json)
             if text:
@@ -1110,15 +1128,7 @@ class LocalZoteroReader:
         Returns:
             True if content_list.json exists, False otherwise
         """
-        for key, path, ctype in self._iter_parent_attachments(item_id):
-            resolved = self._resolve_attachment_path(key, path or "")
-            if not resolved or not resolved.exists():
-                continue
-            if ctype == "application/pdf":
-                content_list = self._find_content_list_json(key, resolved)
-                if content_list and content_list.exists():
-                    return True
-        return False
+        return self._get_content_list_json_path(item_id) is not None
 
     def get_content_list_json_path(self, item_id: int) -> Path | None:
         """Get the path to MinerU content_list.json for an item.
@@ -1129,15 +1139,7 @@ class LocalZoteroReader:
         Returns:
             Path to content_list.json if found, None otherwise
         """
-        for key, path, ctype in self._iter_parent_attachments(item_id):
-            resolved = self._resolve_attachment_path(key, path or "")
-            if not resolved or not resolved.exists():
-                continue
-            if ctype == "application/pdf":
-                content_list = self._find_content_list_json(key, resolved)
-                if content_list and content_list.exists():
-                    return content_list
-        return None
+        return self._get_content_list_json_path(item_id)
 
     def get_attachment_paths(self, parent_key: str) -> list[dict]:
         """Return resolved filesystem paths for a parent item's attachments.
