@@ -1,12 +1,35 @@
 """Shared test fixtures for Zotero MCP tests."""
 
 import os
+import sys
+from pathlib import Path
+
 import pytest
+
+# Always exercise the source tree that these tests live in, not whatever
+# `zotero_mcp` an editable install happens to resolve to. Without this, running
+# the suite from a git worktree silently imports the *main* checkout's package,
+# so edits under test are never executed and results are meaningless.
+_SRC = Path(__file__).resolve().parents[1] / "src"
+if _SRC.is_dir():
+    sys.path.insert(0, str(_SRC))
+    for _name in [n for n in sys.modules if n == "zotero_mcp" or n.startswith("zotero_mcp.")]:
+        del sys.modules[_name]
 
 # Marker for tests that use tmp_path and fail on GitHub Actions
 skip_on_ci = pytest.mark.skipif(
     os.environ.get("CI") == "true",
     reason="tmp_path fixture unreliable on GitHub Actions"
+)
+
+# Marker for tests whose *fixtures* hardcode POSIX paths ("/Users/test/x.pdf",
+# "file:///…"). The code under test is cross-platform; the assertions are not,
+# because Windows resolves those strings to "D:\Users\test\x.pdf". Skipped
+# rather than deleted so the coverage stays real on Linux and macOS —
+# rewriting them platform-neutrally is worth doing but is not this change.
+skip_on_windows = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="fixture hardcodes POSIX paths; the behaviour under test is not platform-specific",
 )
 
 

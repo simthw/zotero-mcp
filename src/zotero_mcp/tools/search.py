@@ -420,10 +420,25 @@ def search_by_tag(
             results = zot.items()
 
         if not results:
+            if collection_key:
+                # Name the scope that was applied. The bare message read as
+                # "this tag matches nothing", which invites a retry without
+                # collection_key — a library-wide search whose results look
+                # like scoped ones (#418).
+                return (
+                    f"No items found with tag: '{tag}' in collection {collection_key}. "
+                    f"The collection was searched and no item in it carries that tag. "
+                    f"Items elsewhere in the library may still carry it; re-running "
+                    f"without collection_key searches the whole library, not this collection."
+                )
             return f"No items found with tag: '{tag}'"
 
-        # Format results as markdown
-        scope = f" in Collection {collection_key}" if collection_key else ""
+        # Format results as markdown. State the scope in both directions, so a
+        # library-wide result is never mistaken for a collection-scoped one.
+        scope = (
+            f" in Collection {collection_key}" if collection_key
+            else " (entire library — no collection scope applied)"
+        )
         output = [f"# Search Results for Tag: '{tag}'{scope}", ""]
 
         for i, item in enumerate(results, 1):
@@ -647,6 +662,19 @@ def advanced_search(
                         values.append(str(tag.get("tag", "")).strip())
                 return values
 
+            if field_lower in {"collection", "collections"}:
+                # Membership lives in data["collections"] (a list of keys);
+                # data["collection"] does not exist, so the generic branch
+                # below used to extract [""] and no collection condition could
+                # ever match (#418). Direct membership only, matching Zotero's
+                # own "Collection is X" with subcollections not included.
+                collections = data.get("collections", []) or []
+                keys = [str(k).strip() for k in collections if str(k).strip()]
+                # An item in no collection must still satisfy `isNot`, so fall
+                # back to a single empty value rather than an empty list (which
+                # _matches_condition rejects outright).
+                return keys or [""]
+
             if field_lower == "year":
                 date_value = str(data.get("date", "")).strip()
                 return [date_value[:4]] if len(date_value) >= 4 else []
@@ -738,6 +766,7 @@ def advanced_search(
                 break
             start += batch_size
 
+        sort_warning: str | None = None
         if sort_by:
             sort_field = sort_by.strip()
             reverse = sort_direction == "desc"
@@ -746,9 +775,34 @@ def advanced_search(
                 data = item.get("data", {}) if isinstance(item, dict) else {}
                 if sort_field in {"creator", "author"}:
                     return _utils.format_creators(data.get("creators", []))
+                if sort_field in {"date", "year", "publicationDate"}:
+                    # data["date"] is Zotero's *display* string ("October 1,
+                    # 2016"), so sorting it lexically orders by month name.
+                    # meta.parsedDate is the normalized ISO form the API
+                    # computes for exactly this purpose.
+                    meta = item.get("meta", {}) if isinstance(item, dict) else {}
+                    parsed = str(meta.get("parsedDate", "") or "").strip()
+                    if parsed:
+                        return parsed
+                    # No parsedDate (local API, sparse records): fall back to
+                    # the first 4-digit year in the display string, which at
+                    # least sorts by year instead of by month name.
+                    match = re.search(r"\b(\d{4})\b", str(data.get("date", "")))
+                    return match.group(1) if match else ""
                 return str(data.get(sort_field, "")).lower()
 
-            results.sort(key=_sort_key, reverse=reverse)
+            # A sort field absent from every result (misspelled, or simply not
+            # present in this backend's item shape) used to sort every key to
+            # "" and silently return library order as though it had been
+            # honored. Say so instead (#418).
+            if results and not any(_sort_key(item) for item in results):
+                sort_warning = (
+                    f"Requested sort by `{sort_field}` was not applied: no result carries "
+                    f"that field. Results are in library order. Sortable fields include "
+                    f"dateAdded, dateModified, title, date, creator."
+                )
+            else:
+                results.sort(key=_sort_key, reverse=reverse)
 
         if not results:
             return "No items found matching the search criteria."
@@ -764,6 +818,9 @@ def advanced_search(
             output.append(
                 f"{i}. {condition['field']} {condition['operation']} \"{condition['value']}\""
             )
+        if sort_warning:
+            output.append("")
+            output.append(f"> **Note:** {sort_warning}")
         output.append("")
         output.append("## Results")
 
@@ -952,7 +1009,7 @@ def semantic_search(
     description=(
         "Build or refresh the semantic search embedding database from "
         "Zotero items. Run this: (a) after first install, (b) after adding "
-        "items via zotero_add_by_doi / add_by_url / add_from_file, or "
+        "items via zotero_add_item, or "
         "(c) when the user has added items directly in Zotero desktop "
         "since the last update. "
         "By default the update is INCREMENTAL — only new or changed items "

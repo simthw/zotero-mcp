@@ -4,6 +4,7 @@ Zotero client wrapper for MCP server.
 
 import functools
 import os
+import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,9 +12,14 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from markitdown import MarkItDown
 from pyzotero import zotero
 
+from zotero_mcp.extract import (
+    categorize_attachment,
+    extract_file,
+    normalize_attachment_priority,
+    pick_by_priority,
+)
 from zotero_mcp.utils import _paginate, format_creators
 from zotero_mcp.webdav import (
     WebDAVNotConfiguredError,
@@ -481,15 +487,40 @@ def generate_bibtex(item: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def configured_attachment_priority() -> tuple[str, ...]:
+    """The user's ``attachment_priority``, or the default if unset/unreadable.
+
+    Imported lazily because ``config`` is not a dependency of this module at
+    import time and a missing config must never break attachment lookup.
+    """
+    try:
+        from zotero_mcp.config import load_config
+
+        configured = load_config().semantic_search.extraction.attachment_priority
+    except Exception:
+        return normalize_attachment_priority(None)
+    return normalize_attachment_priority(configured)
+
+
 def get_attachment_details(
-    zot: zotero.Zotero, item: dict[str, Any]
+    zot: zotero.Zotero, item: dict[str, Any], priority=None
 ) -> AttachmentDetails | None:
     """
     Get attachment details for a Zotero item, finding the most relevant attachment.
 
+    Passing a key that names an attachment *directly* returns that attachment
+    unchanged, without consulting ``priority``. That short-circuit is
+    supported and deliberate: it is how a caller reads one specific file on
+    an item that has several (#378).
+
     Args:
         zot: A Zotero client instance.
         item: A Zotero item dictionary.
+        priority: Attachment kinds in preference order. ``None`` uses the
+            configured ``attachment_priority``. Callers that need one
+            specific kind should say so — ``zotero_read_pdf_pages`` passes
+            ``("pdf",)`` so a markdown-first configuration cannot hand it a
+            file it has no way to read.
 
     Returns:
         AttachmentDetails if found, None otherwise.
@@ -509,47 +540,48 @@ def get_attachment_details(
             content_type=data.get("contentType", ""),
         )
 
+    if priority is None:
+        priority = configured_attachment_priority()
+
     # For regular items, look for child attachments
     try:
         children = _paginate(zot.children, item_key)
 
-        # Group attachments by content type
-        pdfs = []
-        htmls = []
-        others = []
-
+        candidates = []
         for child in children:
             child_data = child.get("data", {})
-            if child_data.get("itemType") == "attachment":
-                content_type = child_data.get("contentType", "")
-                filename = child_data.get("filename", "")
-                title = child_data.get("title", "Untitled")
-                key = child.get("key", "")
+            if child_data.get("itemType") != "attachment":
+                continue
+            content_type = child_data.get("contentType", "")
+            filename = child_data.get("filename", "")
+            title = child_data.get("title", "Untitled")
+            key = child.get("key", "")
 
-                # Use MD5 as proxy for size (longer MD5 usually means larger file)
-                size_proxy = len(child_data.get("md5", ""))
+            # Unlike the local path, an attachment we cannot parse ourselves
+            # is still worth returning: the caller tries Zotero's
+            # server-side fulltext index first, which covers formats we have
+            # no reader for (EPUB, DOCX). So an uncategorized attachment
+            # joins the catch-all bucket rather than being dropped.
+            category = categorize_attachment(filename or title, content_type) or "other"
 
-                attachment = (key, title, filename, content_type, size_proxy)
+            # The API exposes no file size, so this only distinguishes a
+            # stored file (32-char md5) from a linked one (no md5) — enough
+            # to prefer a real upload, not a true size ordering.
+            size_proxy = len(child_data.get("md5") or "")
 
-                if content_type == "application/pdf":
-                    pdfs.append(attachment)
-                elif content_type.startswith("text/html"):
-                    htmls.append(attachment)
-                else:
-                    others.append(attachment)
-
-        # Return first match in priority order (PDF > HTML > other)
-        # Sort each category by size (descending) to get largest/most complete file
-        for category in [pdfs, htmls, others]:
-            if category:
-                category.sort(key=lambda x: x[4], reverse=True)
-                key, title, filename, content_type, _ = category[0]
-                return AttachmentDetails(
+            candidates.append((
+                category,
+                size_proxy,
+                AttachmentDetails(
                     key=key,
                     title=title,
                     filename=filename,
                     content_type=content_type,
-                )
+                ),
+            ))
+
+        if (chosen := pick_by_priority(candidates, priority)) is not None:
+            return chosen
     except Exception:
         pass
 
@@ -569,9 +601,18 @@ def download_attachment_file(
     Download an attachment using the best available source.
 
     The fallback order is:
-    1. local Zotero API (works with local storage or desktop-managed WebDAV)
-    2. Direct WebDAV access via environment variables
-    3. Zotero Web API (works with Zotero cloud storage)
+    1. local Zotero storage, resolved straight off the local SQLite DB
+    2. local Zotero API (works with local storage or desktop-managed WebDAV)
+    3. Direct WebDAV access via environment variables
+    4. Zotero Web API (works with Zotero cloud storage)
+
+    Step 1 exists because none of the later steps can serve a *linked* file.
+    The local API answers ``/file`` for a linked attachment with a 302 to a
+    ``file://`` URL, which httpx refuses to follow ("unsupported protocol"),
+    and a linked file is by definition never uploaded to WebDAV or Zotero
+    storage — so all three remaining sources fail on an attachment that is
+    sitting readable on the same disk. Reading the path out of the DB avoids
+    the redirect entirely and is faster for ordinary stored files too.
     """
     destination = Path(destination_dir)
     destination.mkdir(parents=True, exist_ok=True)
@@ -582,6 +623,52 @@ def download_attachment_file(
     def _cleanup_target() -> None:
         if target_path.exists() and target_path.stat().st_size == 0:
             target_path.unlink()
+
+    def _try_local_storage() -> AttachmentDownloadResult | None:
+        """Resolve the attachment off disk via the local Zotero SQLite DB.
+
+        Gated on local mode so a web-API user pointed at a group library never
+        matches an unrelated same-key row in a personal DB that happens to
+        exist on the machine.
+        """
+        try:
+            from zotero_mcp.config import load_config
+            from zotero_mcp.local_db import LocalZoteroReader
+            from zotero_mcp.utils import is_local_mode
+
+            if not is_local_mode():
+                return None
+
+            with LocalZoteroReader(db_path=load_config().resolve_zotero_db_path()) as reader:
+                attachment = reader.get_attachment_by_key(attachment_key)
+                if attachment is None:
+                    return None
+
+                resolved = reader._resolve_attachment_path(
+                    attachment_key, attachment["zotero_path"] or ""
+                )
+                if not (resolved and resolved.exists()):
+                    # Recorded filename drifted on disk — scan the folder (#291)
+                    resolved = reader._scan_storage_for_attachment(
+                        attachment_key, attachment["content_type"]
+                    )
+                if not (resolved and resolved.exists() and resolved.stat().st_size > 0):
+                    return None
+
+                # Copy rather than hand back the library path: callers treat
+                # the returned file as a scratch copy and delete it, which on
+                # a linked file would destroy the user's original (#372).
+                shutil.copyfile(resolved, target_path)
+                return AttachmentDownloadResult(
+                    path=target_path,
+                    source="Local storage",
+                    errors=errors,
+                )
+        except Exception as exc:
+            errors.append(f"Local storage: {exc}")
+            _cleanup_target()
+
+        return None
 
     def _try_dump(label: str, zot_client: zotero.Zotero | None) -> AttachmentDownloadResult | None:
         if zot_client is None:
@@ -602,6 +689,10 @@ def download_attachment_file(
             _cleanup_target()
 
         return None
+
+    storage_result = _try_local_storage()
+    if storage_result:
+        return storage_result
 
     local_result = _try_dump("Local Zotero", local_client)
     if local_result:
@@ -633,19 +724,18 @@ def download_attachment_file(
     return AttachmentDownloadResult(path=None, source=None, errors=errors)
 
 
-def convert_to_markdown(file_path: str | Path) -> str:
+def convert_to_markdown(file_path: str | Path, *, max_pages: int | None = None) -> str:
     """
-    Convert a file to markdown using markitdown library.
+    Convert a downloaded attachment to markdown.
 
     Args:
         file_path: Path to the file to convert.
+        max_pages: For PDFs, extract only the first N pages.
 
     Returns:
-        Markdown text.
+        Markdown text, or a human-readable error string on failure.
     """
-    try:
-        md = MarkItDown()
-        result = md.convert(str(file_path))
-        return result.text_content
-    except Exception as e:
-        return f"Error converting file to markdown: {str(e)}"
+    doc = extract_file(file_path, max_pages=max_pages)
+    if doc is None:
+        return f"Error converting file to markdown: {Path(file_path).name}"
+    return doc.text

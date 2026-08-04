@@ -335,6 +335,10 @@ def main():
                                  help="Limit number of items to process (for testing)")
     update_db_parser.add_argument("--fulltext", action="store_true",
                                  help="Extract fulltext content from local Zotero database (slower but more comprehensive)")
+    update_db_parser.add_argument("--allow-mass-deletion", action="store_true",
+                                 help="One-run opt-in when the deletion pass would remove "
+                                      "a large share of the library's indexed documents "
+                                      "(e.g. after intentionally purging the library)")
     update_db_parser.add_argument("--config-path",
                                  help="Path to semantic search configuration file")
     update_db_parser.add_argument("--db-path",
@@ -387,6 +391,11 @@ def main():
     # Setup info command
     subparsers.add_parser("setup-info", help="Show installation path and configuration info for MCP clients")
 
+    # Schema refresh command
+    subparsers.add_parser(
+        "schema-refresh",
+        help="Refresh the cached Zotero base-field schema from the server now")
+
     args = parser.parse_args(_normalize_help_args(sys.argv[1:]))
 
     # If no command is provided, default to 'serve'
@@ -398,6 +407,23 @@ def main():
     if args.command == "version":
         from zotero_mcp._version import __version__
         print(f"Zotero MCP v{__version__}")
+        sys.exit(0)
+
+    elif args.command == "schema-refresh":
+        from zotero_mcp import schema
+        before = schema.get_table().get("version")
+        if schema.refresh(force=True) == "offline":
+            print(
+                "Could not reach the Zotero schema server; keeping the current "
+                f"copy (version {before}).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        after = schema.get_table().get("version")
+        if after != before:
+            print(f"Zotero schema refreshed: version {before} -> {after}.")
+        else:
+            print(f"Zotero schema already current (version {after}).")
         sys.exit(0)
 
     elif args.command == "setup-info":
@@ -556,6 +582,7 @@ def main():
                 limit=args.limit,
                 extract_fulltext=args.fulltext,
                 use_openai_batch=args.openai_batch,
+                allow_mass_deletion=args.allow_mass_deletion,
             )
 
             _print_update_stats(stats)
@@ -826,6 +853,16 @@ def main():
         transport = getattr(args, "transport", "stdio")
         # Ensure environment is initialized (Claude config or standalone config)
         setup_zotero_environment()
+        # Re-apply the toolset profile now that the transport is known. The
+        # import-time call in server.py assumed stdio; an HTTP transport also
+        # needs the ChatGPT connector tools. setup_zotero_environment() runs
+        # first so a ZOTERO_MCP_TOOLSETS set via the config file is honoured.
+        from zotero_mcp.toolsets import UnknownToolsetError, apply_toolsets
+        try:
+            apply_toolsets(mcp, transport=transport)
+        except UnknownToolsetError as e:
+            print(f"❌ {e}")
+            sys.exit(1)
         # If the reranker is enabled, warm it up in the background so the first
         # semantic search doesn't pay the ~tens-of-seconds model load inside the
         # request path and time out (issue #283). Daemon thread: never blocks

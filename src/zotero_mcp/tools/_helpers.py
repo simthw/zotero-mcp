@@ -80,28 +80,19 @@ def _get_write_client(ctx):
 def _get_bibliography_client(ctx=None):
     """Return a client able to render CSL bibliographies/citations.
 
-    Zotero's local HTTP API has no citation engine — any request carrying
-    ``content=bib`` / ``citation`` / ``bibtex`` is rejected with "Local API
-    does not support Atom output" (#371). Only the web API can render, so
-    mirror the hybrid pattern in ``_get_write_client``: render through the
-    web client whenever web credentials are configured (applying the active
-    library override so a switched-to group library is targeted), and raise
-    an actionable ValueError in local-only mode instead of surfacing the raw
-    Atom error.
+    The local API *does* have a citation engine; what it lacks is Atom. The
+    original diagnosis of #371 confused the two, because the only rendering
+    request we made was ``content=bib``/``citation``/``bibtex``, and ``content``
+    implies ``format=atom`` — which the local API answers with 501 "Local API
+    does not support Atom output". That was read as "no citation engine", and
+    rendering was routed through the web API, which locked local-only users out
+    of a feature their own Zotero could serve.
+
+    Asking the JSON way instead (``include=bib``/``citation`` with ``style``,
+    or the top-level ``format=bibtex`` export) works against the local API with
+    no credentials at all, so every mode can now use its normal client.
     """
-    if not _utils.is_local_mode():
-        return _client.get_zotero_client()
-    web_zot = _client.get_web_zotero_client()
-    if web_zot is not None:
-        apply_library_override(web_zot, _client.get_active_library())
-        if ctx is not None:
-            ctx.info("Routing bibliography rendering through the Zotero web API")
-        return web_zot
-    raise ValueError(
-        "Bibliography and citation rendering requires Zotero's web API CSL "
-        "engine; the local API has no citation engine. "
-        "Add ZOTERO_API_KEY and ZOTERO_LIBRARY_ID to enable hybrid mode."
-    )
+    return _client.get_zotero_client()
 
 
 def fetch_trashed_collections(zot) -> list[dict]:
@@ -130,7 +121,7 @@ def is_collection_trashed(zot, collection_key: str) -> bool | None:
     """Return True if a collection is in the trash, False if live, None on error.
 
     Reads a single collection by key and inspects ``data.deleted``. Used to
-    pre-validate ``zotero_manage_collections`` calls so the tool returns a
+    pre-validate ``zotero_set_item_collections`` calls so the tool returns a
     clear error instead of silently filing items into trashed parents.
     """
     try:
@@ -757,7 +748,7 @@ def _url_resolves_to_public_host(url: str) -> bool:
     SSRF guard for the open-access PDF download path: the candidate URL comes
     from third-party metadata APIs (Unpaywall / Semantic Scholar) and is
     therefore attacker-influenceable (a hostile paper record, or prompt
-    injection steering ``zotero_add_by_doi``). We reject non-http(s) schemes
+    injection steering ``zotero_add_item``). We reject non-http(s) schemes
     and any host that resolves to a private, loopback, link-local, reserved,
     or otherwise non-global address — including the 169.254.169.254
     cloud-metadata endpoint, which matters for HTTP/SSE-transport deployments.
@@ -881,7 +872,7 @@ def _download_and_attach_pdf(write_zot, item_key, pdf_url, doi, ctx):
 def _maybe_upload_to_webdav(attach_result, file_path, ctx, write_zot=None):
     """Suffix to append to a user-facing 'file attached' message.
 
-    PR #279 added WebDAV-aware upload to ``zotero_add_from_file``. The same
+    PR #279 added WebDAV-aware upload to ``zotero_add_item``. The same
     treatment is needed everywhere else ``attachment_both`` is called: the
     Web API's file upload lands bytes in Zotero Storage, which a desktop
     client with File Syncing set to WebDAV never consults.

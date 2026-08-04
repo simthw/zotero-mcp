@@ -1,3 +1,5 @@
+<!-- mcp-name: io.github.54yyyu/zotero-mcp -->
+
 # Zotero MCP: Chat with your Research Library—Local or Web—in Claude, ChatGPT, and more.
 
 <p align="center">
@@ -174,6 +176,21 @@ When prompted by `zotero-mcp setup --semantic-config-only`, choose **Ollama** an
 zotero-mcp update-db --force-rebuild
 ```
 
+Two `semantic_search.embedding_config` keys tune the Ollama path for slower
+hardware or very large libraries:
+
+```jsonc
+"embedding_config": {
+  "model_name": "bge-m3",
+  "timeout": 600,            // HTTP timeout per /api/embed call (default 120s)
+  "request_batch_size": 64   // documents per request (default 64)
+}
+```
+
+Raise `timeout` if indexing reports `Read timed out`; lower
+`request_batch_size` to make each request cover less GPU work, which usually
+fixes timeouts more reliably than raising the timeout alone.
+
 When you choose OpenAI, setup also asks whether database updates should use
 OpenAI Batch API. Batch updates are cheaper for large libraries, but they are
 asynchronous: submit the batch, wait for completion, then import the embeddings.
@@ -233,6 +250,34 @@ update automatically upgrades that item without requiring a force rebuild.
 - *"Find papers conceptually similar to this abstract: [paste abstract]"*
 
 The semantic search provides similarity scores and finds papers based on conceptual understanding, not just keyword matching.
+
+### Text Extraction Settings
+
+PDFs are parsed with [pdf-inspector](https://github.com/firecrawl/pdf-inspector), which produces Markdown with the document's heading structure intact. These keys live under `semantic_search.extraction` in `~/.config/zotero-mcp/config.json`:
+
+```json
+{
+  "semantic_search": {
+    "extraction": {
+      "pdf_max_pages": 50,
+      "fulltext_display_max_pages": 10,
+      "attachment_priority": ["markdown", "pdf", "html", "other"]
+    }
+  }
+}
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `pdf_max_pages` | `50` | Pages extracted per PDF when indexing. Raising it does not widen what search sees on its own — that is bounded by the embedding model's token limit or `chunking.max_chunks_per_item`. |
+| `fulltext_display_max_pages` | `10` | Pages returned by `zotero_get_item_fulltext`. Separate from the above because reading a paper is bounded by your assistant's context, not by recall. |
+| `attachment_priority` | `["pdf", "html", "other"]` | Order in which attachment kinds are tried when an item has several readable files. |
+
+**`attachment_priority`** exists for the case where you have converted a paper to clean Markdown yourself and attached it next to the original PDF. By default the PDF still wins; listing `"markdown"` first makes your converted copy the one that gets read and indexed. Valid entries are `pdf`, `html`, `markdown`, `text` and `other`. `other` is a catch-all matching every kind not named elsewhere in the list, so the default sweeps Markdown and plain text into one bucket where the larger file wins. Omitting `other` means anything unlisted is never chosen.
+
+Changing this setting marks affected items for re-extraction, so a following `zotero-mcp update-db` refreshes text that came from a now-deprioritized attachment rather than leaving stale embeddings behind.
+
+To read one specific attachment regardless of priority, pass that attachment's own key to `zotero_get_item_fulltext` (find it with `zotero_get_item_children`) — an attachment key bypasses the priority order and reads exactly that file.
 
 ## 🖥️ Setup & Usage
 
@@ -391,6 +436,24 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
   preferences (read from the profile's `prefs.js`) is tried first, then the
   default `~/Zotero` location.
 
+**Tool surface:**
+- `ZOTERO_MCP_TOOLSETS`: Which optional tool groups to expose. Every tool the
+  server registers is sent to the model on *every* request, so the tool list is
+  a fixed cost on your context window. Groups that need an external service,
+  serve maintenance rather than research, or apply only to some users are off
+  by default. See [Tool Groups](#-tool-groups) below.
+
+**Item schema:**
+- `ZOTERO_MCP_SCHEMA_REFRESH=0`: Disable the weekly background refresh of
+  Zotero's item-type schema from `api.zotero.org`. The schema is what routes a
+  generic `title=` update to the field a type actually stores it under (a
+  statute's `nameOfAct`, a case's `caseName`). A copy ships with the package, so
+  disabling the refresh only means new item types added by Zotero after this
+  release won't be picked up until you upgrade. `zotero-mcp schema-refresh`
+  still refreshes on demand.
+- `ZOTERO_MCP_SCHEMA_CACHE`: Custom path for the refreshed schema cache
+  (default: `~/.cache/zotero-mcp/schema.json`).
+
 ### Command-Line Options
 
 ```bash
@@ -503,7 +566,8 @@ zotero-cli edit ABC123 --add-tags "reviewed,important" --date "2024"
 zotero-cli notes list ABC123
 zotero-cli notes create --item-key ABC123 --text "My note" --tags "idea"
 zotero-cli notes create --item-key ABC123 --text -   # read from stdin
-zotero-cli ann list ABC123                    # annotations (short alias)
+zotero-cli ann list --item-key ABC123         # annotations (short alias)
+zotero-cli ann list --item-key ABC123 --format json  # structured export
 zotero-cli ann search "highlight text"
 
 # Add items
@@ -570,7 +634,10 @@ The first time you use PDF annotation features, the necessary tools will be auto
 
 ## 🔗 Managing Related Items
 
-Zotero MCP now supports managing relationships between items in your library. This is useful for linking related papers, tracking versions, or connecting preprints to their published versions.
+Zotero MCP supports managing relationships between items in your library. This is useful for linking related papers, tracking versions, or connecting preprints to their published versions.
+
+> These tools are in the opt-in `relations` group. Enable them with
+> `ZOTERO_MCP_TOOLSETS=relations` — see [Tool Groups](#-tool-groups).
 
 ### View Related Items
 ```
@@ -600,7 +667,60 @@ zotero_remove_item_relation(
 - `dc:relation` — General related items (default)
 - `owl:sameAs` — Items that are the same work (e.g., preprint and published version)
 
+## 🧰 Tool Groups
+
+Every tool this server registers is sent to the model on **every** request, so
+the tool list is a fixed tax on your context window before you type anything.
+To keep that cost proportionate, optional capabilities are grouped into
+*toolsets* that you turn on when you need them.
+
+Set `ZOTERO_MCP_TOOLSETS` to control which groups are exposed:
+
+| Value | Effect |
+|---|---|
+| *(unset)* | Default profile — core tools plus `libraries`, `search-admin`, `pdf-geometry` |
+| `all` | Everything (the pre-0.9 behaviour) |
+| `none` | Core tools only — the smallest surface |
+| `scite,feeds` | Core plus the named groups |
+| `all,-scite` | Everything except the named groups |
+
+Values are case-insensitive and may be comma- or space-separated. An unknown
+group name is an error at startup rather than a silent no-op.
+
+| Group | Default | Contents |
+|---|---|---|
+| `scite` | off | Scite citation tallies and retraction checks (calls scite.ai; pairs with the `[scite]` extra) |
+| `duplicates` | off | Find and merge duplicate items — library maintenance |
+| `discovery` | off | `find_related_papers`, `library_coverage` — corpus-level exploration |
+| `feeds` | off | Zotero RSS feed subscriptions |
+| `relations` | off | Explicit item-to-item "related items" links |
+| `libraries` | **on** | List and switch between personal/group libraries |
+| `search-admin` | **on** | Build and inspect the semantic search index |
+| `pdf-geometry` | **on** | Page layout and PDF outline — pairs with area annotations |
+| `chatgpt-connector` | auto | The `search`/`fetch` pair required by ChatGPT deep research |
+
+`chatgpt-connector` is scoped by transport: it turns on automatically when the
+server is served over `streamable-http` or `sse` (how ChatGPT reaches it) and
+stays off for `stdio`. Name it explicitly to override either way.
+
+Anything not listed above is **core** and always available.
+
+**Note:** a disabled tool is genuinely absent — not merely hidden — so the
+model cannot call it. If you rely on a capability, enable its group.
+
+Example (Claude Desktop / Claude Code):
+
+```json
+"env": {
+  "ZOTERO_LOCAL": "true",
+  "ZOTERO_MCP_TOOLSETS": "scite,duplicates"
+}
+```
+
 ## 📚 Available Tools
+
+> Availability depends on your `ZOTERO_MCP_TOOLSETS` setting — see
+> [Tool Groups](#-tool-groups) above.
 
 ### 🧠 Semantic Search Tools
 - `zotero_semantic_search`: AI-powered similarity search with embedding models
@@ -619,16 +739,20 @@ zotero_remove_item_relation(
 ### 📚 Content Tools
 - `zotero_get_item_metadata`: Get detailed metadata (supports `format="markdown"`, `format="json"` for complete raw Zotero metadata, and `format="bibtex"`)
 - `zotero_get_item_fulltext`: Get full text content
-- `zotero_get_item_children`: Get attachments and notes
+- `zotero_get_item_children`: Get attachments and notes for one item or many (pass an array of keys)
 
 ### 📝 Annotation & Notes Tools
-- `zotero_get_annotations`: Get annotations (including direct PDF extraction)
-- `zotero_get_notes`: Retrieve notes from your Zotero library
-- `zotero_search_notes`: Search in notes and annotations (including PDF-extracted)
-- `zotero_create_note`: Create a new note for an item (beta feature)
-- `zotero_get_page_layout`: Detect figure/table regions on a PDF page (with captions and normalized coordinates) for accurate area annotation placement
+- `zotero_get_annotations`: Get annotations (including direct PDF extraction); use `format="json"` for normalized records suitable for scripts and other MCP tools
+- `zotero_synthesize_annotations`: Build a per-paper annotation/note digest; supports `format="json"` for structured grouped output
+- `zotero_get_notes`: Retrieve notes from your Zotero library; pass `query` to search note and annotation text instead of listing
+- `zotero_create_annotation`: Create a highlight (`text=`) or an area annotation (`rect=[x, y, width, height]`)
+- `zotero_manage_note`: Create, update, or delete a note via `action="create"|"update"|"delete"` (beta feature)
+- `zotero_get_page_layout`: Detect figure/table regions on a PDF page (with captions and normalized coordinates) for accurate area annotation placement — its reported `bbox` can be passed straight to `zotero_create_annotation(rect=...)`
 
 ### 📊 Scite Citation Intelligence Tools
+
+> Opt-in group: enable with `ZOTERO_MCP_TOOLSETS=scite` — see [Tool Groups](#-tool-groups).
+
 - `scite_enrich_item`: Get Scite citation tallies and retraction alerts for a paper
 - `scite_enrich_search`: Search your Zotero library with Scite-enriched results (tallies + alerts inline)
 - `scite_check_retractions`: Scan items for retractions and editorial notices

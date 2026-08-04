@@ -240,12 +240,13 @@ def setup_semantic_search(
     print("2. OpenAI - Better quality, requires API key")
     print("3. Gemini - Better quality, requires API key")
     print("4. Ollama - Local embeddings via Ollama API")
+    print("5. Custom model (for OpenAI-compatible APIs like SiliconFlow)")
 
     while True:
-        choice = input("\nChoose embedding model (1-4): ").strip()
-        if choice in ["1", "2", "3", "4"]:
+        choice = input("\nChoose embedding model (1-5): ").strip()
+        if choice in ["1", "2", "3", "4", "5"]:
             break
-        print("Please enter 1, 2, 3, or 4")
+        print("Please enter 1, 2, 3, 4, or 5")
 
     config = {}
 
@@ -338,6 +339,33 @@ def setup_semantic_search(
             print(f"Using custom Ollama base URL: {base_url}")
         else:
             print("Using default Ollama base URL: http://localhost:11434")
+
+    elif choice == "5":
+        # Custom model for OpenAI-compatible APIs
+        config["embedding_model"] = "openai"
+
+        # Get custom model name
+        model_name = input("Enter custom model name (e.g., BAAI/bge-m3): ").strip()
+        if not model_name:
+            print("Warning: No model name provided, using text-embedding-3-small")
+            model_name = "text-embedding-3-small"
+        config["embedding_config"] = {"model_name": model_name}
+        print(f"Using custom model: {model_name}")
+
+        # Get API key
+        api_key = getpass.getpass("Enter your API key (hidden): ").strip()
+        if api_key:
+            config["embedding_config"]["api_key"] = api_key
+        else:
+            print("Warning: No API key provided. Set OPENAI_API_KEY environment variable.")
+
+        # Get custom base URL
+        base_url = input("Enter custom OpenAI base URL (leave blank for default): ").strip()
+        if base_url:
+            config["embedding_config"]["base_url"] = base_url
+            print(f"Using custom base URL: {base_url}")
+        else:
+            print("Using default OpenAI base URL")
 
     # Configure update frequency
     print("\n=== Database Update Configuration ===")
@@ -434,7 +462,14 @@ def setup_semantic_search(
         print("Using auto-detect for Zotero database location.")
 
     config["update_config"] = update_config
-    config["extraction"] = {"pdf_max_pages": pdf_max_pages}
+    # Merge rather than replace: setup only prompts for the page cap, and
+    # rewriting the whole section would silently drop hand-edited keys such
+    # as attachment_priority and fulltext_display_max_pages.
+    extraction_config = dict(
+        (existing_semantic_config or {}).get("extraction") or {}
+    )
+    extraction_config["pdf_max_pages"] = pdf_max_pages
+    config["extraction"] = extraction_config
     # Web-API users: index fulltext from Zotero's server-side extraction by
     # default. Users can set this to false to keep the old metadata-only
     # behavior. The flag is ignored in local mode (ZOTERO_LOCAL=true uses

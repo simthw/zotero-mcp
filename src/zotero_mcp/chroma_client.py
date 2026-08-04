@@ -8,6 +8,7 @@ for semantic search over Zotero libraries.
 import json
 import logging
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -48,13 +49,15 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
 
     def __init__(self, model_name: str = "text-embedding-3-small", api_key: str | None = None,
                  base_url: str | None = None, request_batch_size: int | None = None,
-                 rate_limit_rps: float | None = None):
+                 rate_limit_rps: float | None = None, max_input_tokens: int | None = None):
         import threading
         self.model_name = model_name
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
         self.request_batch_size = int(request_batch_size) if request_batch_size else self.DEFAULT_REQUEST_BATCH_SIZE
         self.rate_limit_rps: float | None = float(rate_limit_rps) if rate_limit_rps else None
+        if max_input_tokens is not None:
+            self.max_input_tokens = max_input_tokens
         self._rate_lock = threading.Lock()
         self._last_request_ts: float = 0.0
         if not self.api_key:
@@ -79,6 +82,7 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
             "base_url": self.base_url,
             "request_batch_size": self.request_batch_size,
             "rate_limit_rps": self.rate_limit_rps,
+            "max_input_tokens": getattr(self, "max_input_tokens", None),
             # ChromaDB's built-in EF of the same registered name rebuilds from
             # {api_key_env_var, model_name, api_base, ...} and asserts ("This
             # code should not be reached") when those are missing. Persisting
@@ -101,6 +105,7 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
             base_url=config.get("base_url") or config.get("api_base"),
             request_batch_size=config.get("request_batch_size"),
             rate_limit_rps=config.get("rate_limit_rps"),
+            max_input_tokens=config.get("max_input_tokens"),
         )
 
     def _wait_for_rate_limit(self) -> None:
@@ -148,19 +153,36 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
         return self.__call__([text])[0]
 
     def truncate(self, text: str, max_tokens: int) -> str:
-        """Truncate using tiktoken cl100k_base (correct for OpenAI models)."""
-        try:
-            import tiktoken
-            if not hasattr(self, '_tokenizer'):
-                self._tokenizer = tiktoken.get_encoding("cl100k_base")
-            tokens = self._tokenizer.encode(text, disallowed_special=())
-            if len(tokens) > max_tokens:
-                tokens = tokens[:max_tokens]
-                text = self._tokenizer.decode(tokens)
-        except ImportError:
-            max_chars = max_tokens * 3
-            if len(text) > max_chars:
-                text = text[:max_chars]
+        """Truncate text to fit within the token limit.
+
+        Uses tiktoken cl100k_base when the model is a native OpenAI model.
+        For third-party models served via an OpenAI-compatible API (detected
+        by a non-OpenAI model_name), uses a conservative character estimate
+        since the actual tokenizer may differ significantly.
+        """
+        is_native_openai = getattr(self, "model_name", "text-embedding-3-small").startswith(
+            "text-embedding-"
+        )
+        if is_native_openai:
+            try:
+                import tiktoken
+                if not hasattr(self, '_tokenizer'):
+                    self._tokenizer = tiktoken.get_encoding("cl100k_base")
+                tokens = self._tokenizer.encode(text, disallowed_special=())
+                if len(tokens) > max_tokens:
+                    tokens = tokens[:max_tokens]
+                    text = self._tokenizer.decode(tokens)
+                return text
+            except ImportError:
+                pass
+        # Conservative character-based truncation for non-OpenAI models.
+        # Subword tokenizers (e.g. bge-m3's XLMRoberta SentencePiece) can
+        # produce ~1 token per 1.5-2 chars on malformed PDF text with no
+        # whitespace.  Empirically, 16000 chars still exceeds bge-m3's 8192
+        # token limit on such text, so we use 1.5 chars/token for safety.
+        max_chars = int(max_tokens * 1.5)
+        if len(text) > max_chars:
+            text = text[:max_chars]
         return text
 
 
@@ -400,8 +422,18 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
     # ChromaDB's built-in ollama EF requires a ``timeout`` key.
     DEFAULT_TIMEOUT = 120
 
+    # Documents per /api/embed request. The indexer hands us a whole item
+    # batch, which with chunking enabled is (items × max_chunks_per_item)
+    # documents — up to thousands. Sending that as one request makes a single
+    # HTTP call that has to outlast the entire GPU pass, which is what pushed
+    # runs past any sane timeout (#423). Chunking the request keeps each call
+    # short; Ollama processes sequentially either way, so on a local server
+    # the extra round trips cost approximately nothing.
+    DEFAULT_REQUEST_BATCH_SIZE = 64
+
     def __init__(self, model_name: str = "qwen3-embedding", base_url: str | None = None,
-                 url: str | None = None, timeout: int | None = None):
+                 url: str | None = None, timeout: int | None = None,
+                 request_batch_size: int | None = None):
         self.model_name = model_name
         # ``url`` is ChromaDB's built-in spelling of ``base_url``; accept both
         # so a config written by either class rebuilds here (issue #382).
@@ -411,6 +443,9 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
         # Mirror the attribute under the built-in's name as well.
         self.url = self.base_url
         self.timeout = int(timeout) if timeout else self.DEFAULT_TIMEOUT
+        self.request_batch_size = (
+            int(request_batch_size) if request_batch_size else self.DEFAULT_REQUEST_BATCH_SIZE
+        )
 
     @staticmethod
     def name() -> str:
@@ -428,6 +463,9 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
             # Carrying both spellings makes the config valid for both classes.
             "url": self.base_url,
             "timeout": self.timeout,
+            # Extra keys are ignored by the built-in (it reads only
+            # url/model_name/timeout via .get()), so carrying ours is safe.
+            "request_batch_size": self.request_batch_size,
         }
 
     @staticmethod
@@ -436,6 +474,7 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
             model_name=config.get("model_name", "qwen3-embedding"),
             base_url=config.get("base_url") or config.get("url"),
             timeout=config.get("timeout"),
+            request_batch_size=config.get("request_batch_size"),
         )
 
     def __call__(self, input: Documents) -> Embeddings:
@@ -443,8 +482,11 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
 
         Unlike the deprecated /api/embeddings route (single ``prompt`` -> single
         ``embedding``), /api/embed accepts a batch via ``input`` and returns a
-        list under ``embeddings``, so the whole batch is sent in one request
-        instead of one request per document.
+        list under ``embeddings``, so several documents go out per request.
+
+        The caller's list is split into ``request_batch_size`` chunks so one
+        request never has to cover an unbounded amount of GPU work; see that
+        attribute for why. Vectors are concatenated back in input order.
         """
         try:
             import requests
@@ -456,18 +498,30 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
             return []
 
         endpoint = f"{self.base_url}/api/embed"
-        response = requests.post(
-            endpoint,
-            json={"model": self.model_name, "input": texts},
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        data = response.json()
-        embeddings = data.get("embeddings")
-        if embeddings is None:
-            raise ValueError(
-                f"Ollama /api/embed returned no 'embeddings' field: {data}"
+        embeddings: list = []
+        for start in range(0, len(texts), self.request_batch_size):
+            window = texts[start : start + self.request_batch_size]
+            response = requests.post(
+                endpoint,
+                json={"model": self.model_name, "input": window},
+                timeout=self.timeout,
             )
+            response.raise_for_status()
+            data = response.json()
+            vectors = data.get("embeddings")
+            if vectors is None:
+                raise ValueError(
+                    f"Ollama /api/embed returned no 'embeddings' field: {data}"
+                )
+            if len(vectors) != len(window):
+                # A short response would silently misalign every vector after
+                # it with the wrong document, poisoning the index in a way that
+                # only shows up as bad search results much later.
+                raise ValueError(
+                    f"Ollama /api/embed returned {len(vectors)} embeddings for "
+                    f"{len(window)} inputs"
+                )
+            embeddings.extend(vectors)
         return embeddings
 
     def embed_query(self, text: str) -> list[float]:
@@ -617,6 +671,7 @@ class ChromaClient:
                 model_name=model_name, api_key=api_key, base_url=base_url,
                 request_batch_size=self.embedding_config.get("request_batch_size"),
                 rate_limit_rps=self.embedding_config.get("rate_limit_rps"),
+                max_input_tokens=self.embedding_config.get("max_input_tokens"),
             )
 
         elif self.embedding_model == "gemini":
@@ -628,7 +683,12 @@ class ChromaClient:
         elif self.embedding_model == "ollama":
             model_name = self.embedding_config.get("model_name", "qwen3-embedding")
             base_url = self.embedding_config.get("base_url")
-            return OllamaEmbeddingFunction(model_name=model_name, base_url=base_url)
+            return OllamaEmbeddingFunction(
+                model_name=model_name,
+                base_url=base_url,
+                timeout=self.embedding_config.get("timeout"),
+                request_batch_size=self.embedding_config.get("request_batch_size"),
+            )
 
         elif self.embedding_model == "qwen":
             model_name = self.embedding_config.get("model_name", "Qwen/Qwen3-Embedding-0.6B")
@@ -743,12 +803,18 @@ class ChromaClient:
         returned asynchronously without calling the realtime embeddings API.
         """
         try:
-            self.collection.upsert(
-                documents=documents,
-                metadatas=metadatas,
-                ids=ids,
-                embeddings=embeddings,
-            )
+            # Same max_batch_size constraint as upsert_documents.
+            try:
+                max_batch = int(self.client.get_max_batch_size())
+            except Exception:
+                max_batch = 5000
+            for i in range(0, len(ids), max_batch):
+                self.collection.upsert(
+                    documents=documents[i:i + max_batch],
+                    metadatas=metadatas[i:i + max_batch],
+                    ids=ids[i:i + max_batch],
+                    embeddings=embeddings[i:i + max_batch],
+                )
             logger.info(f"Upserted {len(documents)} precomputed embeddings to ChromaDB collection")
         except Exception as e:
             logger.error(f"Error upserting precomputed embeddings to ChromaDB: {e}")
@@ -819,7 +885,7 @@ class ChromaClient:
             logger.error(f"Error deleting documents from ChromaDB: {e}")
             raise
 
-    def delete_item_chunks(self, item_key: str) -> None:
+    def delete_item_chunks(self, item_key: str, group_id: int | None = None) -> None:
         """Delete all passage chunks belonging to one item (chunked collections).
 
         Passage chunks carry ``parent_item_key`` in their metadata; deleting by
@@ -827,11 +893,21 @@ class ChromaClient:
         chunks are re-upserted, so a document that shrank to fewer passages
         never leaves orphaned chunks behind. No-op-safe on item-level
         collections (nothing matches the filter).
+
+        Args:
+            item_key: Parent item whose chunks to delete.
+            group_id: When given, restrict the delete to chunks attributed to
+                that library — the deletion pass passes its run scope so a
+                mixed-attribution chunk set (partial rewrite, key collision)
+                never loses another library's chunks.
         """
+        where: dict[str, Any] = {"parent_item_key": item_key}
+        if group_id is not None:
+            where = {"$and": [{"parent_item_key": item_key}, {"group_id": int(group_id)}]}
         try:
-            self.collection.delete(where={"parent_item_key": item_key})
+            self.collection.delete(where=where)
         except Exception as e:
-            logger.debug(f"delete_item_chunks({item_key}) failed: {e}")
+            logger.warning(f"delete_item_chunks({item_key}) failed: {e}")
 
     def get_collection_info(self) -> dict[str, Any]:
         """Get information about the collection."""
@@ -908,18 +984,91 @@ class ChromaClient:
         except Exception:
             return set()
 
-    def get_all_ids(self) -> set[str]:
+    def get_all_ids(self, where: dict[str, Any] | None = None) -> set[str]:
         """Return every id currently stored in the collection.
 
         Used by incremental sync to compute deletions: items in the local
         collection but no longer present in the Zotero library.
+
+        Args:
+            where: Optional ChromaDB metadata filter (e.g.
+                ``{"group_id": 0}``) applied DB-side. Documents missing a
+                filtered key never match, so callers scoping by ``group_id``
+                structurally exclude unattributed documents.
+
+        Errors return an empty set, which every caller treats as "nothing
+        eligible" — deletion passes fail toward deleting nothing.
         """
         try:
-            result = self.collection.get(include=[])
+            result = self.collection.get(where=where, include=[])
             return set(result.get("ids", []))
         except Exception as e:
             logger.error(f"Error listing collection ids: {e}")
             return set()
+
+    def iter_metadatas(self, batch_size: int = 500) -> Iterator[tuple[list[str], list[dict[str, Any]]]]:
+        """Stream ``(ids, metadatas)`` over the whole collection in batches.
+
+        Snapshots the id set first, then pages metadata with
+        ``collection.get(ids=chunk)`` — deliberately not ``limit``/``offset``,
+        whose ordering across pages is an undocumented implementation detail,
+        and never one unbounded ids list (the "too many SQL variables"
+        failure, #368). Callers may update already-yielded documents between
+        batches (the group_id backfill does); a snapshot makes that safe by
+        construction. Documents deleted mid-iteration are simply absent from
+        their page.
+
+        Backend failures RAISE — deliberately not routed through
+        ``get_all_ids``, whose swallow-into-empty-set contract is safe for
+        deletion ("nothing eligible") but inverts here: the backfill's
+        one-time schema gate closes permanently on "success", so an error
+        masquerading as an empty collection would silently disable the
+        migration with zero documents tagged.
+        """
+        batch_size = int(batch_size)
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        # Cap at the same order as the backend batch limit so a caller cannot
+        # accidentally defeat the bounded-ids protection this method exists
+        # to provide.
+        batch_size = min(batch_size, 5000)
+        all_ids = sorted(self.collection.get(include=[]).get("ids") or [])
+        for start in range(0, len(all_ids), batch_size):
+            chunk = all_ids[start:start + batch_size]
+            result = self.collection.get(ids=chunk, include=["metadatas"])
+            ids = result.get("ids") or []
+            if not ids:
+                continue
+            metadatas = result.get("metadatas") or [{} for _ in ids]
+            yield ids, metadatas
+
+    def update_metadatas(self, ids: list[str], metadatas: list[dict[str, Any]]) -> None:
+        """Metadata-only update for existing documents; never re-embeds.
+
+        Callers must pass complete metadata dicts: chromadb 1.5.x merges
+        the given keys into existing metadata, while other versions have
+        replaced the whole dict — full dicts behave identically under both.
+        Split under the backend's max batch size like ``upsert_documents``
+        (#369).
+        """
+        if not ids:
+            return
+        try:
+            try:
+                max_batch = int(self.client.get_max_batch_size())
+            except Exception:
+                max_batch = 5000
+            if max_batch < 1:
+                max_batch = 5000
+            for i in range(0, len(ids), max_batch):
+                self.collection.update(
+                    ids=ids[i:i + max_batch],
+                    metadatas=metadatas[i:i + max_batch],
+                )
+            logger.info(f"Updated metadata for {len(ids)} documents")
+        except Exception as e:
+            logger.error(f"Error updating document metadata: {e}")
+            raise
 
 
 def create_chroma_client(config_path: str | None = None) -> ChromaClient:

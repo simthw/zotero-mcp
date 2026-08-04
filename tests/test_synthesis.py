@@ -1,5 +1,8 @@
 """Tests for the synthesis tool module (digest + bibliography export)."""
 
+import json
+
+import pytest
 from conftest import DummyContext, FakeZotero
 
 import zotero_mcp.client as zotero_client
@@ -90,6 +93,66 @@ def test_synthesize_annotations_groups_by_paper(monkeypatch):
     assert "1 notes" in out
 
 
+def test_synthesize_annotations_markdown_disambiguates_same_title(monkeypatch):
+    """Two distinct papers sharing a title get distinguishable headings."""
+    fake = _DigestZotero()
+    fake._title_map["PAPER002"] = "Attention Is All You Need"
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: fake)
+
+    out = synthesis.synthesize_annotations(ctx=DummyContext())
+
+    assert "## Attention Is All You Need (PAPER001)" in out
+    assert "## Attention Is All You Need (PAPER002)" in out
+    # Still two papers, and each keeps its own highlight.
+    assert "2 papers" in out
+    assert "Self-attention scales to long sequences" in out
+    assert "Residual connections ease optimization" in out
+
+
+def test_synthesize_annotations_json_groups_structured_records_by_paper(monkeypatch):
+    fake = _DigestZotero()
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: fake)
+
+    payload = json.loads(
+        synthesis.synthesize_annotations(format="json", ctx=DummyContext())
+    )
+
+    assert payload["summary"] == {
+        "papers": 2,
+        "highlights": 2,
+        "notes": 1,
+    }
+    papers = {paper["item_key"]: paper for paper in payload["papers"]}
+    assert papers["PAPER001"]["title"] == "Attention Is All You Need"
+    assert papers["PAPER001"]["highlights"][0] == {
+        "annotation_key": "ANN1",
+        "item_key": "PAPER001",
+        "attachment_key": "ATTACH01",
+        "parent_title": "Attention Is All You Need",
+        "attachment_title": "Full Text PDF",
+        "type": None,
+        "page": None,
+        "page_index": None,
+        "text": "Self-attention scales to long sequences",
+        "comment": "key claim",
+        "color": None,
+        "color_category": None,
+        "tags": [],
+        "created": None,
+        "modified": None,
+        "source": "zotero",
+    }
+    assert papers["PAPER001"]["notes"] == [{
+        "note_key": "NOTE1",
+        "item_key": "PAPER001",
+        "parent_title": "Attention Is All You Need",
+        "text": "Transformers remove recurrence entirely.",
+        "tags": [],
+        "created": None,
+        "modified": None,
+    }]
+
+
 def test_synthesize_annotations_empty(monkeypatch):
     fake = FakeZotero()  # items() returns [] for every itemType
     monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: fake)
@@ -98,39 +161,76 @@ def test_synthesize_annotations_empty(monkeypatch):
     assert "No annotations or notes found" in out
 
 
+def test_synthesize_annotations_json_empty_result_is_structured(monkeypatch):
+    fake = FakeZotero()
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: fake)
+
+    payload = json.loads(
+        synthesis.synthesize_annotations(format="json", ctx=DummyContext())
+    )
+
+    assert payload == {
+        "summary": {"papers": 0, "highlights": 0, "notes": 0},
+        "papers": [],
+    }
+
+
 # ---------------------------------------------------------------------------
 # export_bibliography
 # ---------------------------------------------------------------------------
 
 
 class _BibZotero(FakeZotero):
-    """FakeZotero honoring a content= kwarg for CSL/bibtex rendering."""
+    """Stub matching what Zotero's API actually returns for rendering.
+
+    Both the local and web APIs answer ``include=bib``/``citation`` with JSON
+    rows carrying the rendered string, and ``format=bibtex`` with the whole
+    .bib file as raw bytes. Neither serves ``content=`` (that implies Atom, and
+    the local API 501s on it), so this stub raises if it ever sees one —
+    sending ``content=`` is precisely the bug behind #371.
+    """
 
     def __init__(self):
         super().__init__()
         self.last_kwargs = None
 
-    def _render(self, content, style):
-        if content == "bibtex":
-            return "@article{smith2020, title={Title}, author={Smith, J.}}"
-        # bib / citation -> list of HTML snippets
-        if content == "citation":
-            return ['<span class="citation">(Smith, 2020)</span>']
-        return ['<div class="csl-entry">Smith, J. (2020). Title. Journal.</div>']
+    def _render(self, kwargs):
+        if kwargs.get("content"):
+            raise AssertionError(
+                "content= implies Atom, which the local API rejects (#371)"
+            )
+        if kwargs.get("format") == "bibtex":
+            return b"@article{smith2020, title={Title}, author={Smith, J.}}"
+        include = kwargs.get("include")
+        if include == "citation":
+            return [{"key": "ABCD1234", "citation": '<span>(Smith, 2020)</span>'}]
+        if include == "bib":
+            return [
+                {
+                    "key": "ABCD1234",
+                    "bib": '<div class="csl-entry">Smith, J. (2020). Title. Journal.</div>',
+                },
+                # An attachment: present in the library, nothing to render.
+                {"key": "ATTACH01", "bib": ""},
+            ]
+        return None
 
     def items(self, **kwargs):
         self.last_kwargs = kwargs
-        content = kwargs.get("content")
-        if content:
-            return self._render(content, kwargs.get("style"))
-        return self._items
+        rendered = self._render(kwargs)
+        return self._items if rendered is None else rendered
+
+    def top(self, **kwargs):
+        self.last_kwargs = kwargs
+        rendered = self._render(kwargs)
+        return self._items if rendered is None else rendered
 
     def collection_items(self, key, **kwargs):
         self.last_kwargs = kwargs
-        content = kwargs.get("content")
-        if content:
-            return self._render(content, kwargs.get("style"))
-        return super().collection_items(key, **kwargs)
+        rendered = self._render(kwargs)
+        if rendered is None:
+            return super().collection_items(key, **kwargs)
+        return rendered
 
 
 def test_export_bibliography_bib_strips_html(monkeypatch):
@@ -145,7 +245,10 @@ def test_export_bibliography_bib_strips_html(monkeypatch):
     assert "Bibliography" in out
     # style passed through to the API.
     assert fake.last_kwargs.get("style") == "apa"
-    assert fake.last_kwargs.get("content") == "bib"
+    assert fake.last_kwargs.get("include") == "bib"
+    # Rows with nothing rendered (the attachment) are dropped, not emitted
+    # as blank numbered entries.
+    assert "\n2. " not in out
 
 
 def test_export_bibliography_style_passthrough(monkeypatch):
@@ -160,7 +263,7 @@ def test_export_bibliography_style_passthrough(monkeypatch):
     )
 
     assert fake.last_kwargs.get("style") == "ieee"
-    assert fake.last_kwargs.get("content") == "citation"
+    assert fake.last_kwargs.get("include") == "citation"
     assert "(Smith, 2020)" in out
     assert "ieee" in out
 
@@ -177,7 +280,9 @@ def test_export_bibliography_bibtex_fenced(monkeypatch):
 
     assert "@article{smith2020" in out
     assert "```bibtex" in out
-    # bibtex ignores style (not passed to the API).
+    # bibtex is a whole-file export: format=, not include=, and style is
+    # meaningless so it is not sent.
+    assert fake.last_kwargs.get("format") == "bibtex"
     assert "style" not in fake.last_kwargs
 
 
@@ -191,83 +296,130 @@ def test_export_bibliography_collection(monkeypatch):
         ctx=DummyContext(),
     )
     assert "Smith, J. (2020). Title. Journal." in out
-    assert fake.last_kwargs.get("content") == "bib"
+    assert fake.last_kwargs.get("include") == "bib"
 
 
 def test_export_bibliography_api_error(monkeypatch):
     class _ErrZot(FakeZotero):
         def items(self, **kwargs):
-            raise RuntimeError("bib not supported in local mode")
+            raise RuntimeError("connection refused")
 
     monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: _ErrZot())
 
     out = synthesis.export_bibliography(item_keys=["ABCD1234"], ctx=DummyContext())
-    assert "web API" in out.lower() or "ZOTERO_API_KEY" in out
+    assert "Error rendering bibliography" in out
+    # The remedy names both modes now that either can render.
+    assert "local" in out.lower()
 
 
 # ---------------------------------------------------------------------------
-# export_bibliography — local/hybrid mode routing (#371)
+# export_bibliography — rendering works without web credentials (#371)
+#
+# The original fix for #371 concluded the local API had no citation engine and
+# routed rendering through the web API, locking local-only users out. The real
+# constraint is narrower: the local API rejects *Atom*, and `content=` implies
+# Atom. Asking the JSON way (`include=bib`/`citation`, or `format=bibtex`)
+# renders fine locally, verified against a live Zotero 7 local API.
 # ---------------------------------------------------------------------------
 
 
-class _LocalOnlyZotero(FakeZotero):
-    """Local API stub: rejects any CSL/Atom rendering request like Zotero does."""
+class _AtomRejectingZotero(_BibZotero):
+    """Local API stub: renders JSON requests, 501s on Atom ones like Zotero."""
 
-    def items(self, **kwargs):
+    def _render(self, kwargs):
         if kwargs.get("content"):
             raise RuntimeError("Local API does not support Atom output")
-        return self._items
-
-    def collection_items(self, key, **kwargs):
-        if kwargs.get("content"):
-            raise RuntimeError("Local API does not support Atom output")
-        return super().collection_items(key, **kwargs)
+        return super()._render(kwargs)
 
 
-def test_export_bibliography_routes_to_web_client_in_hybrid_mode(monkeypatch):
-    """Local mode + web credentials → render through the web client (#371)."""
-    local = _LocalOnlyZotero()
-    web = _BibZotero()
+def test_export_bibliography_renders_in_local_only_mode(monkeypatch):
+    """No web credentials at all → still renders, no error (#371)."""
+    local = _AtomRejectingZotero()
     monkeypatch.setenv("ZOTERO_LOCAL", "true")
     monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: local)
-    monkeypatch.setattr(zotero_client, "get_web_zotero_client", lambda: web)
-    monkeypatch.setattr(zotero_client, "get_active_library", dict)
+    monkeypatch.setattr(zotero_client, "get_web_zotero_client", lambda: None)
 
     out = synthesis.export_bibliography(item_keys=["ABCD1234"], ctx=DummyContext())
 
     assert "Smith, J. (2020). Title. Journal." in out
     assert "Atom output" not in out
-    # The web client did the rendering, not the local one.
-    assert web.last_kwargs.get("content") == "bib"
+    assert "ZOTERO_API_KEY" not in out
 
 
-def test_export_bibliography_web_client_honors_library_override(monkeypatch):
-    """Exporting while switched to a group library targets that library."""
-    web = _BibZotero()
+@pytest.mark.parametrize("export_format", ["bib", "citation", "bibtex"])
+def test_export_bibliography_never_requests_atom(monkeypatch, export_format):
+    """No format may fall back to content=, which is what broke local mode."""
+    local = _AtomRejectingZotero()
     monkeypatch.setenv("ZOTERO_LOCAL", "true")
-    monkeypatch.setattr(zotero_client, "get_zotero_client", _LocalOnlyZotero)
-    monkeypatch.setattr(zotero_client, "get_web_zotero_client", lambda: web)
-    monkeypatch.setattr(
-        zotero_client,
-        "get_active_library",
-        lambda: {"library_id": "987654", "library_type": "group"},
-    )
-
-    synthesis.export_bibliography(collection_key="COLL1234", ctx=DummyContext())
-
-    assert web.library_id == "987654"
-    # pyzotero wants the plural URL segment.
-    assert web.library_type == "groups"
-
-
-def test_export_bibliography_local_only_mode_message(monkeypatch):
-    """Local-only mode → actionable message, not the raw Atom error (#371)."""
-    monkeypatch.setenv("ZOTERO_LOCAL", "true")
-    monkeypatch.setattr(zotero_client, "get_zotero_client", _LocalOnlyZotero)
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: local)
     monkeypatch.setattr(zotero_client, "get_web_zotero_client", lambda: None)
 
-    out = synthesis.export_bibliography(item_keys=["ABCD1234"], ctx=DummyContext())
+    out = synthesis.export_bibliography(
+        item_keys=["ABCD1234"], export_format=export_format, ctx=DummyContext()
+    )
 
-    assert "ZOTERO_API_KEY" in out
-    assert "ZOTERO_LIBRARY_ID" in out
+    assert "content" not in (local.last_kwargs or {})
     assert "Atom output" not in out
+
+
+def test_export_bibliography_local_only_bibtex_is_decoded(monkeypatch):
+    """format=bibtex returns raw bytes; they must reach the user as text."""
+    local = _AtomRejectingZotero()
+    monkeypatch.setenv("ZOTERO_LOCAL", "true")
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: local)
+    monkeypatch.setattr(zotero_client, "get_web_zotero_client", lambda: None)
+
+    out = synthesis.export_bibliography(
+        item_keys=["ABCD1234"], export_format="bibtex", ctx=DummyContext()
+    )
+
+    assert "@article{smith2020" in out
+    # A bytes repr leaking through would show up as b'...' in the output.
+    assert "b'" not in out
+
+
+class _LooseItemKeyZotero(_AtomRejectingZotero):
+    """Local API behaviour: an itemKey filter returns extras alongside the ask.
+
+    Verified against a live Zotero local API — requesting one key came back
+    with that item plus three unrelated ones, so the response cannot be
+    treated as the selection. The web API filters correctly, so the client-side
+    filter is a no-op there.
+    """
+
+    def items(self, **kwargs):
+        self.last_kwargs = kwargs
+        if kwargs.get("format") == "bibtex":
+            return b"@article{smith2020, title={Title}}"
+        include = kwargs.get("include")
+        requested = (kwargs.get("itemKey") or "").split(",")
+        rows = [{"key": "UNRELATED", include: "<div>Noise, N. (1999).</div>"}]
+        rows += [{"key": k, include: f"<div>Wanted {k}</div>"} for k in requested]
+        rows.append({"key": "ALSONOISE", include: "<div>More, M. (1998).</div>"})
+        return rows
+
+
+def test_export_bibliography_item_keys_filters_out_api_extras(monkeypatch):
+    """Only the requested keys are rendered, in the order asked for (#371)."""
+    local = _LooseItemKeyZotero()
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: local)
+
+    out = synthesis.export_bibliography(
+        item_keys=["BBBB2222", "AAAA1111"], ctx=DummyContext()
+    )
+
+    numbered = [ln for ln in out.splitlines() if ln[:2] in ("1.", "2.", "3.")]
+    assert len(numbered) == 2, f"extras leaked into the export: {numbered}"
+    assert "Wanted BBBB2222" in numbered[0]
+    assert "Wanted AAAA1111" in numbered[1]
+    assert "Noise" not in out and "More, M." not in out
+
+
+def test_export_bibliography_library_wide_uses_top_level_items(monkeypatch):
+    """Exporting the library skips attachments/notes, which render as blanks."""
+    local = _AtomRejectingZotero()
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: local)
+
+    synthesis.export_bibliography(ctx=DummyContext())
+
+    assert local.last_kwargs.get("include") == "bib"
