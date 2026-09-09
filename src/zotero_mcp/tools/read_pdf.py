@@ -142,9 +142,11 @@ def _get_pdf_path(item_key: str, ctx: Context) -> tuple[str, str, bool] | None:
 @mcp.tool(
     name="zotero_read_pdf_pages",
     description="Read specific page range(s) from a PDF attachment of a Zotero item. "
-    "Use this when you know which pages to read — for example after getting the PDF "
-    "outline via zotero_get_pdf_outline. Pages are 1-indexed. "
-    "Returns Markdown with the page's heading structure preserved.",
+    "Use ONLY when you need a specific page range (e.g., after getting the PDF "
+    "outline via zotero_get_pdf_outline). For reading the full paper, use "
+    "zotero_get_item_fulltext instead — it prioritizes MinerU content_list.json "
+    "structured text over raw PDF extraction. "
+    "Pages are 1-indexed. Returns Markdown with heading structure preserved.",
 )
 def read_pdf_pages(
     item_key: str,

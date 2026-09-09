@@ -176,7 +176,9 @@ def get_item_metadata(
     name="zotero_get_item_fulltext",
     description=(
         "Return the full extracted text of a Zotero item's primary "
-        "attachment (PDF or EPUB). "
+        "attachment (PDF or EPUB). In local mode, prioritizes MinerU "
+        "content_list.json structured text when available (higher quality "
+        "than raw PDF extraction). "
         "WARNING: returns the entire paper (often 10K+ tokens). Use ONLY "
         "when the user explicitly wants to READ the paper — not for "
         "searching or browsing. For topic search use "
