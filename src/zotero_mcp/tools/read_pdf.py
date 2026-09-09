@@ -173,8 +173,33 @@ def read_pdf_pages(
         if end_page is not None and end_page < start_page:
             return "Error: end_page must be greater than or equal to start_page."
 
-        ctx.info(f"Reading PDF pages {start_page}-{end_page or start_page} for item {item_key}")
+        ctx.info(f"Reading pages {start_page}-{end_page or start_page} for item {item_key}")
 
+        # 0. MinerU content_list.json — highest quality, when available.
+        try:
+            from zotero_mcp.local_db import LocalZoteroReader
+            if _utils.is_local_mode():
+                config = load_config()
+                with LocalZoteroReader(db_path=config.resolve_zotero_db_path()) as reader:
+                    local_item = reader.get_item_by_key(item_key)
+                    if local_item and reader.has_content_list_json(local_item.item_id):
+                        json_path = reader.get_content_list_json_path(local_item.item_id)
+                        if json_path:
+                            full_text = reader._extract_text_from_content_list_json(json_path)
+                            if full_text.strip():
+                                # content_list.json has no page boundaries —
+                                # return the full text with a page-note header.
+                                return _helpers._prepend_size_warning(
+                                    f"# {local_item.title or 'Untitled'}\n"
+                                    f"**Item Key:** {item_key}\n"
+                                    f"**Source:** MinerU content_list.json (full document)\n"
+                                    f"\n{full_text}\n",
+                                    "Consider using zotero_semantic_search to find specific content.",
+                                )
+        except Exception:
+            pass  # fall through to raw PDF extraction
+
+        # 1. Raw PDF extraction (fallback).
         result = _get_pdf_path(item_key, ctx)
         if result is None:
             return f"No PDF attachment found for item: {item_key}"
