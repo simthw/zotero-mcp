@@ -1264,16 +1264,15 @@ class LocalZoteroReader:
         Preference order:
         1. MinerU ``content_list.json`` alongside the attachment — source
            ``"content_list_json"`` (highest quality structured text).
-        2. Our own extraction of the best attachment on disk, chosen by
+        2. ``.zotero-ft-cache`` — source ``"zotero-cache"`` (Zotero's
+           pre-built pdftotext index; fast, avoids slow PDF extraction).
+        3. Our own extraction of the best attachment on disk, chosen by
            ``attachment_priority`` — source ``"pdf"``, ``"html"`` or
            ``"file"``. A PDF that exceeds ``pdf_timeout`` yields no text
            rather than a sentinel.
-        3. ``.zotero-ft-cache`` — source ``"zotero-cache"``.
 
-        Our parser goes first because it is the only path that yields heading
-        structure and the page separators chunk provenance needs; the cache is
-        flat pdftotext output (see :meth:`_read_zotero_ft_cache`). The cache
-        still covers everything the parser cannot reach: attachments whose
+        Our parser goes last because it is the slowest path and is only
+        needed when the cache cannot serve the item: attachments whose
         file won't resolve, formats we don't read (EPUB), and files that fail
         to parse.
 
@@ -1291,19 +1290,29 @@ class LocalZoteroReader:
                 logger.info(f"Using content_list.json for item {item_id}: {best_content_list_json}")
                 return (text, "content_list_json")
 
-        # 1. Best attachment by the configured priority.
         if chosen:
             target, attachment_key = chosen
+
+            # 1. Transient cache lookup.
             hit = self._cache_lookup(target, attachment_key)
             if hit:
                 return hit
+
+            # 2. Zotero's own .zotero-ft-cache for the chosen attachment
+            #    (fast, pre-built by Zotero's pdftotext; avoids slow PDF extraction).
+            cached = self._read_zotero_ft_cache(attachment_key)
+            if cached:
+                self._cache_store(target, attachment_key, item_key, cached, "zotero-cache")
+                return (cached, "zotero-cache")
+
+            # 3. PDF/HTML extraction from the chosen attachment (slowest path).
             text = self._extract_text_from_file(target)
             if text and text != _EXTRACTION_TIMEOUT:
                 source = _source_for_path(target)
                 self._cache_store(target, attachment_key, item_key, text, source)
                 return (text, source)
 
-        # 2. Zotero's own cache, for whatever step 1 could not read.
+        # 4. Zotero's own .zotero-ft-cache for any other attachment (fallback).
         return self._zotero_ft_cache_fallback(item_id, chosen, item_key)
 
         return None

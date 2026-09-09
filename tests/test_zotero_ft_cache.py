@@ -81,9 +81,9 @@ def test_ft_cache_covers_an_attachment_whose_file_cannot_be_resolved(tmp_path):
 
 
 @skip_on_ci
-def test_our_extraction_wins_over_the_ft_cache(tmp_path):
-    """The cache is flat pdftotext with no headings and usually no page
-    separators, so a file we can parse ourselves takes precedence."""
+def test_ft_cache_wins_over_pdf_extraction(tmp_path):
+    """The .zotero-ft-cache is fast and pre-built by Zotero's pdftotext,
+    so it takes precedence over slow PDF extraction."""
     storage = tmp_path / "storage"
     attachment_dir = storage / "BOTHAVAIL"
     attachment_dir.mkdir(parents=True)
@@ -101,9 +101,9 @@ def test_our_extraction_wins_over_the_ft_cache(tmp_path):
     )
 
     text, source = reader._extract_fulltext_for_item(item_id=1)
-    assert source == "pdf"
-    assert "parsed markdown" in text
-    assert "flat cached text" not in text
+    assert source == "zotero-cache"
+    assert "flat cached text" in text
+    assert "parsed markdown" not in text
 
 
 @skip_on_ci
