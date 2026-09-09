@@ -72,7 +72,29 @@
 ### ⌨️ Standalone CLI (`zotero-cli`)
 - Search, browse, and edit your library directly from the terminal — no AI assistant required
 - Ideal for scripting, automation, and quick lookups
-- Short aliases (`s`, `g`, `ann`, `coll`) for interactive use
+- `--json` on every command for pipelines and agents; short aliases (`s`, `g`, `ann`, `coll`) for interactive use
+
+### 🪶 Agent skill — the same library for ~1% of the context
+
+If your agent has shell access (Claude Code, Cursor, Codex, Windsurf, Gemini CLI, Amp, OpenCode …), one command teaches it to drive `zotero-cli` directly:
+
+```bash
+zotero-mcp install-skill
+```
+
+It detects the harnesses in your project and installs to each — no flags, no per-tool instructions to look up.
+
+Why it matters: an MCP server sends **every tool's schema on every request**, before you type anything. The skill sits at 98 tokens until the agent decides it is relevant.
+
+| Route | In context | Paid |
+|---|---:|---|
+| MCP server, default profile (38 tools) | **13,448** | every request |
+| Agent skill, frontmatter only | **98** | always |
+| Agent skill, body loaded | 1,368 | when it fires |
+
+~137x cheaper before either is used, ~10x once the skill has fired. Re-measure any time with `python scripts/measure_context_cost.py`. This is the fixed context cost only — it does not measure task success or round trips, and a cheaper surface that gets the answer wrong is not cheaper. [Details below](#-agent-skill-one-command-for-any-harness).
+
+Both routes work, and they share one config. Use the MCP server when your client speaks MCP but has no shell (Claude Desktop, ChatGPT); use the skill when it has a shell.
 
 ## 🚀 Quick Install
 
@@ -436,6 +458,43 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
   preferences (read from the profile's `prefs.js`) is tried first, then the
   default `~/Zotero` location.
 
+**Search backend:**
+- `ZOTERO_SEARCH_BACKEND=sqlite`: Route `zotero_search_items` and
+  `zotero_advanced_search` through direct SQL against `zotero.sqlite` instead of
+  fetching over the API and filtering in Python (default: `api`). Requires
+  `ZOTERO_LOCAL=true`, since it reads the database off disk. Substantially
+  faster on large libraries — an `advanced_search` that pages the whole library
+  over the API drops from minutes to well under a second. Any query the backend
+  doesn't cover falls back to the API path automatically, so the results are
+  either the same or better, never worse.
+
+**Global search across libraries:**
+
+With the SQLite backend enabled, `zotero_search_items`, `zotero_advanced_search`
+and `zotero_semantic_search` accept `search_all_libraries=True` (`--all-libraries`
+on the CLI). One query then covers your personal library and every group library
+at once, and each result is labelled with the library it came from:
+
+```
+**Library:** AI in entrepreneurship (groupID=6015547)
+```
+
+This is deliberately gated on `ZOTERO_SEARCH_BACKEND=sqlite`. The Zotero API can
+only search one library per request, so without direct SQL the best anyone could
+do is replay a single-library search against each library in turn — a different
+and far slower operation. Rather than emulate global search badly, the tools
+refuse and say so.
+
+Two limits follow from how Zotero stores things. **Collections are per-library**
+(`collections.libraryID` is NOT NULL), so `collection_key` and `collection`
+conditions cannot be combined with a global search. **Tags are not** — Zotero
+keeps one database-wide `tags` table shared by every library — so tag filters and
+`tag` conditions work globally and are the recommended way to slice a global
+search.
+
+Duplicates across libraries are returned as-is: the same paper filed in two
+libraries is two items, and collapsing them would hide where each copy lives.
+
 **Tool surface:**
 - `ZOTERO_MCP_TOOLSETS`: Which optional tool groups to expose. Every tool the
   server registers is sent to the model on *every* request, so the tool list is
@@ -543,6 +602,68 @@ Use `zotero-mcp` when your AI client supports MCP (Claude Desktop, ChatGPT). Use
 
 Both share the same configuration set up by `zotero-mcp setup`.
 
+### How much context each route costs
+
+The MCP server sends every enabled tool's name, description and JSON parameter schema to the model on **every request**, before you type anything. The CLI route puts only a skill description in context until the model decides it is relevant. Measured on this repo with `python scripts/measure_context_cost.py`:
+
+| Route | Tokens in context | When it is paid |
+|---|---:|---|
+| MCP, default profile (38 tools) | 13,448 | every request |
+| MCP, `ZOTERO_MCP_TOOLSETS=none` (32 tools) | 11,761 | every request |
+| MCP, `ZOTERO_MCP_TOOLSETS=all` (50 tools) | 17,414 | every request |
+| CLI skill, frontmatter only | 98 | always |
+| CLI skill, body loaded | 1,368 | once the skill fires |
+| CLI skill + full command reference | 4,389 | worst case |
+
+That is the *fixed* cost only. It does not measure task success, output size, or how many round trips each route takes to finish a job — a cheaper surface that gets the answer wrong is not cheaper. Numbers are `cl100k_base` tokens and are re-measured, not estimated; `tests/test_context_cost_claim.py` fails if the relationship stops holding.
+
+### 🪶 Agent skill: one command for any harness
+
+```bash
+zotero-mcp install-skill
+```
+
+Run it in your project. It detects which agent harnesses are set up there and installs to each one, in that harness's own format:
+
+| Harness | Detected by | Installs |
+|---|---|---|
+| Claude Code (project) | `.claude/` | `.claude/skills/zotero-cli/` |
+| Claude Code (user) | `~/.claude/` | `~/.claude/skills/zotero-cli/` |
+| Cursor | `.cursor/` | `.cursor/rules/zotero-cli.mdc` |
+| Windsurf | `.windsurf/` | `.windsurf/rules/zotero-cli.md` |
+| Codex, Amp, OpenCode, Jules … | `AGENTS.md` | a pointer block in `AGENTS.md` |
+| Gemini CLI | `GEMINI.md` or `.gemini/` | a pointer block in `GEMINI.md` |
+
+```bash
+zotero-mcp install-skill --list-targets      # what is detected here
+zotero-mcp install-skill --target cursor     # install one explicitly
+zotero-mcp install-skill --force             # overwrite an existing copy
+```
+
+**It will not overwrite your work.** A destination that exists and differs is reported, not replaced, unless you pass `--force`. For shared instruction files it is stricter: only the text between the `zotero-cli` markers is ever managed, so the rest of your `AGENTS.md` is untouchable by construction — re-running updates that block in place rather than appending a second one.
+
+**It keeps the context advantage.** Shared instruction files get a short pointer block, not the whole skill; the body lands beside it and the agent opens it only when it decides Zotero is relevant. Pasting 1,400 tokens into every agent's always-loaded context would spend exactly the advantage this exists for.
+
+The skill teaches the find-keys-then-act loop, `--json`, how to pick among the six search modes, paging, reading a PDF by outline-then-page-range rather than whole, and when an empty result means "the index is not built" rather than "you have no papers on that".
+
+### Machine-readable output (`--json`)
+
+Every command accepts `--json`, before or after the command name. Output is one object per invocation:
+
+```bash
+zotero-cli --json search "attention" --limit 5 --detail keys_only
+# {"ok": true, "command": "search", "schema": 1, "data": {"count": 5, "items": [...]}}
+```
+
+Success carries `data`; failure carries `error.message` and a stable `error.code`, also on stdout, so one stream carries both outcomes. Read commands (search, get, annotations list, notes list, config) return real structure; commands whose answer is a status line return `{"text": ...}`. Run `zotero-cli --json-schema` for the full contract.
+
+```bash
+# Item keys are the currency of every command — pipe them onward
+zotero-cli --json search "diffusion models" --limit 5 --detail keys_only \
+  | jq -r '.data.items[].key' \
+  | while read -r key; do zotero-cli --json get metadata "$key"; done
+```
+
 ### Quick reference
 
 ```bash
@@ -608,6 +729,32 @@ zotero-cli db status
 # Library and duplicates
 zotero-cli library info
 zotero-cli duplicates find
+
+# Reading PDFs — find the section first, then read only those pages
+zotero-cli outline ABC123
+zotero-cli read ABC123 --start-page 42 --end-page 55
+zotero-cli path ABC123                        # where the file lives on disk
+
+# Attachments, deletion, bibliographies
+zotero-cli attach ABC123 --file /path/to/paper.pdf
+zotero-cli delete item ABC123
+zotero-cli export --item-keys ABC123,DEF456 --style apa
+zotero-cli export --collection COLL01 --format bibtex
+
+# Discovery and synthesis
+zotero-cli related 10.1038/s41586-021-03819-2 --direction citations
+zotero-cli coverage --collection COLL01
+zotero-cli synthesize --tag "to-read" --format json
+
+# Bulk edits across many items
+zotero-cli batch --item-keys ABC123,DEF456 --add-tags screened
+zotero-cli batch --query "machine learning" --add-tags survey --limit 100
+```
+
+Paging: listings cap at `--limit` and the response names the next offset.
+
+```bash
+zotero-cli --json get collection-items QS7TQPPA --limit 100 --offset 100
 ```
 
 ### Verbose mode
@@ -767,12 +914,13 @@ Example (Claude Desktop / Claude Code):
 
 All add tools take a `collections` parameter accepting collection keys, names, or `parent/child` paths — resolved and validated before the item is created, so unknown or ambiguous specs fail with suggestions instead of producing an unfiled item. They also take `if_exists` (`"duplicate"` — default — always creates; `"file"` reuses an existing item matching the DOI/arXiv ID/ISBN/URL, filing it into missing collections and adding missing tags; `"skip"` leaves a match untouched) and `create_missing_collections` (create unknown collection specs, including path chains, instead of failing). The `zotero-cli add` commands default to `--if-exists file`.
 - `zotero_attach_file`: Attach a local file or a PDF URL to an existing item by key (no new item created; returns the attachment key; idempotent per filename and content hash)
+- `zotero_set_item_parent`: Set, change, or clear an item's parent (`parent_key=null` makes it top-level)
 - `zotero_create_collection`: Create a new collection (folder/project) in your library
 - `zotero_search_collections`: Search for collections by name to find their keys
 - `zotero_manage_collections`: Add or remove items from collections (accepts keys, names, or `parent/child` paths)
 - `zotero_update_item`: Update metadata for an existing item (title, tags, abstract, date, etc.)
-- `zotero_find_duplicates`: Find duplicate items by title and/or DOI
-- `zotero_merge_duplicates`: Merge duplicate items with dry-run preview; consolidates all child items
+- `zotero_find_duplicates`: Find duplicate items by title and/or DOI, paged with `limit`/`offset`
+- `zotero_merge_duplicates`: Merge duplicate items with dry-run preview; consolidates all child items. `auto=True` merges every high-confidence (same-DOI) group in one pass behind a two-call plan/confirm gate
 - `zotero_get_pdf_outline`: Extract the table of contents / outline from a PDF attachment
 - `zotero_search_by_citation_key`: Look up items by BetterBibTeX citation key (with Extra field fallback)
 
@@ -785,7 +933,7 @@ All add tools take a `collections` parameter accepting collection keys, names, o
 
 ### Unit Tests
 ```bash
-uv run pytest tests/     # 294 tests, ~2 seconds
+uv run pytest tests/     # 1596 tests, ~7 seconds
 ```
 
 ### Integration Test Plan
@@ -814,11 +962,20 @@ A 45-point live integration test plan is included at `docs/integration-test-plan
 
 ## ☕ Support
 
-If you find Zotero MCP useful, consider buying me a coffee!
+Zotero MCP is free and MIT-licensed.
 
+If it saves you or your lab time, sponsoring helps cover the unglamorous parts: Windows and WSL2 edge
+cases, Zotero schema changes, group-library support, and the embedding/search infrastructure.
+
+<a href="https://github.com/sponsors/54yyyu">
+  <img src="https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor on GitHub">
+</a>
 <a href="https://buymeacoffee.com/stevenyuyy">
   <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me a Coffee">
 </a>
+
+**Labs and institutions:** the $50 and $200 tiers are meant to be expensable, and include priority
+triage on the issues affecting your workflow.
 
 ## 📄 License
 

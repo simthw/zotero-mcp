@@ -1,6 +1,8 @@
 """Write / mutation tool functions for the Zotero MCP server."""
 
+import contextlib
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -19,7 +21,15 @@ from zotero_mcp import schema as _schema
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
 from zotero_mcp._context import Context
-from zotero_mcp.client import with_zotero_api_lock
+from zotero_mcp.client import (
+    ZoteroApiBusyError,
+    with_zotero_api_lock,
+    zotero_api_lock,
+)
+from zotero_mcp.html_metadata import (
+    EmbeddedMetadata,
+    extract_embedded_metadata,
+)
 from zotero_mcp.tools import _helpers
 
 # Accessed as _helpers.X so that monkeypatch/mock on the module attribute works.
@@ -51,6 +61,192 @@ def _resolve_collections_arg(
         read_zot, specs,
         create_missing=create_missing, write_zot=write_zot, ctx=ctx,
     )
+
+
+def _split_multi_value(raw, field_name: str, validator) -> list[str]:
+    """Split a batch-identifier argument (DOI/URL/ISBN) into tokens.
+
+    Structured input — a list, or a string that opens with ``[``/``{`` —
+    goes to ``_normalize_str_list_input`` unchanged: the caller shaped it
+    deliberately, so a JSON array is a batch and a JSON object is the error
+    that helper already reports.
+
+    A plain string splits on newlines unconditionally, since no identifier
+    can contain one. Commas are the ambiguous case — they are ordinary
+    characters inside these identifiers, as query strings routinely show
+    and as ``_normalize_doi``'s own ``10.\\d{4,9}/\\S+`` allows — so a line
+    splits on commas unless doing so would break an identifier that works
+    as it stands. Concretely, it splits when either:
+
+    * every comma-token is independently valid, so the reading is
+      unambiguous (``10.1/a,10.2/b``, or two ISBNs — a comma can never
+      occur inside a valid ISBN, so those always split); or
+    * the whole line is *not* a valid identifier, so there is nothing to
+      protect and splitting is the only reading that can produce anything
+      (``9780199735815, 9781234567890`` where the second fails its
+      checksum — one bad token must not cost its neighbours).
+
+    It keeps the line whole only when the tokens don't all validate *and*
+    the line itself does — ``https://example.com/p?ids=1,2``, which
+    unconditional splitting turned into a truncated page plus a junk
+    sibling item titled ``2``.
+
+    Applying this per line rather than to the whole string keeps the mixed
+    case right: in ``"https://a.com/x?ids=1,2\\nhttps://b.com"`` the newline
+    separates and the comma does not.
+
+    ``validator`` is the same normalizer ``detect_source_type`` uses for
+    this identifier type, so detection and splitting agree by construction
+    rather than by keeping two copies of the rule in step.
+    """
+    if not isinstance(raw, str):
+        return _helpers._normalize_str_list_input(raw, field_name)
+
+    stripped = raw.strip()
+    if stripped[:1] in ("[", "{"):
+        return _helpers._normalize_str_list_input(stripped, field_name)
+
+    tokens: list[str] = []
+    for line in stripped.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",") if p.strip()]
+        if len(parts) > 1 and (
+            all(validator(p) for p in parts) or not validator(line)
+        ):
+            tokens.extend(parts)
+        else:
+            tokens.append(line)
+    return tokens
+
+
+def _dedupe_multi_tokens(tokens: list[str], key_fn):
+    """Collapse tokens naming the same identifier into one unit of work.
+
+    Returns ``(canonical_indices, duplicate_of)``: the positions to actually
+    process, in first-occurrence order, and a map from each remaining
+    position to the position it repeats.
+
+    Dedup against the *library* runs in phase 1, before anything has been
+    created, so it cannot see items this same call is about to add — a DOI
+    listed twice was created twice even under ``if_exists='skip'``. Removing
+    the repeat before any work starts is cheaper than teaching every later
+    phase about items created mid-call, and it also saves the redundant
+    CrossRef and Zotero round-trips.
+
+    ``key_fn`` returns the identity to compare on, or None for a token it
+    can't normalize — those stay separate so each still gets its own error.
+    """
+    canonical: list[int] = []
+    duplicate_of: dict[int, int] = {}
+    seen: dict[object, int] = {}
+    for i, tok in enumerate(tokens):
+        key = key_fn(tok)
+        if key is None:
+            canonical.append(i)
+            continue
+        if key in seen:
+            duplicate_of[i] = seen[key]
+        else:
+            seen[key] = i
+            canonical.append(i)
+    return canonical, duplicate_of
+
+
+def _doi_dedup_key(tok: str):
+    """DOIs are case-insensitive, and CrossRef echoes canonical case."""
+    normalized = _helpers._normalize_doi(tok)
+    return normalized.lower() if normalized else None
+
+
+def _isbn_dedup_key(tok: str):
+    """_normalize_isbn returns ISBN-13, so both spellings of one book
+    collapse to the same key."""
+    return _helpers._normalize_isbn(tok)
+
+
+def _url_dedup_key(tok: str):
+    """Exact match after stripping. There is no URL normalizer, and
+    inventing equivalence rules (trailing slash, case, query order) here
+    would silently drop URLs a user meant to add separately."""
+    return (tok or "").strip() or None
+
+
+def _duplicate_of_message(kind: str, position: int) -> str:
+    """Rendered in place of a result for a token repeated within one call."""
+    return (f"Same {kind} as entry {position} in this request — "
+            "added once, not duplicated.")
+
+
+# Prefixes the per-source adders open a successful result block with. Sniffing
+# rendered text is a stopgap: add_by_doi/url/isbn hand back pre-rendered
+# strings, so this is the only success signal the recursive URL/ISBN paths
+# expose. The real fix is the convergence _format_multi_result's docstring
+# describes — structured per-item dicts rendered through
+# _format_batch_result — at which point these go away.
+_CREATED_MARKERS = (
+    "Successfully added",       # add_by_doi, add_by_isbn, embedded metadata
+    "Successfully added arXiv",  # _add_by_arxiv
+    "Created webpage item for:",  # add_by_url's generic-webpage branch
+)
+_REUSED_MARKERS = ("Already in library:",)
+
+
+def _summarize_multi_results(results: list[str]) -> dict[str, int]:
+    """Count outcomes across a batch's per-token rendered results."""
+    counts = {"created": 0, "reused": 0, "duplicate": 0, "failed": 0}
+    for res in results:
+        text = res or ""
+        if "in this request — added once" in text:
+            counts["duplicate"] += 1
+        elif any(m in text for m in _CREATED_MARKERS):
+            counts["created"] += 1
+        elif any(m in text for m in _REUSED_MARKERS):
+            counts["reused"] += 1
+        else:
+            counts["failed"] += 1
+    return counts
+
+
+def _format_multi_result(kind: str, tokens: list[str], results: list[str]) -> str:
+    """Concatenate per-token single-item results for a DOI/URL/ISBN batch.
+
+    Each element of ``results`` is the normal, unmodified single-item
+    return value for that adder — this just labels and stacks them, so
+    batch output is a plain superset of what a single call already prints.
+
+    Deliberately a second, simpler batch strategy alongside
+    ``_format_batch_result`` (used by add_by_bibtex/add_by_csl_json), which
+    aggregates structured per-item dicts instead of pre-rendered strings.
+    Chosen here to keep the diff small and single-item output byte-for-byte
+    unchanged. If a third source ever needs batching, or the two formats
+    need to converge, the natural refactor is to make add_by_doi/url/isbn
+    return the same per-item dict shape (like a hypothetical
+    ``_add_one_by_doi`` helper) and render everything through
+    ``_format_batch_result`` — see the recursive per-token loops below for
+    the redundant-work cost that refactor would also remove.
+    """
+    counts = _summarize_multi_results(results)
+    total = len(tokens)
+    lines = [f"# Added {counts['created']} of {total} {kind}"
+             f"{'s' if total != 1 else ''}"]
+    detail = []
+    if counts["reused"]:
+        detail.append(f"{counts['reused']} already in library")
+    if counts["duplicate"]:
+        detail.append(f"{counts['duplicate']} repeated in this request")
+    if counts["failed"]:
+        detail.append(f"{counts['failed']} failed")
+    if detail:
+        lines.append(", ".join(detail).capitalize() + ".")
+    lines.append("")
+    for i, (tok, res) in enumerate(zip(tokens, results), 1):
+        lines.append(f"## {i}. {tok}")
+        lines.append("")
+        lines.append(res)
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _collections_status(coll_keys: list[str], missing: list[str]) -> str:
@@ -345,11 +541,14 @@ def batch_update_tags(
                     # If writing via web API, re-fetch the item from web to get
                     # the correct version number for the update
                     if write_zot is not zot:
+                        def _set_tags(it):
+                            it["data"]["tags"] = current_tags
+
                         try:
-                            web_item = write_zot.item(item_key)
-                            web_item["data"]["tags"] = current_tags
                             ctx.info(f"Updating item {item_key} via web API with tags: {current_tags}")
-                            result = write_zot.update_item(web_item)
+                            result = _helpers._update_item_with_version_retry(
+                                write_zot, item_key, _set_tags, ctx=ctx,
+                            )
                         except Exception as e:
                             ctx.error(f"Failed to fetch/update item {item_key} via web API: {str(e)}")
                             skipped_count += 1
@@ -564,9 +763,12 @@ def batch_update_extra(
                 # If writing via web API, re-fetch the item from web to get
                 # the correct version number for the update
                 if write_zot is not zot:
-                    web_item = write_zot.item(item_key)
-                    web_item["data"]["extra"] = new_extra
-                    result = write_zot.update_item(web_item)
+                    def _set_extra(it):
+                        it["data"]["extra"] = new_extra
+
+                    result = _helpers._update_item_with_version_retry(
+                        write_zot, item_key, _set_extra, ctx=ctx,
+                    )
                 else:
                     item["data"]["extra"] = new_extra
                     result = write_zot.update_item(item)
@@ -946,195 +1148,772 @@ def manage_collections(
 # individual MCP tools — ``zotero_add_item`` is the single public facade that
 # detects the source shape and dispatches here. They stay importable (and
 # individually callable) for the CLI and for direct use.
-@with_zotero_api_lock
+def _crossref_to_item_data(cr: dict, normalized: str, template_fn,
+                           supplemental: EmbeddedMetadata | None = None,
+                           ) -> tuple[dict, str, str]:
+    """Map a CrossRef ``/works`` message to a Zotero item dict.
+
+    Pure aside from ``template_fn(zot_type)`` (see
+    ``_memoized_item_template_fn``), so add_by_doi's single- and multi-DOI
+    paths can share one implementation (#A2). Returns ``(item_data,
+    zot_type, type_note)`` — callers need ``zot_type`` for display and
+    ``type_note`` to warn about an unmapped CrossRef type.
+
+    ``supplemental`` carries metadata read from the page the DOI was found
+    on, and fills *only* fields CrossRef left empty. CrossRef stays
+    authoritative where it says anything at all.
+    """
+    # Determine Zotero item type. An unmapped type still becomes a
+    # document, but the caller is told so — the fields a document has no
+    # room for are dropped silently otherwise.
+    cr_type = cr.get("type", "")
+    zot_type = CROSSREF_TYPE_MAP.get(cr_type, "document")
+    type_note = _helpers.crossref_type_note(cr_type)
+
+    template = template_fn(zot_type)
+    item_data = dict(template)
+
+    # Map fields
+    title_list = cr.get("title", [])
+    if title_list and "title" in item_data:
+        item_data["title"] = title_list[0]
+
+    # Creators
+    creators = []
+    for author in cr.get("author", []):
+        if "family" in author:
+            creators.append({
+                "creatorType": "author",
+                "firstName": author.get("given", ""),
+                "lastName": author["family"],
+            })
+        elif "name" in author:
+            creators.append({
+                "creatorType": "author",
+                "name": author["name"],
+            })
+    for editor in cr.get("editor", []):
+        if "family" in editor:
+            creators.append({
+                "creatorType": "editor",
+                "firstName": editor.get("given", ""),
+                "lastName": editor["family"],
+            })
+        elif "name" in editor:
+            creators.append({
+                "creatorType": "editor",
+                "name": editor["name"],
+            })
+    if creators:
+        item_data["creators"] = creators
+
+    # Date
+    date_parts = cr.get("published", cr.get("created", {})).get("date-parts", [[]])
+    if date_parts and date_parts[0]:
+        parts = date_parts[0]
+        item_data["date"] = "-".join(str(p) for p in parts)
+
+    # Simple string fields
+    field_map = {
+        "DOI": normalized,
+        "url": cr.get("URL", ""),
+        "volume": cr.get("volume", ""),
+        "issue": cr.get("issue", ""),
+        "pages": cr.get("page", ""),
+        "publisher": cr.get("publisher", ""),
+        "ISSN": (cr.get("ISSN") or [""])[0],
+    }
+
+    container = (cr.get("container-title") or [""])[0]
+    if container:
+        field_map["publicationTitle"] = container
+
+    abstract = _utils.clean_html(cr.get("abstract", ""), collapse_whitespace=True)
+    if abstract:
+        field_map["abstractNote"] = abstract
+
+    for field, value in field_map.items():
+        if field in item_data and value:
+            item_data[field] = value
+
+    # Fill the gaps CrossRef left, from the page the DOI came from.
+    # Never overwrite: a value CrossRef supplied wins.
+    if supplemental is not None:
+        page_fields = {
+            "title": supplemental.title,
+            "publicationTitle": supplemental.publication,
+            "bookTitle": supplemental.book_title,
+            "volume": supplemental.volume,
+            "issue": supplemental.issue,
+            "pages": supplemental.pages,
+            "date": supplemental.date,
+            "ISSN": supplemental.issn,
+            "ISBN": supplemental.isbn,
+            "language": supplemental.language,
+            "publisher": supplemental.publisher,
+        }
+        for field, value in page_fields.items():
+            if value and field in item_data and not item_data[field]:
+                item_data[field] = value
+        if supplemental.authors and not item_data.get("creators"):
+            item_data["creators"] = [
+                {"creatorType": "author", "firstName": first, "lastName": last}
+                for first, last in supplemental.authors
+            ]
+
+    return item_data, zot_type, type_note
+
+
+def _memoized_item_template_fn(write_zot):
+    """Wrap ``write_zot.item_template`` with a per-call cache (#A3).
+
+    CROSSREF_TYPE_MAP maps onto at most ~13 distinct Zotero item types, so
+    caching collapses up to one template GET per DOI in an N-DOI batch down
+    to at most one per distinct type actually seen. Self-locking so it is
+    correct regardless of whether the caller already holds
+    ``zotero_api_lock`` (the RLock is reentrant).
+    """
+    cache: dict[str, dict] = {}
+
+    def template_fn(zot_type: str) -> dict:
+        if zot_type not in cache:
+            with zotero_api_lock():
+                cache[zot_type] = write_zot.item_template(zot_type)
+        return cache[zot_type]
+
+    return template_fn
+
+
+def _resolve_thin_crossref_record(cr: dict, normalized: str, ctx: Context):
+    """Read the DOI's landing page when CrossRef's answer can't stand alone.
+
+    A publisher can register an article's DOI as a ``journal-issue``, whose
+    CrossRef record legitimately carries no title, authors, volume, issue or
+    pages — while the article's own landing page advertises all of them.
+    The url route hands its tags down as ``supplemental``; a caller passing a
+    bare DOI has no page to hand over, so we resolve the DOI ourselves.
+    Registry silence is not evidence of absence.
+
+    Outbound HTTP: call it outside the Zotero API lock.
+    """
+    cr_type = cr.get("type", "")
+    if not _crossref_record_is_thin(cr, cr_type):
+        return None
+    landing = cr.get("URL") or f"https://doi.org/{normalized}"
+    ctx.info(
+        f"CrossRef record for {normalized} is {cr_type or 'untitled'} "
+        f"and carries no usable title; reading {landing}"
+    )
+    supplemental, _ = _fetch_embedded_metadata(landing, ctx)
+    return supplemental
+
+
+_CROSSREF_WORKS_URL = "https://api.crossref.org/works"
+
+# CrossRef "polite pool": identifying via mailto gives higher rate limits and
+# priority routing, so it is sent unconditionally rather than only when the
+# operator configured an address — the same project-generic noreply identity
+# discovery.py already sends to OpenAlex. ZOTERO_MCP_CONTACT_EMAIL overrides it.
+_CROSSREF_DEFAULT_MAILTO = "zotero-mcp@users.noreply.github.com"
+
+# DOIs per batched /works?filter=doi:... request. 60 was measured working, but
+# CrossRef documents no URL-length or filter-count ceiling, so don't sit next to
+# an unmeasured cliff; 50 also matches _CREATE_BATCH_SIZE.
+_CROSSREF_FILTER_CHUNK = 50
+
+_CROSSREF_MAX_ATTEMPTS = 3
+
+_CROSSREF_HEADERS = {
+    "User-Agent": "zotero-mcp/1.0 (https://github.com/54yyyu/zotero-mcp)",
+    "Accept": "application/json",
+}
+
+
+def _crossref_mailto() -> str:
+    """The address to identify this client to CrossRef with (never empty)."""
+    return (
+        os.environ.get("ZOTERO_MCP_CONTACT_EMAIL", "").strip()
+        or _CROSSREF_DEFAULT_MAILTO
+    )
+
+
+def _crossref_get(url, params, ctx, timeout):
+    """GET a CrossRef endpoint with a bounded retry on 429 / 5xx.
+
+    Returns ``(response, None)`` or ``(None, error_str)``. The retry is a
+    backstop, not the rate-limiting strategy: the batch path issues one
+    request per 50 DOIs, so a normal import should never throttle at all.
+    """
+    last_error = None
+    for attempt in range(_CROSSREF_MAX_ATTEMPTS):
+        try:
+            resp = requests.get(url, params=params, headers=_CROSSREF_HEADERS,
+                                timeout=timeout)
+        except requests.Timeout:
+            return None, "Error: CrossRef API request timed out. Please try again."
+        except requests.RequestException as e:
+            return None, f"Error fetching from CrossRef: {e}"
+
+        if resp.status_code == 429 or resp.status_code >= 500:
+            last_error = f"HTTP {resp.status_code}"
+            if attempt < _CROSSREF_MAX_ATTEMPTS - 1:
+                wait = 5 * (2 ** attempt)  # 5s, 10s
+                ctx.info(
+                    f"CrossRef returned {resp.status_code}; retrying in {wait}s "
+                    f"({attempt + 1}/{_CROSSREF_MAX_ATTEMPTS})..."
+                )
+                _time.sleep(wait)
+                continue
+            break
+        return resp, None
+
+    return None, f"Error fetching from CrossRef: {last_error}"
+
+
+def _dedup_check_one_doi(read_zot, write_zot, doi, coll_keys, tags, if_exists, ctx):
+    """Normalize and dedup-check one DOI.
+
+    Returns ``("final", result_str)`` when the token is already fully
+    resolved (invalid DOI or dedup match), or ``("needs_fetch",
+    normalized_doi)`` when CrossRef metadata is still needed.
+    """
+    try:
+        normalized = _helpers._normalize_doi(doi)
+        if not normalized:
+            return ("final", f"Error: '{doi}' does not appear to be a valid DOI.")
+
+        with zotero_api_lock():
+            if if_exists != "duplicate":
+                existing = _helpers.find_existing_items(read_zot, doi=normalized, ctx=ctx)
+                if existing:
+                    return ("final", _handle_existing_item(
+                        write_zot, existing, coll_keys, tags, if_exists,
+                        matched_by=f"DOI {normalized}", ctx=ctx,
+                    ))
+
+        return ("needs_fetch", normalized)
+
+    except Exception as e:
+        ctx.error(f"Error adding by DOI: {e}")
+        return ("final", f"Error adding by DOI: {e}")
+
+
+def _fetch_one_doi_metadata(normalized: str, ctx) -> tuple[str, dict | str]:
+    """Fetch the CrossRef ``/works/{doi}`` message for a single DOI.
+
+    Kept for the one-DOI case: it is the documented exact-resolution
+    endpoint, so a lone DOI never depends on the ``doi`` filter's
+    undocumented multi-value semantics for no gain (one DOI costs one
+    request either way).
+
+    Returns ``("final", error_str)`` or ``("fetched", cr_message_dict)``.
+    """
+    try:
+        resp, error = _crossref_get(
+            f"{_CROSSREF_WORKS_URL}/{normalized}",
+            {"mailto": _crossref_mailto()}, ctx, timeout=15,
+        )
+        if error is not None:
+            return ("final", error)
+
+        if resp.status_code == 404:
+            return ("final", f"DOI not found on CrossRef: {normalized}")
+        resp.raise_for_status()
+
+        return ("fetched", resp.json().get("message", {}))
+
+    except requests.RequestException as e:
+        return ("final", f"Error fetching from CrossRef: {e}")
+    except Exception as e:
+        return ("final", f"Error adding by DOI: {e}")
+
+
+def _fetch_doi_metadata_batch(normalized_dois: list[str], ctx) -> dict[str, tuple[str, dict | str]]:
+    """Fetch CrossRef metadata for many DOIs in one request per 50 (#A5).
+
+    ``/works`` OR-filters on repeated ``doi:`` values, so an N-DOI import
+    costs ceil(N/50) requests instead of N. That is both faster and
+    *gentler* than the per-DOI fetch it replaces: concurrent per-DOI GETs
+    got HTTP 429 on most of a 25-DOI batch, while one batched request for
+    the same DOIs never throttles.
+
+    Returns ``{normalized_doi: ("fetched", cr_message) | ("final", error_str)}``
+    covering every requested DOI.
+    """
+    fetched: dict[str, tuple[str, dict | str]] = {}
+
+    for start in range(0, len(normalized_dois), _CROSSREF_FILTER_CHUNK):
+        chunk = normalized_dois[start:start + _CROSSREF_FILTER_CHUNK]
+        params = {
+            "filter": ",".join(f"doi:{d}" for d in chunk),
+            # `rows` MUST be sent: CrossRef's default page size is 20, so a
+            # 50-DOI filter would silently return the first 20 and the other
+            # 30 would look like they simply aren't in CrossRef.
+            "rows": len(chunk),
+            "mailto": _crossref_mailto(),
+        }
+
+        resp, error = _crossref_get(_CROSSREF_WORKS_URL, params, ctx, timeout=60)
+        if error is None and resp.status_code >= 400:
+            # _crossref_get only retries 429/5xx; every other 4xx comes back
+            # as a plain success, so the status has to be checked here — the
+            # single-DOI path does the same before parsing.
+            error = (f"Error fetching from CrossRef: HTTP {resp.status_code} "
+                     f"for a batch of {len(chunk)} DOIs")
+        if error is None:
+            try:
+                message = resp.json().get("message")
+            except ValueError as e:
+                message = None
+                error = f"Error fetching from CrossRef: malformed response ({e})"
+            if error is None and not isinstance(message, dict):
+                # A rejected query answers with `message` as a *list* of
+                # validation errors. Reaching straight for .get("items")
+                # raised AttributeError past the ValueError guard and took
+                # the whole call down. Treat it as a failure rather than
+                # falling through to an empty item list, which would report
+                # every DOI in the chunk as "not found on CrossRef" — a
+                # wrong answer rather than a reported one.
+                error = ("Error fetching from CrossRef: unexpected response "
+                         f"shape (message was {type(message).__name__})")
+            items = message.get("items") or [] if error is None else []
+
+        if error is not None:
+            # One request covers the whole chunk, so its failure is every
+            # member's failure — reported per DOI so the batch still returns
+            # one line per requested DOI.
+            for doi in chunk:
+                fetched[doi] = ("final", error)
+            continue
+
+        by_doi = {}
+        for entry in items:
+            entry_doi = (entry.get("DOI") or "").strip().lower()
+            if entry_doi:
+                by_doi[entry_doi] = entry
+
+        for doi in chunk:
+            # Compare case-insensitively: CrossRef echoes DOIs in canonical
+            # case, which need not match what the caller typed. Diffing what
+            # came back against what we asked for is also what guards the
+            # undocumented multi-value OR semantics — anything absent is
+            # reported as not-found rather than silently dropped.
+            entry = by_doi.get(doi.lower())
+            if entry is None:
+                fetched[doi] = ("final", f"DOI not found on CrossRef: {doi}")
+            else:
+                fetched[doi] = ("fetched", entry)
+
+    return fetched
+
+
+def _build_one_doi_item_data(cr: dict, normalized: str, template_fn, tags, coll_keys,
+                             supplemental=None) -> dict:
+    """Map fetched CrossRef metadata to an item_data dict ready for
+    batched creation.
+
+    Calling-thread only: ``template_fn`` may fetch (and cache) an item
+    template under the Zotero API lock on a cache miss (#A3).
+
+    ``supplemental`` fills only the fields CrossRef left empty; see
+    ``_crossref_to_item_data``.
+
+    ``cr`` is carried through in the payload as well as consumed here: the
+    OA-PDF cascade's "arXiv (via CrossRef)" source reads the has-preprint
+    relation straight out of this message, so dropping it after the field
+    mapping silently disables that source.
+    """
+    item_data, zot_type, type_note = _crossref_to_item_data(
+        cr, normalized, template_fn, supplemental
+    )
+    _apply_caller_tags_and_collections(item_data, tags, coll_keys)
+    return {"item_data": item_data, "zot_type": zot_type, "doi": normalized,
+            "type_note": type_note, "cr": cr}
+
+
+def _render_doi_create_result(cr_result: dict, zot_type: str, normalized: str,
+                              coll_keys: list[str], type_note: str = "") -> str:
+    """Render one _create_and_attach_batch result as add_by_doi's per-item
+    text block — the same shape the old single-item worker produced before
+    the metadata-resolution/creation split (#A4)."""
+    if not cr_result["ok"]:
+        if cr_result["key"] is not None:
+            # Item was created; only the PDF requirement failed.
+            return f"Error: {cr_result['error']}"
+        return f"Failed to create item: {cr_result['error']}"
+
+    collections_status = _collections_status(coll_keys, cr_result["collections_failed"])
+    return (
+        f"Successfully added: **{cr_result['title']}**\n\n"
+        f"Item key: `{cr_result['key']}`\n"
+        f"Type: {zot_type}\n"
+        f"DOI: {normalized}\n"
+        f"Collections: {collections_status}\n"
+        f"PDF: {cr_result['pdf_status']}\n"
+        f"{type_note}\n"
+        "_Note: To include this item in semantic search, run "
+        "zotero_update_search_database._"
+    )
+
+
 def add_by_doi(
-    doi: str,
+    doi: str | list[str],
     collections: list[str] | str | None = None,
     tags: list[str] | str | None = None,
     attach_mode: str = "auto",
     if_exists: Literal["duplicate", "file", "skip"] = "duplicate",
     create_missing_collections: bool = False,
     *,
+    supplemental: EmbeddedMetadata | None = None,
     ctx: Context
 ) -> str:
+    """Add an item by DOI, from CrossRef.
+
+    ``supplemental`` carries metadata read from the page the DOI was found
+    on, and fills *only* fields CrossRef left empty (see
+    ``_crossref_to_item_data``).
+    """
+    # NOT decorated with @with_zotero_api_lock: the lock only needs to
+    # cover the Zotero API calls, taken in short scoped blocks below and by
+    # _create_and_attach_batch, so a slow CrossRef lookup or OA-PDF
+    # download+upload doesn't hold it and starve every other MCP request
+    # (#A5b — the fix for the 244-DOI-batch crash: previously the decorator
+    # held the lock across the ENTIRE recursive multi-DOI loop, one PDF
+    # download+upload at a time).
+    #
+    # ``doi`` may name several DOIs at once (a list, or a comma/newline-
+    # separated string). Client/collections resolution and item-template
+    # fetches happen once for the whole call, not once per token (#A2).
+    # Each token then goes through three phases:
+    #   1. dedup-check
+    #   2. CrossRef fetch, batched via /works?filter=doi:... (#A5)
+    #   3. item_data build + batched create (#A4)
+    # so an N-DOI batch costs ceil(N/50) CrossRef GETs and one
+    # create_items() POST per <=50 DOIs rather than N of each, and one bad
+    # DOI never fails its neighbours. Everything runs on the calling
+    # thread: batching the fetch is both faster and gentler than issuing
+    # the same requests concurrently, which drew HTTP 429s. A single DOI
+    # takes the same path with a one-token list, unwrapped at the end.
     try:
         read_zot, write_zot = _helpers._get_write_client(ctx)
     except ValueError as e:
         return str(e)
 
     try:
+        # Inside the try: malformed structured input (a JSON object, say)
+        # raises from here, and is a user error like any other — it belongs
+        # in the returned text, not as a traceback out of the tool.
+        tokens = _split_multi_value(doi, "doi", _helpers._normalize_doi)
+        is_batch = len(tokens) > 1
+        doi_list = tokens if tokens else [doi]
+
         if if_exists not in _IF_EXISTS_VALUES:
             return f"Error: if_exists must be one of {_IF_EXISTS_VALUES}."
-        normalized = _helpers._normalize_doi(doi)
-        if not normalized:
-            return f"Error: '{doi}' does not appear to be a valid DOI."
 
         # Resolve collection specs (keys/names/paths) BEFORE any network or
         # write work — a bad spec must not produce an unfiled item.
-        try:
-            coll_keys = _resolve_collections_arg(
-                read_zot, collections, ctx,
-                create_missing=create_missing_collections, write_zot=write_zot,
-            )
-        except ValueError as e:
-            return f"Error: {e}"
+        with zotero_api_lock():
+            try:
+                coll_keys = _resolve_collections_arg(
+                    read_zot, collections, ctx,
+                    create_missing=create_missing_collections, write_zot=write_zot,
+                )
+            except ValueError as e:
+                return f"Error: {e}"
 
-        if if_exists != "duplicate":
-            existing = _helpers.find_existing_items(read_zot, doi=normalized, ctx=ctx)
-            if existing:
-                return _handle_existing_item(
-                    write_zot, existing, coll_keys, tags, if_exists,
-                    matched_by=f"DOI {normalized}", ctx=ctx,
+        template_fn = _memoized_item_template_fn(write_zot)  # #A3
+
+        # Collapse repeats before any work: phase 1's library dedup runs
+        # before anything is created, so it can't see the item this same
+        # call is about to add.
+        canonical, duplicate_of = _dedupe_multi_tokens(doi_list, _doi_dedup_key)
+        work_list = [doi_list[i] for i in canonical]
+
+        # Phase 1: dedup-check every token on the calling thread.
+        dedup = [
+            _dedup_check_one_doi(read_zot, write_zot, tok, coll_keys, tags, if_exists, ctx)
+            for tok in work_list
+        ]
+        needs_fetch = [(i, normalized) for i, (kind, normalized) in enumerate(dedup)
+                       if kind == "needs_fetch"]
+
+        # Phase 2: fetch CrossRef metadata in as few requests as possible —
+        # one batched /works?filter=doi:... per 50 DOIs (#A5). Repeats
+        # collapse to a single lookup.
+        fetched: dict[str, tuple[str, dict | str]] = {}
+        unique = list(dict.fromkeys(normalized for _, normalized in needs_fetch))
+        if len(unique) > 1:
+            ctx.info(f"Fetching CrossRef metadata for {len(unique)} DOIs")
+            fetched = _fetch_doi_metadata_batch(unique, ctx)
+        elif unique:
+            ctx.info(f"Fetching metadata for DOI: {unique[0]}")
+            fetched = {unique[0]: _fetch_one_doi_metadata(unique[0], ctx)}
+
+        # Phase 3: build item_data for every successfully fetched DOI, then
+        # create them all in one batched pass (#A4).
+        work_results: list[str] = [None] * len(work_list)
+        pending: list[tuple[int, dict]] = []
+        for i, (kind, payload) in enumerate(dedup):
+            if kind == "final":
+                work_results[i] = payload
+                continue
+            normalized = payload
+            fetch_kind, fetch_payload = fetched[normalized]
+            if fetch_kind == "final":
+                work_results[i] = fetch_payload
+                continue
+            # ``supplemental`` describes one specific page, so it cannot be
+            # handed to a batch. A thin CrossRef record still gets its own
+            # landing page read, per DOI, on either path.
+            page_meta = None if is_batch else supplemental
+            if page_meta is None:
+                page_meta = _resolve_thin_crossref_record(fetch_payload, normalized, ctx)
+            built = _build_one_doi_item_data(fetch_payload, normalized, template_fn,
+                                             tags, coll_keys, page_meta)
+            pending.append((i, built))
+
+        # Phase 3b: serialize check-and-create per DOI (#486).
+        #
+        # Phase 1's dedup ran before the CrossRef fetch, so a parallel add of
+        # the same DOI can have created the item in between — and there is no
+        # version to conflict on, so nothing downstream would catch it. The
+        # locks are per-DOI and taken in sorted order, which is what makes
+        # holding several of them at once deadlock-free.
+        #
+        # This costs one extra dedup read per DOI. It does not undo #A5/#A4:
+        # CrossRef is still one batched request per 50 DOIs and creates are
+        # still one POST per 50 — only the dedup read, which was always per
+        # DOI, happens twice.
+        #
+        # The OA PDF attach inside _create_and_attach_batch runs while these
+        # are held. That is deliberate and is not the thing the narrowing was
+        # protecting: a per-DOI lock held across that DOI's own download
+        # blocks only a concurrent add of the same item, never unrelated
+        # work, which is the opposite of the global lock's blast radius.
+        with contextlib.ExitStack() as identifier_locks:
+            for doi_key in sorted({payload["doi"] for _, payload in pending
+                                   if payload.get("doi")}):
+                identifier_locks.enter_context(
+                    _helpers.identifier_lock("doi", doi_key)
                 )
 
-        ctx.info(f"Fetching metadata for DOI: {normalized}")
+            if if_exists != "duplicate" and pending:
+                still_pending: list[tuple[int, dict]] = []
+                for i, payload in pending:
+                    existing = _helpers.find_existing_items(
+                        read_zot, doi=payload["doi"], ctx=ctx
+                    )
+                    if existing:
+                        work_results[i] = _handle_existing_item(
+                            write_zot, existing, coll_keys, tags, if_exists,
+                            matched_by=f"DOI {payload['doi']}", ctx=ctx,
+                        )
+                    else:
+                        still_pending.append((i, payload))
+                pending = still_pending
 
-        # CrossRef "polite pool": identifying via mailto gives higher rate limits
-        # and priority routing. See https://api.crossref.org/swagger-ui/index.html
-        crossref_url = f"https://api.crossref.org/works/{normalized}"
-        contact_email = os.environ.get("ZOTERO_MCP_CONTACT_EMAIL", "").strip()
-        if contact_email:
-            crossref_url += f"?mailto={contact_email}"
-
-        resp = requests.get(
-            crossref_url,
-            headers={
-                "User-Agent": "zotero-mcp/1.0 (https://github.com/54yyyu/zotero-mcp)",
-                "Accept": "application/json",
-            },
-            timeout=15,
-        )
-
-        if resp.status_code == 404:
-            return f"DOI not found on CrossRef: {normalized}"
-        resp.raise_for_status()
-
-        cr = resp.json().get("message", {})
-
-        # Determine Zotero item type
-        cr_type = cr.get("type", "")
-        zot_type = CROSSREF_TYPE_MAP.get(cr_type, "document")
-
-        # Get valid fields from item template
-        template = write_zot.item_template(zot_type)
-        item_data = dict(template)
-
-        # Map fields
-        title_list = cr.get("title", [])
-        if title_list and "title" in item_data:
-            item_data["title"] = title_list[0]
-
-        # Creators
-        creators = []
-        for author in cr.get("author", []):
-            if "family" in author:
-                creators.append({
-                    "creatorType": "author",
-                    "firstName": author.get("given", ""),
-                    "lastName": author["family"],
-                })
-            elif "name" in author:
-                creators.append({
-                    "creatorType": "author",
-                    "name": author["name"],
-                })
-        for editor in cr.get("editor", []):
-            if "family" in editor:
-                creators.append({
-                    "creatorType": "editor",
-                    "firstName": editor.get("given", ""),
-                    "lastName": editor["family"],
-                })
-            elif "name" in editor:
-                creators.append({
-                    "creatorType": "editor",
-                    "name": editor["name"],
-                })
-        if creators:
-            item_data["creators"] = creators
-
-        # Date
-        date_parts = cr.get("published", cr.get("created", {})).get("date-parts", [[]])
-        if date_parts and date_parts[0]:
-            parts = date_parts[0]
-            item_data["date"] = "-".join(str(p) for p in parts)
-
-        # Simple string fields
-        field_map = {
-            "DOI": normalized,
-            "url": cr.get("URL", ""),
-            "volume": cr.get("volume", ""),
-            "issue": cr.get("issue", ""),
-            "pages": cr.get("page", ""),
-            "publisher": cr.get("publisher", ""),
-            "ISSN": (cr.get("ISSN") or [""])[0],
-        }
-
-        container = (cr.get("container-title") or [""])[0]
-        if container:
-            field_map["publicationTitle"] = container
-
-        abstract = _utils.clean_html(cr.get("abstract", ""), collapse_whitespace=True)
-        if abstract:
-            field_map["abstractNote"] = abstract
-
-        for field, value in field_map.items():
-            if field in item_data and value:
-                item_data[field] = value
-
-        # Tags
-        tag_list = _helpers._normalize_str_list_input(tags, "tags")
-        if tag_list:
-            item_data["tags"] = [{"tag": t} for t in tag_list]
-
-        # Collections (resolved to live keys above, before the CrossRef fetch)
-        if coll_keys:
-            item_data["collections"] = coll_keys
-
-        # Create item
-        result = write_zot.create_items([item_data])
-
-        if isinstance(result, dict) and result.get("success"):
-            item_key = next(iter(result["success"].values()))
-            title = item_data.get("title", normalized)
-
-            # Defensive: pyzotero's atomic ``item["collections"]`` filing is
-            # intermittent (#235) — reconcile membership before reporting success
-            # so the caller sees the real routing state.
-            missing = _helpers.ensure_collection_membership(
-                write_zot, item_key, coll_keys, ctx=ctx
+            created = (
+                _create_and_attach_batch(
+                    write_zot, [payload["item_data"] for _, payload in pending],
+                    attach_mode, ctx,
+                    crossref_by_doi={payload["doi"]: payload["cr"]
+                                     for _, payload in pending},
+                )
+                if pending else []
             )
-            collections_status = _collections_status(coll_keys, missing)
+            for (i, payload), cr_result in zip(pending, created):
+                work_results[i] = _render_doi_create_result(
+                    cr_result, payload["zot_type"], payload["doi"], coll_keys,
+                    payload["type_note"],
+                )
 
-            # Attempt open-access PDF attachment (pass CrossRef metadata for arXiv fallback)
-            pdf_status = _helpers._try_attach_oa_pdf(write_zot, item_key, normalized, ctx,
-                                            crossref_metadata=cr,
-                                            attach_mode=attach_mode)
+        # Expand back to one result per requested token.
+        results: list[str] = [None] * len(doi_list)
+        for slot, i in enumerate(canonical):
+            results[i] = work_results[slot]
+        for i, canon_i in duplicate_of.items():
+            results[i] = _duplicate_of_message("DOI", canon_i + 1)
 
-            return (
-                f"Successfully added: **{title}**\n\n"
-                f"Item key: `{item_key}`\n"
-                f"Type: {zot_type}\n"
-                f"DOI: {normalized}\n"
-                f"Collections: {collections_status}\n"
-                f"PDF: {pdf_status}\n\n"
-                "_Note: To include this item in semantic search, run "
-                "zotero_update_search_database._"
-            )
-        return f"Failed to create item: {result}"
+        if is_batch:
+            return _format_multi_result("DOI", doi_list, results)
+        return results[0]
 
-    except requests.Timeout:
-        return "Error: CrossRef API request timed out. Please try again."
-    except requests.RequestException as e:
-        return f"Error fetching from CrossRef: {e}"
     except Exception as e:
         ctx.error(f"Error adding by DOI: {e}")
         return f"Error adding by DOI: {e}"
 
 
+# CrossRef types that describe a *container* rather than a work. A DOI
+# registered under one of these routinely carries no title, no authors and no
+# volume/issue/page — the article's own landing page is then the only source
+# for them.
+_THIN_CROSSREF_TYPES = frozenset({"journal-issue", "journal-volume", "journal"})
+
+
+def _crossref_record_is_thin(cr: dict, cr_type: str) -> bool:
+    """True when CrossRef's answer cannot stand on its own.
+
+    Deliberately narrow: an untitled record is useless whatever else it has,
+    and a container type is the shape that produces one. Both are rare, so
+    the landing-page fetch this gates stays rare too.
+    """
+    title = cr.get("title")
+    if isinstance(title, list):
+        title = next((t for t in title if t), "")
+    if not (title or "").strip():
+        return True
+    return cr_type in _THIN_CROSSREF_TYPES
+
+
+# Publisher pages are arbitrary third-party HTML. Read a bounded prefix of
+# one: the citation block lives in <head>, so a couple of hundred KB always
+# covers it, and a pathological page must not be able to hold a write open.
+_EMBEDDED_METADATA_MAX_BYTES = 512 * 1024
+_EMBEDDED_METADATA_TIMEOUT = 15
+
+
+def _fetch_embedded_metadata(
+    url: str, ctx: Context
+) -> tuple[EmbeddedMetadata | None, str]:
+    """Fetch *url* and read the bibliographic meta tags out of its head.
+
+    Returns ``(metadata, reason)``. ``metadata`` is ``None`` when the page
+    could not be read, and ``reason`` then says why in one line, for the
+    caller to put in front of the user. Every failure here is non-fatal by
+    design — embedded metadata is an enrichment, and a publisher being slow
+    or hostile must degrade the item, never fail the call — but a degraded
+    item that does not say it was degraded is how a library fills up with
+    URL-titled stubs nobody notices.
+    """
+    try:
+        resp = requests.get(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; zotero-mcp/1.0; "
+                    "+https://github.com/54yyyu/zotero-mcp)"
+                ),
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            timeout=_EMBEDDED_METADATA_TIMEOUT,
+            stream=True,
+        )
+        resp.raise_for_status()
+
+        content_type = resp.headers.get("Content-Type", "").lower()
+        if content_type and "html" not in content_type:
+            ctx.info(f"Not an HTML page ({content_type}); skipping metadata read")
+            return None, f"the URL is not an HTML page ({content_type})"
+
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=16384):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= _EMBEDDED_METADATA_MAX_BYTES:
+                break
+        resp.close()
+
+        raw = b"".join(chunks)
+        encoding = resp.encoding or "utf-8"
+        try:
+            html = raw.decode(encoding, errors="replace")
+        except LookupError:
+            html = raw.decode("utf-8", errors="replace")
+
+        return extract_embedded_metadata(html), ""
+
+    except requests.exceptions.SSLError as e:
+        # Seen in the wild on a university OJS host whose chain validates in
+        # browsers and curl but not under OpenSSL. Name it: silently filing a
+        # blank item invites the user to blame the importer.
+        ctx.info(f"TLS verification failed for {url}: {e}")
+        return None, "the site's HTTPS certificate could not be verified"
+    except requests.Timeout:
+        ctx.info(f"Timed out fetching {url}")
+        return None, "the page did not respond in time"
+    except Exception as e:
+        ctx.info(f"Could not read embedded metadata from {url}: {e}")
+        return None, f"the page could not be fetched ({type(e).__name__})"
+
+
+# Decorated, unlike its caller: every call in here is a Zotero API call,
+# with no third-party fetch to keep out of the lock. add_by_url used to
+# cover it by being decorated itself (#A5b).
 @with_zotero_api_lock
-def add_by_url(
+def _add_from_embedded_metadata(
     url: str,
+    meta: EmbeddedMetadata,
+    coll_keys: list[str],
+    tags,
+    write_zot,
+    ctx: Context,
+) -> str:
+    """Create an item from a page's own citation meta tags."""
+    if meta.looks_like_article():
+        zot_type = "journalArticle"
+    elif meta.looks_like_chapter():
+        zot_type = "bookSection"
+    else:
+        zot_type = "webpage"
+
+    template = dict(write_zot.item_template(zot_type))
+    _set = _citation_import._set_if_in_template
+
+    _set(template, "title", meta.title or url)
+    _set(template, "publicationTitle", meta.publication)
+    _set(template, "bookTitle", meta.book_title)
+    _set(template, "publisher", meta.publisher)
+    _set(template, "volume", meta.volume)
+    _set(template, "issue", meta.issue)
+    _set(template, "pages", meta.pages)
+    _set(template, "date", meta.date)
+    _set(template, "DOI", meta.doi)
+    _set(template, "ISSN", meta.issn)
+    _set(template, "ISBN", meta.isbn)
+    _set(template, "language", meta.language)
+    _set(template, "url", url)
+    if meta.abstract:
+        _set(template, "abstractNote",
+             _utils.clean_html(meta.abstract, collapse_whitespace=True))
+    if meta.institution and "publisher" in template and not template["publisher"]:
+        template["publisher"] = meta.institution
+
+    if meta.authors and "creators" in template:
+        template["creators"] = [
+            {"creatorType": "author", "firstName": first, "lastName": last}
+            for first, last in meta.authors
+        ]
+
+    tag_list = _helpers._normalize_str_list_input(tags, "tags")
+    if tag_list:
+        template["tags"] = [{"tag": t} for t in tag_list]
+    if coll_keys:
+        template["collections"] = coll_keys
+
+    ctx.info(f"Creating {zot_type} from embedded metadata for: {url}")
+    result = write_zot.create_items([template])
+    if isinstance(result, dict) and result.get("success"):
+        item_key = next(iter(result["success"].values()))
+        missing = _helpers.ensure_collection_membership(
+            write_zot, item_key, coll_keys, ctx=ctx
+        )
+        return (
+            f"Successfully added: **{template.get('title', url)}**\n\n"
+            f"Item key: `{item_key}`\n"
+            f"Type: {zot_type}\n"
+            f"Source: metadata embedded in the page\n"
+            f"Collections: {_collections_status(coll_keys, missing)}\n\n"
+            "_Note: To include this item in semantic search, run "
+            "zotero_update_search_database._"
+        )
+    return f"Failed to create item: {result}"
+
+
+def add_by_url(
+    url: str | list[str],
     collections: list[str] | str | None = None,
     tags: list[str] | str | None = None,
     attach_mode: str = "auto",
@@ -1143,6 +1922,36 @@ def add_by_url(
     *,
     ctx: Context
 ) -> str:
+    # NOT decorated with @with_zotero_api_lock: the DOI/arXiv branches
+    # below delegate to add_by_doi/_add_by_arxiv, which manage their own
+    # scoped locking; the generic-webpage branch takes the lock itself,
+    # narrowly, around its own Zotero API calls (#A5b).
+    #
+    # ``url`` may name several URLs at once — see add_by_doi's batch comment
+    # above; the same pattern applies here, and a batch may freely mix DOI-
+    # redirect, arXiv, and generic-webpage URLs since each token is
+    # classified independently below.
+    try:
+        # See add_by_doi: splitting inside the try keeps malformed structured
+        # input a returned error string rather than a traceback.
+        tokens = _split_multi_value(url, "url", _looks_like_url)
+    except ValueError as e:
+        return f"Error adding by URL: {e}"
+    if len(tokens) > 1:
+        canonical, duplicate_of = _dedupe_multi_tokens(tokens, _url_dedup_key)
+        results: list[str] = [None] * len(tokens)
+        for i in canonical:
+            results[i] = add_by_url(
+                url=tokens[i], collections=collections, tags=tags,
+                attach_mode=attach_mode, if_exists=if_exists,
+                create_missing_collections=create_missing_collections,
+                ctx=ctx)
+        for i, canon_i in duplicate_of.items():
+            results[i] = _duplicate_of_message("URL", canon_i + 1)
+        return _format_multi_result("URL", tokens, results)
+    if tokens:
+        url = tokens[0]
+
     try:
         read_zot, write_zot = _helpers._get_write_client(ctx)
     except ValueError as e:
@@ -1171,55 +1980,117 @@ def add_by_url(
                                  if_exists=if_exists,
                                  create_missing_collections=create_missing_collections)
 
-        # Generic webpage
-        try:
-            coll_keys = _resolve_collections_arg(
-                read_zot, collections, ctx,
-                create_missing=create_missing_collections, write_zot=write_zot,
-            )
-        except ValueError as e:
-            return f"Error: {e}"
-
-        if if_exists != "duplicate":
-            existing = _helpers.find_existing_items(read_zot, url=url, ctx=ctx)
-            if existing:
-                return _handle_existing_item(
-                    write_zot, existing, coll_keys, tags, if_exists,
-                    matched_by=f"URL {url}", ctx=ctx,
+        # Generic webpage. The lock covers only the Zotero API calls: reading
+        # the page below, and the add_by_doi delegation it can lead to, are
+        # third-party network work — exactly what this narrowing exists to
+        # keep out of the lock (#A5b).
+        with zotero_api_lock():
+            try:
+                coll_keys = _resolve_collections_arg(
+                    read_zot, collections, ctx,
+                    create_missing=create_missing_collections, write_zot=write_zot,
                 )
+            except ValueError as e:
+                return f"Error: {e}"
 
-        ctx.info(f"Creating webpage item for: {url}")
-        template = write_zot.item_template("webpage")
-        template["url"] = url
-        template["title"] = url
-        template["accessDate"] = ""
+            if if_exists != "duplicate":
+                existing = _helpers.find_existing_items(read_zot, url=url, ctx=ctx)
+                if existing:
+                    return _handle_existing_item(
+                        write_zot, existing, coll_keys, tags, if_exists,
+                        matched_by=f"URL {url}", ctx=ctx,
+                    )
 
-        tag_list = _helpers._normalize_str_list_input(tags, "tags")
-        if tag_list:
-            template["tags"] = [{"tag": t} for t in tag_list]
-        if coll_keys:
-            template["collections"] = coll_keys
+        # Publisher landing pages carry the article's citation in their own
+        # <head> (Highwire citation_* / Dublin Core). Zotero's browser
+        # connector reads exactly those tags, which is why saving a paper
+        # from the browser yields a full record while this path used to
+        # produce a webpage whose only populated field was the URL.
+        embedded, embed_problem = _fetch_embedded_metadata(url, ctx)
 
-        result = write_zot.create_items([template])
-        if isinstance(result, dict) and result.get("success"):
-            item_key = next(iter(result["success"].values()))
-            missing = _helpers.ensure_collection_membership(
-                write_zot, item_key, coll_keys, ctx=ctx
+        if embedded is not None and embedded.doi:
+            # A declared DOI is the better route: add_by_doi already handles
+            # DOI de-duplication, CrossRef enrichment and open-access PDF
+            # attachment. Fall back to the page's own tags if CrossRef does
+            # not know the DOI.
+            ctx.info(f"Page declares DOI {embedded.doi}; adding by DOI")
+            doi_result = add_by_doi(
+                doi=embedded.doi, collections=collections, tags=tags,
+                attach_mode=attach_mode, if_exists=if_exists,
+                create_missing_collections=create_missing_collections,
+                supplemental=embedded,
+                ctx=ctx,
             )
-            return (
-                f"Created webpage item for: {url}\n\nItem key: `{item_key}`\n"
-                f"Collections: {_collections_status(coll_keys, missing)}\n\n"
-                "_Note: To include this item in semantic search, run "
-                "zotero_update_search_database._"
+            if not doi_result.startswith(("DOI not found", "Error", "Failed")):
+                return doi_result
+            ctx.info(
+                f"DOI route failed ({doi_result.splitlines()[0]}); "
+                "falling back to the page's embedded metadata"
             )
-        return f"Failed to create item: {result}"
+
+        if embedded is not None and embedded.is_usable():
+            return _add_from_embedded_metadata(
+                url, embedded, coll_keys, tags, write_zot, ctx,
+            )
+
+        if embedded is not None and not embedded.is_usable():
+            embed_problem = "the page carries no citation metadata"
+
+        # Serialize check-and-create for this identifier (#486). The dedup
+        # check above ran before the fetch, so a parallel add can have created
+        # the item in between; re-checking inside the lock is what makes the
+        # pair atomic. The identifier lock is always taken *outside* the API
+        # lock, so the two are acquired in one consistent order everywhere.
+        with _helpers.identifier_lock("url", url), zotero_api_lock():
+            if if_exists != "duplicate":
+                existing = _helpers.find_existing_items(read_zot, url=url, ctx=ctx)
+                if existing:
+                    return _handle_existing_item(
+                        write_zot, existing, coll_keys, tags, if_exists,
+                        matched_by=f"URL {url}", ctx=ctx,
+                    )
+
+            ctx.info(f"Creating webpage item for: {url}")
+            template = write_zot.item_template("webpage")
+            template["url"] = url
+            template["title"] = url
+            template["accessDate"] = ""
+
+            tag_list = _helpers._normalize_str_list_input(tags, "tags")
+            if tag_list:
+                template["tags"] = [{"tag": t} for t in tag_list]
+            if coll_keys:
+                template["collections"] = coll_keys
+
+            result = write_zot.create_items([template])
+            if isinstance(result, dict) and result.get("success"):
+                item_key = next(iter(result["success"].values()))
+                missing = _helpers.ensure_collection_membership(
+                    write_zot, item_key, coll_keys, ctx=ctx
+                )
+                # This item has a URL and nothing else. Say why, so the caller
+                # can decide whether to fix it rather than discovering a blank
+                # record later.
+                reason = (
+                    f"\nOnly the URL could be recorded: {embed_problem}. "
+                    "Add the item by DOI if you have one, or set the fields with "
+                    "zotero_update_item."
+                    if embed_problem else ""
+                )
+                return (
+                    f"Created webpage item for: {url}\n\nItem key: `{item_key}`\n"
+                    f"Collections: {_collections_status(coll_keys, missing)}\n"
+                    f"{reason}\n"
+                    "_Note: To include this item in semantic search, run "
+                    "zotero_update_search_database._"
+                )
+            return f"Failed to create item: {result}"
 
     except Exception as e:
         ctx.error(f"Error adding by URL: {e}")
         return f"Error adding by URL: {e}"
 
 
-@with_zotero_api_lock
 def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto",
                   read_zot=None, if_exists="duplicate",
                   create_missing_collections=False):
@@ -1233,24 +2104,30 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
     infrastructure. The fallback is best-effort — CrossRef may also lack a
     very recent preprint — so a clear, actionable message is returned when
     both routes fail, never a bare timeout.
-    """
-    try:
-        coll_keys = _resolve_collections_arg(
-            read_zot or write_zot, collections, ctx,
-            create_missing=create_missing_collections, write_zot=write_zot,
-        )
-    except ValueError as e:
-        return f"Error: {e}"
 
-    if if_exists != "duplicate":
-        existing = _helpers.find_existing_items(
-            read_zot or write_zot, arxiv_id=arxiv_id, ctx=ctx
-        )
-        if existing:
-            return _handle_existing_item(
-                write_zot, existing, coll_keys, tags, if_exists,
-                matched_by=f"arXiv ID {arxiv_id}", ctx=ctx,
+    NOT decorated with @with_zotero_api_lock: the lock only needs to cover
+    the Zotero API calls, taken below in short scoped blocks, so a slow
+    arXiv API round trip or PDF download doesn't hold it and starve every
+    other MCP request (#A5b — mirrors add_by_doi's narrowing).
+    """
+    with zotero_api_lock():
+        try:
+            coll_keys = _resolve_collections_arg(
+                read_zot or write_zot, collections, ctx,
+                create_missing=create_missing_collections, write_zot=write_zot,
             )
+        except ValueError as e:
+            return f"Error: {e}"
+
+        if if_exists != "duplicate":
+            existing = _helpers.find_existing_items(
+                read_zot or write_zot, arxiv_id=arxiv_id, ctx=ctx
+            )
+            if existing:
+                return _handle_existing_item(
+                    write_zot, existing, coll_keys, tags, if_exists,
+                    matched_by=f"arXiv ID {arxiv_id}", ctx=ctx,
+                )
 
     ctx.info(f"Fetching arXiv metadata for: {arxiv_id}")
 
@@ -1308,6 +2185,14 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
             result = None
             ctx.info(f"CrossRef fallback errored: {e}")
         # add_by_doi returns a human string; treat "not found"/"Error" as a miss.
+        #
+        # Pre-existing fragility, unrelated to arxiv_doi always being a
+        # single DOI (so add_by_doi's batch path above never triggers here):
+        # this sniffs the *rendered* message rather than a structured
+        # result, so it silently breaks if either prefix's wording ever
+        # changes. The robust fix is the same one noted in add_by_doi's
+        # batch comment — a single-item worker that returns a dict with an
+        # explicit ok/error field, checked here instead of string-matching.
         if result and not result.startswith(("DOI not found", "Error")):
             return result
         return (
@@ -1353,64 +2238,100 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
             else:
                 authors.append({"creatorType": "author", "name": name})
 
-    template = write_zot.item_template("preprint")
-    template["title"] = title
-    if authors:
-        template["creators"] = authors
-    if abstract and "abstractNote" in template:
-        template["abstractNote"] = abstract
-    if published and "date" in template:
-        template["date"] = published
-    template["url"] = f"https://arxiv.org/abs/{arxiv_id}"
-    if "extra" in template:
-        template["extra"] = f"arXiv:{arxiv_id}"
+    # Serialize check-and-create for this arXiv ID (#486) — see add_by_url's
+    # note; the metadata fetch above sits between the first check and here.
+    with _helpers.identifier_lock("arxiv", arxiv_id), zotero_api_lock():
+        if if_exists != "duplicate":
+            existing = _helpers.find_existing_items(
+                read_zot or write_zot, arxiv_id=arxiv_id, ctx=ctx
+            )
+            if existing:
+                return _handle_existing_item(
+                    write_zot, existing, coll_keys, tags, if_exists,
+                    matched_by=f"arXiv ID {arxiv_id}", ctx=ctx,
+                )
 
-    tag_list = _helpers._normalize_str_list_input(tags, "tags")
-    if tag_list:
-        template["tags"] = [{"tag": t} for t in tag_list]
-    if coll_keys:
-        template["collections"] = coll_keys
+        template = write_zot.item_template("preprint")
+        template["title"] = title
+        if authors:
+            template["creators"] = authors
+        if abstract and "abstractNote" in template:
+            template["abstractNote"] = abstract
+        if published and "date" in template:
+            template["date"] = published
+        template["url"] = f"https://arxiv.org/abs/{arxiv_id}"
+        if "extra" in template:
+            template["extra"] = f"arXiv:{arxiv_id}"
 
-    result = write_zot.create_items([template])
-    if isinstance(result, dict) and result.get("success"):
+        tag_list = _helpers._normalize_str_list_input(tags, "tags")
+        if tag_list:
+            template["tags"] = [{"tag": t} for t in tag_list]
+        if coll_keys:
+            template["collections"] = coll_keys
+
+        result = write_zot.create_items([template])
+        if not (isinstance(result, dict) and result.get("success")):
+            return f"Failed to create arXiv item: {result}"
+
         item_key = next(iter(result["success"].values()))
         missing = _helpers.ensure_collection_membership(
             write_zot, item_key, coll_keys, ctx=ctx
         )
 
-        # arXiv always has a free PDF — try to attach it
-        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-        pdf_status = "no PDF attached"
-        if attach_mode == "none":
-            # Honour the caller's explicit opt-out: skip the PDF download/upload
-            # entirely. Without this, the arXiv path always fetched + uploaded
-            # the PDF regardless of attach_mode (only "linked_url" was special-
-            # cased), so attach_mode="none" did far more network/cloud work than
-            # asked — a slow upload here is a prime candidate for wedging the
-            # process under the global API lock.
-            pdf_status = "skipped (attach_mode=none)"
-        elif attach_mode == "linked_url":
-            # Bookmark the PDF URL only — no binary upload. Useful for users who
-            # sync attachment files outside of Zotero's official storage (e.g. WebDAV).
-            try:
-                if _helpers._attach_pdf_linked_url(write_zot, pdf_url, item_key, ctx):
-                    pdf_status = "PDF linked (URL only, no upload)"
-                else:
-                    pdf_status = "linked URL attachment failed"
-            except Exception as e:
-                ctx.info(f"arXiv linked URL attachment failed (non-fatal): {e}")
-                pdf_status = f"no PDF attached ({e})"
-        else:
-            try:
-                pdf_resp = requests.get(pdf_url, timeout=30, stream=True)
-                pdf_resp.raise_for_status()
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    filename = f"arxiv_{arxiv_id.replace('/', '_')}.pdf"
-                    filepath = os.path.join(tmpdir, filename)
-                    with open(filepath, "wb") as f:
-                        for chunk in pdf_resp.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    webdav_suffix = _helpers._webdav_first_attach(
+    # arXiv always has a free PDF — try to attach it. Outside the lock: the
+    # download and upload are outbound network work that has nothing to do
+    # with Zotero API serialization — write_zot is always the cloud Web API
+    # client (never the single-threaded local server the lock exists to
+    # protect). A6's version-checked retry guards concurrent *updates* to an
+    # item that already exists; it does not — and structurally cannot —
+    # stop two concurrent adds from each creating one, because two
+    # create_items() POSTs yield two new keys and no version to conflict on.
+    # Narrowing the lock leaves that race open deliberately: serializing adds
+    # is a separate question from keeping third-party network work out of the
+    # lock, tracked in #486 (#A5b — mirrors add_by_doi's narrowing).
+    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    pdf_status = "no PDF attached"
+    if attach_mode == "none":
+        # Honour the caller's explicit opt-out: skip the PDF download/upload
+        # entirely. Without this, the arXiv path always fetched + uploaded
+        # the PDF regardless of attach_mode (only "linked_url" was special-
+        # cased), so attach_mode="none" did far more network/cloud work than
+        # asked — a slow upload here is a prime candidate for wedging the
+        # process under the global API lock.
+        pdf_status = "skipped (attach_mode=none)"
+    elif attach_mode == "linked_url":
+        # Bookmark the PDF URL only — no binary upload. Useful for users who
+        # sync attachment files outside of Zotero's official storage (e.g. WebDAV).
+        try:
+            if _helpers._attach_pdf_linked_url(write_zot, pdf_url, item_key, ctx):
+                pdf_status = "PDF linked (URL only, no upload)"
+            else:
+                pdf_status = "linked URL attachment failed"
+        except Exception as e:
+            ctx.info(f"arXiv linked URL attachment failed (non-fatal): {e}")
+            pdf_status = f"no PDF attached ({e})"
+    else:
+        attach_ok = False
+        try:
+            pdf_resp = requests.get(pdf_url, timeout=30, stream=True)
+            pdf_resp.raise_for_status()
+            with tempfile.TemporaryDirectory() as tmpdir:
+                filename = f"arxiv_{arxiv_id.replace('/', '_')}.pdf"
+                filepath = os.path.join(tmpdir, filename)
+                with open(filepath, "wb") as f:
+                    for chunk in pdf_resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                webdav_suffix = _helpers._webdav_first_attach(
+                    write_zot,
+                    filename,
+                    filepath,
+                    item_key,
+                    ctx,
+                    content_type="application/pdf",
+                )
+                attach_ok = True
+                if webdav_suffix is None:
+                    attach_ok, webdav_suffix, _key = _helpers._attach_and_verify(
                         write_zot,
                         filename,
                         filepath,
@@ -1418,35 +2339,30 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
                         ctx,
                         content_type="application/pdf",
                     )
-                    attach_ok = True
-                    if webdav_suffix is None:
-                        attach_ok, webdav_suffix, _key = _helpers._attach_and_verify(
-                            write_zot,
-                            filename,
-                            filepath,
-                            item_key,
-                            ctx,
-                            content_type="application/pdf",
-                        )
-                pdf_status = (
-                    "PDF attached" + webdav_suffix
-                    if attach_ok
-                    else f"no PDF attached ({webdav_suffix})"
-                )
-            except Exception as e:
-                ctx.info(f"arXiv PDF attachment failed (non-fatal): {e}")
-                pdf_status = f"no PDF attached ({e})"
+            pdf_status = (
+                "PDF attached" + webdav_suffix
+                if attach_ok
+                else f"no PDF attached ({webdav_suffix})"
+            )
+        except Exception as e:
+            ctx.info(f"arXiv PDF attachment failed (non-fatal): {e}")
+            pdf_status = f"no PDF attached ({e})"
 
-        return (
-            f"Successfully added arXiv paper: **{title}**\n\n"
-            f"Item key: `{item_key}`\n"
-            f"arXiv ID: {arxiv_id}\n"
-            f"Collections: {_collections_status(coll_keys, missing)}\n"
-            f"PDF: {pdf_status}\n\n"
-            "_Note: To include this item in semantic search, run "
-            "zotero_update_search_database._"
-        )
-    return f"Failed to create arXiv item: {result}"
+        if attach_mode == "required" and not attach_ok:
+            return (
+                f"Error: item created (key: `{item_key}`) but attach_mode='required' "
+                f"found no open-access PDF: {pdf_status}"
+            )
+
+    return (
+        f"Successfully added arXiv paper: **{title}**\n\n"
+        f"Item key: `{item_key}`\n"
+        f"arXiv ID: {arxiv_id}\n"
+        f"Collections: {_collections_status(coll_keys, missing)}\n"
+        f"PDF: {pdf_status}\n\n"
+        "_Note: To include this item in semantic search, run "
+        "zotero_update_search_database._"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1578,7 +2494,7 @@ def _lookup_isbn_google_books(isbn, ctx):
 
 
 def add_by_isbn(
-    isbn: str,
+    isbn: str | list[str],
     collections: list[str] | str | None = None,
     tags: list[str] | str | None = None,
     if_exists: Literal["duplicate", "file", "skip"] = "duplicate",
@@ -1586,6 +2502,29 @@ def add_by_isbn(
     *,
     ctx: Context
 ) -> str:
+    # ``isbn`` may name several ISBNs at once — see add_by_doi's batch
+    # comment above; the same pattern applies here.
+    try:
+        # See add_by_doi: splitting inside the try keeps malformed structured
+        # input a returned error string rather than a traceback.
+        tokens = _split_multi_value(isbn, "isbn", _helpers._normalize_isbn)
+    except ValueError as e:
+        return f"Error adding by ISBN: {e}"
+    if len(tokens) > 1:
+        canonical, duplicate_of = _dedupe_multi_tokens(tokens, _isbn_dedup_key)
+        results: list[str] = [None] * len(tokens)
+        for i in canonical:
+            results[i] = add_by_isbn(
+                isbn=tokens[i], collections=collections, tags=tags,
+                if_exists=if_exists,
+                create_missing_collections=create_missing_collections,
+                ctx=ctx)
+        for i, canon_i in duplicate_of.items():
+            results[i] = _duplicate_of_message("ISBN", canon_i + 1)
+        return _format_multi_result("ISBN", tokens, results)
+    if tokens:
+        isbn = tokens[0]
+
     try:
         read_zot, write_zot = _helpers._get_write_client(ctx)
     except ValueError as e:
@@ -1653,7 +2592,22 @@ def add_by_isbn(
         if coll_keys:
             item_data["collections"] = coll_keys
 
-        result = write_zot.create_items([item_data])
+        # Serialize check-and-create for this ISBN (#486). The dedup check
+        # above ran before the Open Library / Google Books lookups, so a
+        # parallel add of the same book can have created it in between. The
+        # check is repeated here rather than moved because the lookups must
+        # stay outside the lock — that is the whole point of the narrowing.
+        with _helpers.identifier_lock("isbn", normalized):
+            if if_exists != "duplicate":
+                existing = _helpers.find_existing_items(
+                    read_zot, isbn=normalized, ctx=ctx
+                )
+                if existing:
+                    return _handle_existing_item(
+                        write_zot, existing, coll_keys, tags, if_exists,
+                        matched_by=f"ISBN {normalized}", ctx=ctx,
+                    )
+            result = write_zot.create_items([item_data])
         if isinstance(result, dict) and result.get("success"):
             item_key = next(iter(result["success"].values()))
             missing = _helpers.ensure_collection_membership(
@@ -1957,6 +2911,10 @@ def update_item(
 
         known_fields = _schema.valid_fields(item_type)
         skipped = []
+        # Counted separately from ``changes``: a valid field whose value
+        # already matches records no change but was still accepted, so the
+        # request was not "every field invalid".
+        accepted = 0
         for field, value in field_updates.items():
             actual = _schema.resolve_field(item_type, field)
             param_name = _UPDATE_ITEM_API_TO_PARAM.get(field, field)
@@ -1964,6 +2922,7 @@ def update_item(
             if not is_valid:
                 skipped.append(param_name)
                 continue
+            accepted += 1
             if actual in data:
                 old = data[actual]
                 if old != value:
@@ -2026,24 +2985,44 @@ def update_item(
                     f"- **collections**: replaced {old_collections} -> {deduped}"
                 )
 
+        # A skipped field is a dropped write, not a footnote. Reporting it
+        # under a "Successfully updated" headline reads as "done" to a caller,
+        # which is how an item can sit in the wrong type indefinitely: the
+        # fields that would make it right are silently discarded on every
+        # attempt. The headline states the partial outcome instead, and names
+        # the remedy — item_type migrates the item so the fields become valid.
         skip_warning = ""
         if skipped:
             item_type = data.get("itemType", "unknown")
             skip_warning = (
                 f"\n\nSkipped (not valid for item type "
                 f"'{item_type}'): {', '.join(skipped)}"
+                f"\nIf '{item_type}' is the wrong type for this item, pass "
+                f"item_type=... to migrate it; these fields can then be "
+                f"written."
             )
 
         if not changes:
+            # Every requested field was rejected — distinct from "the values
+            # you asked for were already set", which is a genuine no-op.
+            if skipped and not accepted:
+                return (
+                    f"No fields applied to item `{item_key}`: every requested "
+                    f"field is invalid for item type "
+                    f"'{data.get('itemType', 'unknown')}'." + skip_warning
+                )
             return "No changes to apply." + skip_warning
 
         resp = write_zot.update_item(item)
         if _helpers._handle_write_response(resp, ctx):
-            result = (
-                f"Successfully updated item `{item_key}`:\n\n"
-                + "\n".join(changes)
-            )
-            return result + skip_warning
+            if skipped:
+                headline = (
+                    f"Partially updated item `{item_key}` — "
+                    f"{len(changes)} applied, {len(skipped)} skipped:"
+                )
+            else:
+                headline = f"Successfully updated item `{item_key}`:"
+            return f"{headline}\n\n" + "\n".join(changes) + skip_warning
         return "Failed to update item: write operation returned failure"
 
     except ValueError as e:
@@ -2133,13 +3112,98 @@ def delete_item(
         return f"Error trashing item: {str(e)}"
 
 
+# ---------------------------------------------------------------------------
+# Duplicate detection — shared by find_duplicates and merge_duplicates
+# ---------------------------------------------------------------------------
+
+# Whole-library scan ceiling. Past this a caller wants collection_key instead.
+_DUP_SCAN_MAX_ITEMS = 5000
+
+# find_duplicates renders one compact line per item of already-grouped
+# duplicates, so it does not have the token-budget problem that the shared
+# _normalize_limit ceiling of 100 exists to solve (#394). Groups beyond this
+# stay reachable through `offset`.
+_DUP_GROUP_MAX_LIMIT = 500
+
+
+def _normalize_dup_title(title: str | None) -> str:
+    """Lowercase, strip punctuation and a leading article, collapse spaces."""
+    t = (title or "").lower().strip()
+    t = re.sub(r'[^\w\s]', '', t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    for article in ("a ", "an ", "the "):
+        if t.startswith(article):
+            t = t[len(article):]
+    return t
+
+
+def _collect_duplicate_groups(zot, method, collection_key=None):
+    """Group the active library's items into duplicate candidates.
+
+    Returns ``(groups, error)``. ``groups`` maps ``"doi:<doi>"`` /
+    ``"title:<normalized>"`` to the items sharing that key, keeping only keys
+    with two or more items, in sorted key order so that paging over it is
+    stable across calls. ``error`` is a message to hand straight back to the
+    caller (library too large), in which case ``groups`` is empty.
+
+    Both zotero_find_duplicates and zotero_merge_duplicates(auto=True) go
+    through here, so "merge everything that qualifies" and "show me what
+    qualifies" can never disagree about what a group is.
+    """
+    items = []
+    start = 0
+    page_size = 100
+    while True:
+        if collection_key:
+            batch = zot.collection_items(collection_key, start=start, limit=page_size)
+        else:
+            batch = zot.items(start=start, limit=page_size)
+        if not batch:
+            break
+        items.extend(batch)
+        if len(batch) < page_size:
+            break
+        start += page_size
+        if len(items) > _DUP_SCAN_MAX_ITEMS:
+            break
+
+    if len(items) > _DUP_SCAN_MAX_ITEMS:
+        return {}, (
+            f"Library has {len(items)} items — too large for duplicate scan. "
+            "Please scope by collection_key to reduce the search."
+        )
+
+    groups: dict[str, list] = {}
+    for item in items:
+        data = item.get("data", {})
+        if data.get("itemType") in ("attachment", "note", "annotation"):
+            continue
+
+        keys_to_check = []
+        if method in ("title", "both"):
+            nt = _normalize_dup_title(data.get("title", ""))
+            if nt:
+                keys_to_check.append(("title", nt))
+        if method in ("doi", "both"):
+            doi_val = (data.get("DOI") or "").strip().lower()
+            if doi_val:
+                keys_to_check.append(("doi", doi_val))
+
+        for group_type, group_key in keys_to_check:
+            groups.setdefault(f"{group_type}:{group_key}", []).append(item)
+
+    return {k: v for k, v in sorted(groups.items()) if len(v) >= 2}, None
+
+
 @mcp.tool(
     name="zotero_find_duplicates",
     description=(
         "Scan the active library (or a single collection) for duplicate "
         "items and return candidate groups for review. This tool only "
         "IDENTIFIES duplicates — it doesn't merge them. Call "
-        "zotero_merge_duplicates to actually merge a group. "
+        "zotero_merge_duplicates to merge one group, or "
+        "zotero_merge_duplicates(auto=True) to merge every high-confidence "
+        "group in one pass. "
         "method: 'both' (default) — match on title OR DOI; 'title' — "
         "normalized-title match only (lowercase, punctuation-stripped); "
         "'doi' — exact DOI match only (safest for automation). Prefer "
@@ -2150,13 +3214,18 @@ def delete_item(
         "LIBRARY SIZE CAP: refuses to scan a library with > 5,000 items "
         "(the whole-library scan is O(n²) on titles) — on larger "
         "libraries you MUST pass collection_key to narrow the scope. "
-        "limit: max groups to return (default 50). "
-        "Returns a markdown block per group with keys, titles, DOIs, "
-        "and dateAdded — use this to decide which item to KEEP before "
-        "calling zotero_merge_duplicates(keeper_key=..., "
-        "duplicate_keys=[...]). "
+        "limit: max groups per call (default 50, max 500). "
+        "offset: 0-based index of the first group returned (default 0). "
+        "Group order is stable, so page a library with more groups than "
+        "`limit` by re-calling with offset=offset+limit. The output always "
+        "states which groups it shows out of how many were found, so a "
+        "partial page is never mistaken for the complete set. "
+        "Returns a markdown block per group with keys, titles, DOIs and "
+        "dateAdded — use it to pick the item to KEEP before calling "
+        "zotero_merge_duplicates. "
         "Read-only; works in local or web mode. "
-        "Example: zotero_find_duplicates(method='doi', limit=20)."
+        "Example: zotero_find_duplicates(method='doi', limit=20). "
+        "Paging: zotero_find_duplicates(limit=100, offset=100)."
     )
 )
 @with_zotero_api_lock
@@ -2164,136 +3233,509 @@ def find_duplicates(
     method: Literal["title", "doi", "both"] = "both",
     collection_key: str | None = None,
     limit: int | str | None = 50,
+    offset: int | str | None = 0,
     *,
     ctx: Context
 ) -> str:
     try:
         zot = _client.get_zotero_client()
-        limit = _helpers._normalize_limit(limit, default=50)
+        limit = _helpers._normalize_limit(limit, default=50, max_val=_DUP_GROUP_MAX_LIMIT)
+        offset = _helpers._normalize_offset(offset)
         ctx.info(f"Searching for duplicates (method={method})")
 
-        # Paginate manually instead of using zot.everything() which can
-        # cause "cannot pickle '_thread.RLock' object" in MCP contexts.
-        items = []
-        start = 0
-        page_size = 100
-        while True:
-            if collection_key:
-                batch = zot.collection_items(collection_key, start=start, limit=page_size)
-            else:
-                batch = zot.items(start=start, limit=page_size)
-            if not batch:
-                break
-            items.extend(batch)
-            if len(batch) < page_size:
-                break
-            start += page_size
-            if len(items) > 5000:
-                break
-
-        if len(items) > 5000:
-            return (
-                f"Library has {len(items)} items — too large for duplicate scan. "
-                "Please scope by collection_key to reduce the search."
-            )
-
-        # Normalize and group
-        def normalize_title(t):
-            t = (t or "").lower().strip()
-            t = re.sub(r'[^\w\s]', '', t)
-            t = re.sub(r'\s+', ' ', t).strip()
-            for article in ("a ", "an ", "the "):
-                if t.startswith(article):
-                    t = t[len(article):]
-            return t
-
-        groups = {}
-        for item in items:
-            data = item.get("data", {})
-            if data.get("itemType") in ("attachment", "note", "annotation"):
-                continue
-
-            keys_to_check = []
-            if method in ("title", "both"):
-                nt = normalize_title(data.get("title", ""))
-                if nt:
-                    keys_to_check.append(("title", nt))
-            if method in ("doi", "both"):
-                doi_val = (data.get("DOI") or "").strip().lower()
-                if doi_val:
-                    keys_to_check.append(("doi", doi_val))
-
-            for group_type, group_key in keys_to_check:
-                full_key = f"{group_type}:{group_key}"
-                if full_key not in groups:
-                    groups[full_key] = []
-                groups[full_key].append(item)
-
-        # Filter to groups with duplicates
-        dups = {k: v for k, v in groups.items() if len(v) >= 2}
+        dups, error = _collect_duplicate_groups(zot, method, collection_key)
+        if error:
+            return error
 
         if not dups:
             return "No duplicates found."
 
-        lines = [f"# Found {len(dups)} duplicate groups", ""]
-        shown = 0
-        for group_key, group_items in sorted(dups.items()):
-            if shown >= limit:
-                lines.append(f"\n... and {len(dups) - shown} more groups")
-                break
-            shown += 1
+        total = len(dups)
+        group_keys = list(dups.keys())
+        doi_total = sum(1 for k in group_keys if k.startswith("doi:"))
+        title_total = total - doi_total
+        header = (
+            f"# Found {total} duplicate groups "
+            f"({doi_total} by DOI, {title_total} by title)"
+        )
+
+        page_keys = group_keys[offset:offset + limit]
+        if not page_keys:
+            last_page_offset = ((total - 1) // limit) * limit
+            return (
+                f"{header}\n\n"
+                f"No groups at offset {offset}; the library has {total}. "
+                f"The last page starts at offset {last_page_offset}."
+            )
+
+        first_shown = offset + 1
+        last_shown = offset + len(page_keys)
+        lines = [
+            header,
+            "",
+            f"Showing groups {first_shown}-{last_shown} of {total}.",
+            "",
+        ]
+        for group_key in page_keys:
             lines.append(f"## Group: {group_key}")
-            for item in group_items:
+            for item in dups[group_key]:
                 d = item.get("data", {})
                 key = item.get("key", "?")
                 t = d.get("title", "Untitled")
                 dt = d.get("date", "")
+                added = d.get("dateAdded", "")
                 doi_val = d.get("DOI", "")
-                lines.append(f"- `{key}` — {t} ({dt}) {f'DOI:{doi_val}' if doi_val else ''}")
+                suffix = " ".join(
+                    part for part in (
+                        f"DOI:{doi_val}" if doi_val else "",
+                        f"added:{added[:10]}" if added else "",
+                    ) if part
+                )
+                lines.append(f"- `{key}` — {t} ({dt}) {suffix}".rstrip())
+            lines.append("")
+
+        remaining = total - last_shown
+        if remaining:
+            lines.append(
+                f"**{remaining} more group(s) not shown.** Call again with "
+                f"offset={last_shown} to continue."
+            )
             lines.append("")
 
         lines.append(
-            "\nTo merge, call `zotero_merge_duplicates` with the key you want to keep "
-            "and the keys to merge into it."
+            "To merge, call `zotero_merge_duplicates` with the key you want to keep "
+            "and the keys to merge into it, or `zotero_merge_duplicates(auto=True)` "
+            "to merge every high-confidence group in one pass."
         )
         return "\n".join(lines)
 
+    except ValueError as e:
+        return f"Input error: {e}"
     except Exception as e:
         ctx.error(f"Error finding duplicates: {e}")
         return f"Error finding duplicates: {e}"
 
 
+# ---------------------------------------------------------------------------
+# Merging — one code path for child re-parenting and trashing, shared by the
+# single-group merge and the auto/batch mode (#395)
+# ---------------------------------------------------------------------------
+
+# Ceiling on how many groups a single auto-merge call will act on. Auto mode
+# trashes items, so the blast radius of one call stays bounded even if the
+# scan finds more; the summary says when it clipped and paging is by re-running
+# after the merged groups are gone.
+_AUTO_MERGE_MAX_GROUPS = 200
+
+# How many declined groups to name before summarising the rest. The skip list
+# is informational, unlike the plan itself, and a library with hundreds of
+# them would otherwise bury the groups the caller has to review.
+_AUTO_MERGE_MAX_SKIP_LINES = 20
+
+
+def _render_skipped(skipped: list[tuple], heading: str) -> list[str]:
+    """Render the declined groups, naming at most _AUTO_MERGE_MAX_SKIP_LINES."""
+    lines = [heading, ""]
+    for group_key, keys, reason in skipped[:_AUTO_MERGE_MAX_SKIP_LINES]:
+        lines.append(f"- `{group_key}` ({', '.join(keys)}) — {reason}")
+    hidden = len(skipped) - _AUTO_MERGE_MAX_SKIP_LINES
+    if hidden > 0:
+        lines.append(f"- ... and {hidden} more skipped group(s)")
+    lines.append("")
+    return lines
+
+
+def _attachment_sig(data: dict) -> tuple:
+    """Identity of an attachment for "the keeper already has this one" checks."""
+    return (
+        data.get("contentType", ""),
+        data.get("filename", ""),
+        data.get("md5", ""),
+        data.get("url", ""),
+    )
+
+
+def _keeper_rank(entry: dict) -> tuple:
+    """Sort key for keeper selection — the lowest-sorting member is the keeper.
+
+    The documented heuristic, in order: most child items (attachments and
+    notes are the part of an item that is expensive to recreate), then an
+    item that carries an abstract over one that doesn't, then the oldest
+    dateAdded (the original save, which is likelier to be the one cited
+    elsewhere). Item key breaks any remaining tie so the choice is
+    deterministic — the plan token depends on it.
+    """
+    data = entry["item"].get("data", {})
+    return (
+        -entry["child_count"],
+        0 if (data.get("abstractNote") or "").strip() else 1,
+        data.get("dateAdded") or "9999-99-99",
+        entry["item"].get("key", ""),
+    )
+
+
+def _describe_keeper(entry: dict) -> str:
+    """One-line why-this-keeper, for the plan output."""
+    data = entry["item"].get("data", {})
+    bits = [f"{entry['child_count']} child item(s)"]
+    bits.append("has abstract" if (data.get("abstractNote") or "").strip() else "no abstract")
+    added = (data.get("dateAdded") or "")[:10]
+    if added:
+        bits.append(f"added {added}")
+    return ", ".join(bits)
+
+
+def _merge_plan(write_zot, keeper_key: str, dup_keys: list[str]) -> dict:
+    """Fetch a keeper and its duplicates and work out what merging would do.
+
+    Children are fetched through _paginate: pyzotero's children() returns only
+    the first API page, which used to silently drop every child past the 25th
+    into the Trash along with the duplicate (#387).
+    """
+    keeper = write_zot.item(keeper_key)
+    keeper_children = _helpers._paginate(write_zot.children, keeper_key)
+    duplicates = [
+        {
+            "item": write_zot.item(dk),
+            "children": _helpers._paginate(write_zot.children, dk),
+        }
+        for dk in dup_keys
+    ]
+
+    keeper_data = keeper.get("data", {})
+    keeper_tags = {t.get("tag", "") for t in keeper_data.get("tags", [])}
+    all_tags = set(keeper_tags)
+    all_collections = set(keeper_data.get("collections", []))
+    total_children_to_move = 0
+
+    for dup in duplicates:
+        dup_data = dup["item"].get("data", {})
+        all_tags.update(t.get("tag", "") for t in dup_data.get("tags", []))
+        all_collections.update(dup_data.get("collections", []))
+        total_children_to_move += len(dup["children"])
+
+    all_tags.discard("")
+
+    keeper_attachment_sigs = {
+        _attachment_sig(kc.get("data", {}))
+        for kc in keeper_children
+        if kc.get("data", {}).get("itemType") == "attachment"
+    }
+    skipped_attachment_count = sum(
+        1
+        for dup in duplicates
+        for child in dup["children"]
+        if child.get("data", {}).get("itemType") == "attachment"
+        and _attachment_sig(child.get("data", {})) in keeper_attachment_sigs
+    )
+
+    return {
+        "keeper_key": keeper_key,
+        "keeper": keeper,
+        "keeper_children": keeper_children,
+        "duplicates": duplicates,
+        "dup_keys": list(dup_keys),
+        "all_tags": all_tags,
+        "new_tags": all_tags - keeper_tags,
+        "new_collections": all_collections - set(keeper_data.get("collections", [])),
+        "children_to_move": total_children_to_move - skipped_attachment_count,
+        "skipped_attachment_count": skipped_attachment_count,
+        "keeper_attachment_sigs": keeper_attachment_sigs,
+    }
+
+
+def _trash_item(write_zot, item_key: str) -> tuple[bool, str]:
+    """Move one item to Zotero's Trash (recoverable), not a permanent delete.
+
+    pyzotero's update_item() strips "deleted" and delete_item() destroys the
+    item, so this is a direct version-conditioned PATCH of {"deleted": 1}.
+    """
+    try:
+        item = write_zot.item(item_key)
+        from pyzotero.zotero import build_url
+        url = build_url(
+            write_zot.endpoint,
+            f"/{write_zot.library_type}/{write_zot.library_id}/items/{item_key}",
+        )
+        resp = write_zot.client.patch(
+            url=url,
+            headers={"If-Unmodified-Since-Version": str(item["version"])},
+            content=json.dumps({"deleted": 1}),
+        )
+        if resp.status_code in (200, 204):
+            return True, ""
+        return False, f"HTTP {resp.status_code}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _execute_merge(write_zot, plan: dict, ctx) -> dict:
+    """Apply a plan from _merge_plan. Returns a result dict; never raises.
+
+    Order matters: tags, then collections, then children, and the duplicates
+    are trashed only if every child moved. A child left behind on an item
+    that is about to be trashed is the data-loss shape from #387, so a partial
+    re-parent aborts before anything reaches the Trash.
+    """
+    keeper_key = plan["keeper_key"]
+    keeper = plan["keeper"]
+    result = {
+        "keeper_key": keeper_key,
+        "new_tags": plan["new_tags"],
+        "new_collections": plan["new_collections"],
+        "moved": [],
+        "failed": [],
+        "skipped_dupes": [],
+        "trashed": [],
+        "trash_failures": [],
+        "error": None,
+    }
+
+    if plan["new_tags"]:
+        keeper_data = keeper.get("data", {})
+        existing_tags = [t.get("tag", "") for t in keeper_data.get("tags", [])]
+        keeper_data["tags"] = [{"tag": t} for t in sorted(set(existing_tags) | plan["all_tags"])]
+        _helpers._strip_unwritable_fields(keeper)
+        resp = write_zot.update_item(keeper)
+        if not _helpers._handle_write_response(resp, ctx):
+            result["error"] = f"Failed to merge tags into keeper {keeper_key}."
+            return result
+        keeper = write_zot.item(keeper_key)  # re-fetch for version
+
+    for coll_key in plan["new_collections"]:
+        resp = write_zot.addto_collection(coll_key, keeper)
+        if not _helpers._handle_write_response(resp, ctx):
+            ctx.warning(f"Failed to add keeper to collection {coll_key}")
+        keeper = write_zot.item(keeper_key)  # re-fetch for version
+
+    for dup in plan["duplicates"]:
+        for child in dup["children"]:
+            child_key = child.get("key", "?")
+            try:
+                fresh_child = write_zot.item(child_key)
+                child_data = fresh_child.get("data", {})
+                if (
+                    child_data.get("itemType") == "attachment"
+                    and _attachment_sig(child_data) in plan["keeper_attachment_sigs"]
+                ):
+                    result["skipped_dupes"].append(child_key)
+                    continue
+                child_data["parentItem"] = keeper_key
+                _helpers._strip_unwritable_fields(fresh_child)
+                resp = write_zot.update_item(fresh_child)
+                if _helpers._handle_write_response(resp, ctx):
+                    result["moved"].append(child_key)
+                else:
+                    result["failed"].append(child_key)
+            except Exception as e:
+                result["failed"].append(f"{child_key} ({e})")
+
+    if result["failed"]:
+        result["error"] = (
+            f"Moved {len(result['moved'])} children, but {len(result['failed'])} "
+            f"failed: {result['failed']}. Duplicates were NOT trashed."
+        )
+        return result
+
+    for dup in plan["duplicates"]:
+        dup_key = dup["item"]["key"]
+        ok, why = _trash_item(write_zot, dup_key)
+        if ok:
+            result["trashed"].append(dup_key)
+        else:
+            result["trash_failures"].append(f"{dup_key} ({why})")
+            ctx.warning(f"Failed to trash {dup_key}: {why}")
+
+    return result
+
+
+def _auto_merge_groups(read_zot, write_zot, method, collection_key, max_groups):
+    """Decide what auto mode would merge.
+
+    Returns ``(qualifying, skipped, clipped, error)``. ``qualifying`` is a list
+    of per-group dicts carrying the chosen keeper and the keys to trash;
+    ``skipped`` is ``(group_key, keys, reason)`` for every group auto mode
+    declines to touch.
+
+    A group is declined rather than merged whenever anything about it is not
+    obviously safe: members of different item types (a book and a book section
+    sharing a title are not the same record), members carrying different DOIs
+    (the shape that makes title matching dangerous — two edited volumes each
+    with a "List of Contributors"), or a group overlapping one already merged
+    in this pass, whose items may already be in the Trash.
+    """
+    dups, error = _collect_duplicate_groups(read_zot, method, collection_key)
+    if error:
+        return [], [], False, error
+
+    qualifying: list[dict] = []
+    skipped: list[tuple] = []
+    consumed: set[str] = set()
+    clipped = False
+
+    for group_key, group_items in dups.items():
+        keys = [i.get("key", "?") for i in group_items]
+
+        item_types = {i.get("data", {}).get("itemType") for i in group_items}
+        if len(item_types) > 1:
+            types = ", ".join(sorted(t or "?" for t in item_types))
+            skipped.append((group_key, keys, f"mixed item types ({types})"))
+            continue
+
+        dois = {(i.get("data", {}).get("DOI") or "").strip().lower() for i in group_items}
+        dois.discard("")
+        if len(dois) > 1:
+            skipped.append((group_key, keys, "members carry different DOIs"))
+            continue
+
+        overlap = [k for k in keys if k in consumed]
+        if overlap:
+            skipped.append((
+                group_key, keys,
+                f"overlaps a group already merged in this pass ({', '.join(overlap)})",
+            ))
+            continue
+
+        if len(qualifying) >= max_groups:
+            clipped = True
+            skipped.append((group_key, keys, f"beyond this call's {max_groups}-group ceiling"))
+            continue
+
+        entries = []
+        for it in group_items:
+            children = _helpers._paginate(write_zot.children, it.get("key"))
+            entries.append({"item": it, "children": children, "child_count": len(children)})
+        entries.sort(key=_keeper_rank)
+
+        keeper_entry = entries[0]
+        qualifying.append({
+            "group_key": group_key,
+            "keeper_key": keeper_entry["item"].get("key", "?"),
+            "keeper_title": keeper_entry["item"].get("data", {}).get("title", "Untitled"),
+            "keeper_why": _describe_keeper(keeper_entry),
+            "duplicate_keys": [e["item"].get("key", "?") for e in entries[1:]],
+            "trash_titles": [
+                (e["item"].get("key", "?"), e["item"].get("data", {}).get("title", "Untitled"))
+                for e in entries[1:]
+            ],
+        })
+        consumed.update(keys)
+
+    return qualifying, skipped, clipped, None
+
+
+def _plan_token(qualifying: list[dict]) -> str:
+    """Short digest of an auto-merge plan.
+
+    Executing auto mode requires echoing this back, which does two things:
+    confirm=True on its own cannot trash anything without the caller having
+    been shown the plan first, and a library that changed between the plan and
+    the confirmation produces a different token, so the call is refused rather
+    than applied to a plan nobody reviewed.
+    """
+    canonical = json.dumps(
+        [[g["group_key"], g["keeper_key"], g["duplicate_keys"]] for g in qualifying],
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()[:12]
+
+
+def _render_auto_plan(qualifying, skipped, clipped, token, method, max_groups) -> str:
+    """The plan output — every group, its keeper, and what would be trashed."""
+    to_trash = sum(len(g["duplicate_keys"]) for g in qualifying)
+    lines = [
+        "# Auto-merge plan (nothing has been changed)",
+        "",
+        f"**Method:** `{method}` — {len(qualifying)} group(s) qualify, "
+        f"{len(skipped)} skipped.",
+        f"**Would trash {to_trash} item(s)**, keeping {len(qualifying)}.",
+        "",
+        "Keeper per group is chosen by: most child items, then has-an-abstract, "
+        "then oldest dateAdded, then item key.",
+        "",
+    ]
+
+    if qualifying:
+        lines.append("## Groups to merge")
+        lines.append("")
+        for g in qualifying:
+            lines.append(f"### {g['group_key']}")
+            lines.append(f"- **KEEP** `{g['keeper_key']}` — {g['keeper_title']}  ({g['keeper_why']})")
+            for key, title in g["trash_titles"]:
+                lines.append(f"- trash `{key}` — {title}")
+            lines.append("")
+
+    if skipped:
+        lines += _render_skipped(skipped, "## Skipped")
+
+    if clipped:
+        lines.append(
+            f"This call is capped at {max_groups} groups. Re-run auto mode "
+            "after this batch to continue with the rest."
+        )
+        lines.append("")
+
+    if not qualifying:
+        lines.append("Nothing qualifies, so there is nothing to confirm.")
+        return "\n".join(lines)
+
+    lines.extend([
+        "---",
+        "",
+        "**To execute, call again with `confirm=True` and "
+        f"`plan_token='{token}'`.**",
+        "",
+        "The token is a digest of the plan above. It exists so that a merge "
+        "cannot run without this plan having been produced and reviewed, and "
+        "so that a library which changed in the meantime is refused rather "
+        "than merged against a stale plan.",
+    ])
+    return "\n".join(lines)
+
+
 @mcp.tool(
     name="zotero_merge_duplicates",
     description=(
-        "Merge one or more duplicate items INTO a keeper: consolidates "
-        "tags, collections, notes, annotations, and all child items onto "
-        "the keeper, then moves the duplicates to Trash (recoverable "
-        "from Zotero desktop's Trash view). "
-        "SAFETY: dry-run by DEFAULT — prints what would happen without "
-        "changing anything. Pass confirm=True to actually execute. Always "
-        "run dry-first at least once to verify the keeper choice. "
-        "Discover groups first with zotero_find_duplicates. "
-        "keeper_key: 8-character key of the item to KEEP. All metadata "
-        "gaps on the keeper are filled from duplicates where possible; "
-        "conflicting fields keep the keeper's value. "
-        "duplicate_keys: ARRAY of 8-character item keys to merge into "
-        "the keeper and trash (also accepts a JSON-encoded list "
-        "string) — pass as an array, not a single concatenated string. "
-        "The keeper itself must NOT appear in this list. "
-        "confirm: False (default) runs dry; True executes the merge. "
-        "Requires a writable library (web API key or hybrid mode); fails "
-        "in local-only mode. "
-        "Example dry-run: zotero_merge_duplicates("
-        "keeper_key='ABC12345', duplicate_keys=['XYZ98765']). "
-        "Example execute: same, plus confirm=True."
+        "Merge duplicate items INTO a keeper: consolidates tags, "
+        "collections, notes, annotations and children onto it, then "
+        "trashes the duplicates (recoverable in Zotero). "
+        "SINGLE GROUP (default): pass keeper_key + duplicate_keys. Dry-run "
+        "by DEFAULT — confirm=True executes. Find groups with "
+        "zotero_find_duplicates. keeper_key: 8-char key to KEEP; its gaps "
+        "are filled from the duplicates, conflicts keep its own value. "
+        "duplicate_keys: ARRAY of 8-char keys to merge in and trash (or a "
+        "JSON list string); must not contain the keeper. "
+        "AUTO/BATCH: auto=True finds and merges every high-confidence "
+        "group in one pass, picking each keeper itself — do NOT pass "
+        "keeper_key or duplicate_keys. method: 'doi' (default, safest — "
+        "exact DOI); 'title'/'both' also match "
+        "normalized titles, which false-positives on edited volumes, so opt "
+        "in only when asked. collection_key scopes the "
+        f"scan; max_groups caps one call (default/max "
+        f"{_AUTO_MERGE_MAX_GROUPS}). KEEPER = most child items, then "
+        "has-an-abstract, then oldest dateAdded, then key. Groups with "
+        "mixed item types, differing DOIs, or overlapping an earlier merge "
+        "are SKIPPED and reported. "
+        "AUTO NEEDS TWO CALLS: auto=True alone returns a plan plus a "
+        "plan_token; executing needs confirm=True AND that token. "
+        "confirm=True alone is refused, as is a stale token. "
+        "Needs a writable library (web API key/hybrid); fails local-only. "
+        "Example: zotero_merge_duplicates(keeper_key='ABC12345', "
+        "duplicate_keys=['XYZ98765']), then again with confirm=True. "
+        "Auto: zotero_merge_duplicates(auto=True), then the same plus "
+        "confirm=True and plan_token."
     )
 )
 @with_zotero_api_lock
 def merge_duplicates(
-    keeper_key: str,
-    duplicate_keys: list[str] | str,
+    keeper_key: str | None = None,
+    duplicate_keys: list[str] | str | None = None,
     confirm: bool = False,
+    auto: bool = False,
+    method: Literal["title", "doi", "both"] = "doi",
+    collection_key: str | None = None,
+    max_groups: int | str | None = None,
+    plan_token: str | None = None,
     *,
     ctx: Context
 ) -> str:
@@ -2303,6 +3745,25 @@ def merge_duplicates(
         return str(e)
 
     try:
+        if auto:
+            if keeper_key or duplicate_keys:
+                return (
+                    "Error: auto=True finds and picks its own groups — do not "
+                    "pass keeper_key or duplicate_keys with it. Drop auto=True "
+                    "to merge one specific group."
+                )
+            return _merge_duplicates_auto(
+                read_zot, write_zot, method, collection_key,
+                max_groups, confirm, plan_token, ctx,
+            )
+
+        if not keeper_key:
+            return (
+                "Error: keeper_key is required. Pass keeper_key + "
+                "duplicate_keys to merge one group, or auto=True to merge "
+                "every high-confidence group."
+            )
+
         dup_keys = _helpers._normalize_str_list_input(duplicate_keys, "duplicate_keys")
 
         # Safety: remove keeper from duplicates
@@ -2313,73 +3774,21 @@ def merge_duplicates(
         if not dup_keys:
             return "Error: No duplicate keys to merge (after removing keeper if present)."
 
-        # Fetch all items and children (children() returns only the first
-        # API page without explicit pagination — see _paginate)
-        keeper = write_zot.item(keeper_key)
-        keeper_children = _helpers._paginate(write_zot.children, keeper_key)
-        duplicates = []
-        for dk in dup_keys:
-            dup_item = write_zot.item(dk)
-            dup_children = _helpers._paginate(write_zot.children, dk)
-            duplicates.append({"item": dup_item, "children": dup_children})
+        plan = _merge_plan(write_zot, keeper_key, dup_keys)
 
-        # Compute what will be merged
-        all_tags = set()
-        for t in keeper.get("data", {}).get("tags", []):
-            all_tags.add(t.get("tag", ""))
-        all_collections = set(keeper.get("data", {}).get("collections", []))
-        total_children_to_move = 0
-
-        for dup in duplicates:
-            for t in dup["item"].get("data", {}).get("tags", []):
-                all_tags.add(t.get("tag", ""))
-            all_collections.update(dup["item"].get("data", {}).get("collections", []))
-            total_children_to_move += len(dup["children"])
-
-        all_tags.discard("")
-        new_tags = all_tags - {t.get("tag", "") for t in keeper.get("data", {}).get("tags", [])}
-        new_collections = all_collections - set(keeper.get("data", {}).get("collections", []))
-
-        # Build keeper's attachment signatures for deduplication
-        keeper_attachment_sigs = set()
-        for kc in keeper_children:
-            kd = kc.get("data", {})
-            if kd.get("itemType") == "attachment":
-                sig = (
-                    kd.get("contentType", ""),
-                    kd.get("filename", ""),
-                    kd.get("md5", ""),
-                    kd.get("url", ""),
-                )
-                keeper_attachment_sigs.add(sig)
-
-        # Count duplicate attachments that would be skipped
-        skipped_attachment_count = 0
-        for dup in duplicates:
-            for child in dup["children"]:
-                cd = child.get("data", {})
-                if cd.get("itemType") == "attachment":
-                    sig = (
-                        cd.get("contentType", ""),
-                        cd.get("filename", ""),
-                        cd.get("md5", ""),
-                        cd.get("url", ""),
-                    )
-                    if sig in keeper_attachment_sigs:
-                        skipped_attachment_count += 1
-
-        # DRY RUN
         if not confirm:
+            skipped = plan["skipped_attachment_count"]
             lines = [
                 "# Merge Preview (dry run)",
                 "",
-                f"**Keeper:** `{keeper_key}` — {keeper.get('data', {}).get('title', 'Untitled')}",
+                f"**Keeper:** `{keeper_key}` — {plan['keeper'].get('data', {}).get('title', 'Untitled')}",
                 f"**Duplicates to merge:** {', '.join(f'`{k}`' for k in dup_keys)}",
                 "",
-                f"**Tags to add:** {sorted(new_tags) if new_tags else 'none'}",
-                f"**Collections to add:** {sorted(new_collections) if new_collections else 'none'}",
-                f"**Child items to re-parent:** {total_children_to_move - skipped_attachment_count}",
-                f"  ({skipped_attachment_count} duplicate attachment(s) will be skipped)" if skipped_attachment_count else "  (notes, PDFs, annotations, highlights, etc.)",
+                f"**Tags to add:** {sorted(plan['new_tags']) if plan['new_tags'] else 'none'}",
+                f"**Collections to add:** {sorted(plan['new_collections']) if plan['new_collections'] else 'none'}",
+                f"**Child items to re-parent:** {plan['children_to_move']}",
+                f"  ({skipped} duplicate attachment(s) will be skipped)" if skipped
+                else "  (notes, PDFs, annotations, highlights, etc.)",
                 "",
                 "Duplicates will be moved to **Trash** (recoverable in Zotero).",
                 "",
@@ -2387,100 +3796,21 @@ def merge_duplicates(
             ]
             return "\n".join(lines)
 
-        # EXECUTE MERGE
         ctx.info(f"Merging {len(dup_keys)} duplicates into {keeper_key}")
+        result = _execute_merge(write_zot, plan, ctx)
+        if result["error"]:
+            return f"Merge partially completed. {result['error']}\n\nFix the failures and retry."
 
-        # Step 3: Consolidate tags
-        if new_tags:
-            keeper_data = keeper.get("data", {})
-            existing_tags = [t.get("tag", "") for t in keeper_data.get("tags", [])]
-            keeper_data["tags"] = [{"tag": t} for t in sorted(set(existing_tags) | all_tags)]
-            _helpers._strip_unwritable_fields(keeper)
-            resp = write_zot.update_item(keeper)
-            if not _helpers._handle_write_response(resp, ctx):
-                return "Error: Failed to merge tags into keeper."
-            keeper = write_zot.item(keeper_key)  # re-fetch for version
-
-        # Step 4: Consolidate collections
-        for coll_key in new_collections:
-            resp = write_zot.addto_collection(coll_key, keeper)
-            if not _helpers._handle_write_response(resp, ctx):
-                ctx.warning(f"Failed to add keeper to collection {coll_key}")
-            keeper = write_zot.item(keeper_key)  # re-fetch for version
-
-        # Step 5: Re-parent children (skip duplicate attachments)
-        moved = []
-        failed = []
-        skipped_dupes = []
-        for dup in duplicates:
-            for child in dup["children"]:
-                child_key = child.get("key", "?")
-                try:
-                    fresh_child = write_zot.item(child_key)
-                    # Skip duplicate attachments — keeper already has this one
-                    child_data = fresh_child.get("data", {})
-                    if child_data.get("itemType") == "attachment":
-                        child_sig = (
-                            child_data.get("contentType", ""),
-                            child_data.get("filename", ""),
-                            child_data.get("md5", ""),
-                            child_data.get("url", ""),
-                        )
-                        if child_sig in keeper_attachment_sigs:
-                            skipped_dupes.append(child_key)
-                            continue  # Skip — keeper already has this attachment
-                    fresh_child.get("data", {})["parentItem"] = keeper_key
-                    _helpers._strip_unwritable_fields(fresh_child)
-                    resp = write_zot.update_item(fresh_child)
-                    if _helpers._handle_write_response(resp, ctx):
-                        moved.append(child_key)
-                    else:
-                        failed.append(child_key)
-                except Exception as e:
-                    failed.append(f"{child_key} ({e})")
-
-        if failed:
-            return (
-                f"Merge partially completed. Moved {len(moved)} children, "
-                f"but {len(failed)} failed: {failed}\n\n"
-                "Duplicates were NOT trashed. Fix the failures and retry."
-            )
-
-        # Step 6: Trash duplicates (move to Zotero Trash, NOT permanent delete)
-        # pyzotero's update_item() strips "deleted" and delete_item() permanently
-        # destroys items. We send a direct PATCH with {"deleted": 1} which moves
-        # items to Zotero's Trash — recoverable by the user.
-        trashed = []
-        for dup in duplicates:
-            dup_key = dup["item"]["key"]
-            try:
-                dup_item = write_zot.item(dup_key)
-                version = dup_item["version"]
-                from pyzotero.zotero import build_url
-                url = build_url(
-                    write_zot.endpoint,
-                    f"/{write_zot.library_type}/{write_zot.library_id}/items/{dup_key}",
-                )
-                headers = {"If-Unmodified-Since-Version": str(version)}
-                resp = write_zot.client.patch(
-                    url=url,
-                    headers=headers,
-                    content=json.dumps({"deleted": 1}),
-                )
-                if resp.status_code in (200, 204):
-                    trashed.append(dup_key)
-                else:
-                    ctx.warning(f"Failed to trash {dup_key}: HTTP {resp.status_code}")
-            except Exception as e:
-                ctx.warning(f"Failed to trash {dup_key}: {e}")
-
-        skip_info = f" ({len(skipped_dupes)} duplicate attachments skipped)" if skipped_dupes else ""
+        skip_info = (
+            f" ({len(result['skipped_dupes'])} duplicate attachments skipped)"
+            if result["skipped_dupes"] else ""
+        )
         return (
             f"Merge complete.\n\n"
-            f"- Tags merged: {len(new_tags)} new\n"
-            f"- Collections added: {len(new_collections)} new\n"
-            f"- Children re-parented: {len(moved)}{skip_info}\n"
-            f"- Duplicates trashed: {', '.join(f'`{k}`' for k in trashed)}\n\n"
+            f"- Tags merged: {len(result['new_tags'])} new\n"
+            f"- Collections added: {len(result['new_collections'])} new\n"
+            f"- Children re-parented: {len(result['moved'])}{skip_info}\n"
+            f"- Duplicates trashed: {', '.join(f'`{k}`' for k in result['trashed'])}\n\n"
             "Trashed items can be restored from Zotero's Trash."
         )
 
@@ -2489,6 +3819,104 @@ def merge_duplicates(
     except Exception as e:
         ctx.error(f"Error merging duplicates: {e}")
         return f"Error merging duplicates: {e}"
+
+
+def _merge_duplicates_auto(
+    read_zot, write_zot, method, collection_key, max_groups, confirm, plan_token, ctx,
+):
+    """The auto/batch path of zotero_merge_duplicates (#395)."""
+    max_groups = _helpers._normalize_limit(
+        max_groups,
+        default=_AUTO_MERGE_MAX_GROUPS,
+        max_val=_AUTO_MERGE_MAX_GROUPS,
+    )
+
+    if confirm and not plan_token:
+        return (
+            "Error: auto mode will not execute on confirm=True alone. Call "
+            "zotero_merge_duplicates(auto=True) first to get the plan and its "
+            "plan_token, then call again with confirm=True and that token. "
+            "This is deliberate: a batch merge trashes items across the whole "
+            "library, so the plan has to be produced and reviewed first."
+        )
+
+    ctx.info(f"Building auto-merge plan (method={method})")
+    qualifying, skipped, clipped, error = _auto_merge_groups(
+        read_zot, write_zot, method, collection_key, max_groups
+    )
+    if error:
+        return error
+
+    token = _plan_token(qualifying)
+
+    if not confirm:
+        if not qualifying and not skipped:
+            return "No duplicates found."
+        return _render_auto_plan(qualifying, skipped, clipped, token, method, max_groups)
+
+    if plan_token != token:
+        return (
+            f"Error: plan_token mismatch — refusing to merge.\n\n"
+            f"Token supplied: `{plan_token}`\n"
+            f"Token for the library's current state: `{token}`\n\n"
+            "The set of duplicate groups, or the keeper chosen for one of "
+            "them, is not what it was when the plan you are confirming was "
+            "produced. Re-run zotero_merge_duplicates(auto=True), review the "
+            "new plan, and confirm that one."
+        )
+
+    if not qualifying:
+        return "Nothing to merge — no groups qualify."
+
+    ctx.info(f"Auto-merging {len(qualifying)} group(s)")
+    merged, failures = [], []
+    total_trashed, total_children = 0, 0
+
+    for group in qualifying:
+        try:
+            plan = _merge_plan(write_zot, group["keeper_key"], group["duplicate_keys"])
+            result = _execute_merge(write_zot, plan, ctx)
+        except Exception as e:
+            failures.append((group["group_key"], str(e)))
+            continue
+        if result["error"]:
+            failures.append((group["group_key"], result["error"]))
+            continue
+        merged.append(group)
+        total_trashed += len(result["trashed"])
+        total_children += len(result["moved"])
+        if result["trash_failures"]:
+            failures.append((
+                group["group_key"],
+                f"merged, but failed to trash {', '.join(result['trash_failures'])}",
+            ))
+
+    lines = [
+        "# Auto-merge complete",
+        "",
+        f"- Groups merged: **{len(merged)}** of {len(qualifying)} planned",
+        f"- Items trashed: **{total_trashed}**",
+        f"- Child items re-parented: {total_children}",
+        f"- Groups skipped as ambiguous: {len(skipped)}",
+        f"- Groups that failed: {len(failures)}",
+        "",
+    ]
+    if failures:
+        lines.append("## Failures")
+        lines.append("")
+        for group_key, why in failures:
+            lines.append(f"- `{group_key}` — {why}")
+        lines.append("")
+    if skipped:
+        lines += _render_skipped(skipped, "## Skipped (not merged)")
+    if clipped:
+        lines.append(
+            f"Capped at {max_groups} groups this call — re-run auto mode to "
+            "continue with the rest."
+        )
+        lines.append("")
+    lines.append("Trashed items can be restored from Zotero's Trash.")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -2503,18 +3931,62 @@ _TOC_EXIT_NO_PYMUPDF = 3
 # can't cascade into "Zotero API busy" errors on every other tool.
 _TOC_TIMEOUT = 30
 
-# Child script. It imports ONLY fitz — never zotero_mcp — so the subprocess
+# Seconds to wait for a killed child to be reaped. Bounded on purpose: if the
+# child (or a Windows Error Reporting process holding its handles) cannot be
+# reaped right now, returning to the caller matters more than reaping.
+_TOC_KILL_GRACE = 5
+
+# Marks the start of the JSON payload in the child's stdout. Everything the
+# child prints before this — and everything anything else in that interpreter
+# prints — is noise to be discarded (#455).
+_TOC_SENTINEL = "@@ZOTERO_MCP_TOC@@"
+
+# Child script. It imports ONLY PyMuPDF — never zotero_mcp — so the subprocess
 # cannot trigger FastMCP server initialization (macOS 'spawn' deadlock, #178).
+#
+# SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX) is set first on
+# Windows: without it an access violation in fitz pops up Windows Error
+# Reporting, and WerFault.exe inherits the child's stdout/stderr handles and
+# keeps them open while it writes a crash dump. The parent then sees a child
+# that never closes its pipes rather than a crash it can report (#431). With
+# the error mode set, the crash comes back as a plain NTSTATUS exit code.
+#
+# Two things keep the JSON channel clean, and both are needed (#455).
+#
+# The import is `pymupdf`, not `fitz`. PyMuPDF >= 1.28 ends its legacy `fitz`
+# shim with message_warning('The `fitz` API is deprecated ...'), and `message`
+# writes to *stdout*. Since our floor is only pymupdf>=1.24.2, every fresh
+# install resolves a version that does this, which is why `get_pdf_outline`
+# failed on every PDF regardless of the file: the notice arrived ahead of the
+# JSON and json.loads choked on the first character. `fitz` remains the
+# fallback for PyMuPDF older than 1.24.3, which has no `pymupdf` name.
+#
+# The payload is also sentinel-delimited, which is the part that generalises.
+# Fixing only the import would leave the channel one stray print away from
+# breaking again, and some of those prints are not ours to prevent: a
+# sitecustomize hook, a .pth file, or a C-level write from MuPDF itself all
+# land on fd 1 before or during our code and none of them can be caught from
+# inside this script. Taking everything after the last sentinel is immune to
+# all of it.
 _TOC_CHILD_SCRIPT = (
     "import json, sys\n"
+    "if sys.platform == 'win32':\n"
+    "    try:\n"
+    "        import ctypes\n"
+    "        ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002)\n"
+    "    except Exception:\n"
+    "        pass\n"
     "try:\n"
-    "    import fitz\n"
+    "    import pymupdf as fitz\n"
     "except ImportError:\n"
-    f"    sys.exit({_TOC_EXIT_NO_PYMUPDF})\n"
+    "    try:\n"
+    "        import fitz\n"
+    "    except ImportError:\n"
+    f"        sys.exit({_TOC_EXIT_NO_PYMUPDF})\n"
     "doc = fitz.open(sys.argv[1])\n"
     "toc = doc.get_toc()\n"
     "doc.close()\n"
-    "sys.stdout.write(json.dumps(toc))\n"
+    f"sys.stdout.write({_TOC_SENTINEL!r} + json.dumps(toc))\n"
 )
 
 
@@ -2531,15 +4003,50 @@ class TocOutcome(NamedTuple):
     detail: str = ""
 
 
+def _reap_toc_child(proc, grace: float = _TOC_KILL_GRACE) -> None:
+    """Kill an overdue child and stop waiting on it within a bounded time.
+
+    Deliberately does NOT re-enter ``communicate()`` after the kill. That is
+    what ``subprocess.run``'s timeout path does, and on Windows it can block
+    forever: a crashed child's stdout/stderr handles may still be held by
+    WerFault.exe, so the pipes never reach EOF and the read never returns
+    (#431). Closing our own ends of the pipes and giving the child a short
+    window to be reaped is enough; anything still lingering is left to the OS
+    rather than allowed to hang the server.
+    """
+    import subprocess
+
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is None:
+            continue
+        try:
+            pipe.close()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+
+
 def _extract_pdf_toc(pdf_path: str, timeout: int = _TOC_TIMEOUT) -> TocOutcome:
     """Read a PDF's table of contents in a throwaway child process.
 
     ``fitz.Document.get_toc()`` segfaults on some born-digital journal PDFs
     (#372). A segfault cannot be caught in-process: it takes the whole MCP
     server down ("Server disconnected"), so the call has to run somewhere
-    that is allowed to die. ``subprocess.run`` waits on the child on every
-    exit path — success, crash, and timeout-kill — so no zombies are left
-    behind.
+    that is allowed to die.
+
+    Every exit path — success, crash, timeout, spawn failure — returns within
+    a bounded time. The caller is an MCP tool on a single-channel stdio
+    transport, so a call that never returns takes the whole server with it
+    (#431).
     """
     import subprocess
     import sys
@@ -2560,23 +4067,49 @@ def _extract_pdf_toc(pdf_path: str, timeout: int = _TOC_TIMEOUT) -> TocOutcome:
     child_env.setdefault("PYTHONUTF8", "1")
 
     try:
-        proc = subprocess.run(
+        # stdin is DEVNULL, never inherited: under the stdio transport the
+        # server's stdin IS the MCP pipe from the client, and a child that
+        # outlives its parent would hold that pipe open, so the client never
+        # sees the connection close (#431).
+        proc = subprocess.Popen(
             [sys.executable, "-c", _TOC_CHILD_SCRIPT, str(pdf_path)],
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
             env=child_env,
         )
-    except subprocess.TimeoutExpired:
-        return TocOutcome("timeout", [], f"no response after {timeout}s")
     except Exception as exc:
         return TocOutcome("error", [], str(exc))
 
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _reap_toc_child(proc)
+        return TocOutcome("timeout", [], f"no response after {timeout}s")
+    except Exception as exc:
+        _reap_toc_child(proc)
+        return TocOutcome("error", [], str(exc))
+
     if proc.returncode == 0:
+        # Take only what follows the last sentinel. Anything ahead of it is
+        # something else in the child's interpreter writing to stdout — a
+        # PyMuPDF deprecation notice, a sitecustomize hook, a MuPDF warning
+        # — and is not ours to parse (#455).
+        payload = stdout or ""
+        if _TOC_SENTINEL in payload:
+            payload = payload.rsplit(_TOC_SENTINEL, 1)[1]
+        elif payload.strip():
+            # The child exited 0 but produced no sentinel. It cannot have
+            # reached its final write, so whatever is here is noise, not a
+            # truncated outline; say that rather than blaming the JSON.
+            return TocOutcome(
+                "error", [], "child produced no outline data (stdout was not tagged)"
+            )
         try:
-            return TocOutcome("ok", json.loads(proc.stdout or "[]"))
+            return TocOutcome("ok", json.loads(payload or "[]"))
         except ValueError as exc:
             return TocOutcome("error", [], f"unreadable outline data: {exc}")
 
@@ -2596,7 +4129,7 @@ def _extract_pdf_toc(pdf_path: str, timeout: int = _TOC_TIMEOUT) -> TocOutcome:
     if proc.returncode >= 0xC0000000:
         return TocOutcome("crashed", [], f"exit code 0x{proc.returncode:08X}")
 
-    stderr = (proc.stderr or "").strip()
+    stderr = (stderr or "").strip()
     return TocOutcome("error", [], stderr[:300] or f"exit code {proc.returncode}")
 
 
@@ -2620,59 +4153,78 @@ def _extract_pdf_toc(pdf_path: str, timeout: int = _TOC_TIMEOUT) -> TocOutcome:
         "Example: zotero_get_pdf_outline(item_key='RTKZQI8E')."
     )
 )
-@with_zotero_api_lock
 def get_pdf_outline(
     item_key: str,
     *,
     ctx: Context
 ) -> str:
+    # NOT decorated with @with_zotero_api_lock: the lock exists only to
+    # serialize Zotero API access, and holding it across the outline
+    # extraction meant one slow or hung PDF blocked every other tool in the
+    # server until the client gave up (#431). It is taken below around the
+    # API work alone and released before the extraction subprocess runs.
     try:
-        zot = _client.get_zotero_client()
         ctx.info(f"Getting PDF outline for item {item_key}")
 
-        attachment_key = None
-        filename = "document.pdf"
-
-        # The key may name the PDF attachment itself — attachments have no
-        # children, so the parent scan below would find nothing (#372).
-        try:
-            item = zot.item(item_key)
-        except Exception:
-            item = None
-        data = item.get("data", {}) if isinstance(item, dict) else {}
-        if (
-            data.get("itemType") == "attachment"
-            and data.get("contentType") == "application/pdf"
-        ):
-            attachment_key = item.get("key") or data.get("key") or item_key
-            filename = data.get("filename") or f"{attachment_key}.pdf"
-        else:
-            for child in _helpers._paginate(zot.children, item_key):
-                child_data = child.get("data", {})
-                if child_data.get("contentType") == "application/pdf":
-                    attachment_key = child["key"]
-                    filename = child_data.get("filename") or "document.pdf"
-                    break
-
-        if not attachment_key:
-            return f"No PDF attachment found for item `{item_key}`."
-
-        # Download via the multi-source downloader so WebDAV- and
-        # local-storage-backed attachments work, not just Zotero cloud.
-        local_mode = _utils.is_local_mode()
         with tempfile.TemporaryDirectory() as tmpdir:
-            download = _client.download_attachment_file(
-                attachment_key,
-                tmpdir,
-                os.path.basename(filename),
-                local_client=zot if local_mode else _client.get_local_zotero_client(),
-                web_client=None if local_mode else zot,
-            )
-            pdf_path = download.path
-            if not pdf_path or not pdf_path.exists() or pdf_path.stat().st_size == 0:
-                detail = f" ({'; '.join(download.errors)})" if download.errors else ""
-                return f"Could not download PDF for attachment `{attachment_key}`.{detail}"
+            with zotero_api_lock():
+                zot = _client.get_zotero_client()
 
+                attachment_key = None
+                filename = "document.pdf"
+
+                # The key may name the PDF attachment itself — attachments have
+                # no children, so the parent scan below would find nothing (#372).
+                try:
+                    item = zot.item(item_key)
+                except Exception:
+                    item = None
+                data = item.get("data", {}) if isinstance(item, dict) else {}
+                if (
+                    data.get("itemType") == "attachment"
+                    and data.get("contentType") == "application/pdf"
+                ):
+                    attachment_key = item.get("key") or data.get("key") or item_key
+                    filename = data.get("filename") or f"{attachment_key}.pdf"
+                else:
+                    for child in _helpers._paginate(zot.children, item_key):
+                        child_data = child.get("data", {})
+                        if child_data.get("contentType") == "application/pdf":
+                            attachment_key = child["key"]
+                            filename = child_data.get("filename") or "document.pdf"
+                            break
+
+                if not attachment_key:
+                    return f"No PDF attachment found for item `{item_key}`."
+
+                # Download via the multi-source downloader so WebDAV- and
+                # local-storage-backed attachments work, not just Zotero cloud.
+                local_mode = _utils.is_local_mode()
+                download = _client.download_attachment_file(
+                    attachment_key,
+                    tmpdir,
+                    os.path.basename(filename),
+                    local_client=(
+                        zot if local_mode else _client.get_local_zotero_client()
+                    ),
+                    web_client=None if local_mode else zot,
+                )
+                pdf_path = download.path
+                if (
+                    not pdf_path
+                    or not pdf_path.exists()
+                    or pdf_path.stat().st_size == 0
+                ):
+                    detail = (
+                        f" ({'; '.join(download.errors)})" if download.errors else ""
+                    )
+                    return (
+                        f"Could not download PDF for attachment "
+                        f"`{attachment_key}`.{detail}"
+                    )
+
+            # Lock released: parsing a file we already have on disk needs no
+            # Zotero API access, and it is the slow part.
             outcome = _extract_pdf_toc(str(pdf_path))
 
         if outcome.status == "no_pymupdf":
@@ -2709,6 +4261,10 @@ def get_pdf_outline(
 
         return "\n".join(lines)
 
+    except ZoteroApiBusyError:
+        # Same as every lock-decorated tool: surface "busy" to the caller
+        # rather than reporting it as a PDF failure.
+        raise
     except Exception as e:
         ctx.error(f"Error extracting PDF outline: {e}")
         return f"Error extracting PDF outline: {e}"
@@ -3428,52 +4984,137 @@ def _apply_caller_tags_and_collections(
         item_data["collections"] = existing
 
 
-def _create_and_attach(
+_CREATE_BATCH_SIZE = 50
+
+
+def _create_and_attach_batch(
     write_zot,
-    item_data: dict,
+    item_datas: list[dict],
     attach_mode: str,
     ctx: Context,
-) -> dict:
-    """Create one Zotero item and, if it has a DOI, try to attach an OA PDF.
+    crossref_by_doi: dict[str, dict] | None = None,
+) -> list[dict]:
+    """Create many Zotero items in POSTs of up to 50 and, for each with a
+    DOI, try to attach an OA PDF (#A4).
 
-    Returns a dict ``{"ok": bool, "key": str|None, "doi": str|None,
-    "pdf_status": str|None, "error": str|None, "title": str,
-    "collections_failed": list[str]}``.
+    One ``create_items()`` POST and one ``items(itemKey=...)`` collection-
+    membership read per 50-item chunk, instead of one POST and one
+    ``item()`` GET per item — the 50-key idiom already used for read paths
+    at annotations.py/retrieval.py. ``ensure_collection_membership`` (the
+    per-item #235 backstop, which does its own re-fetch) is only called for
+    entries the bulk read shows are actually missing a requested collection.
+
+    ``crossref_by_doi`` maps normalized DOI to the CrossRef message that
+    entry was built from, for the cascade's "arXiv (via CrossRef)" source.
+    Keyed by DOI rather than passed as a list parallel to ``item_datas``
+    because the DOI is re-derived below anyway, and a parallel list is one
+    more thing that has to stay aligned across chunking. Optional: the
+    bibtex and CSL-JSON importers share this function and have no CrossRef
+    message, in which case that source simply finds nothing.
+
+    Returns per-entry result dicts — ``{"ok": bool, "key": str|None, "doi":
+    str|None, "pdf_status": str|None, "error": str|None, "title": str,
+    "collections_failed": list[str]}`` — in the same order as item_datas.
     """
-    title = item_data.get("title") or "(untitled)"
-    try:
-        result = write_zot.create_items([item_data])
-    except Exception as e:
-        return {"ok": False, "key": None, "doi": None, "pdf_status": None,
-                "error": str(e), "title": title, "collections_failed": []}
+    results: list[dict] = [None] * len(item_datas)
 
-    if not (isinstance(result, dict) and result.get("success")):
-        return {"ok": False, "key": None, "doi": None, "pdf_status": None,
-                "error": f"create_items failed: {result}", "title": title,
-                "collections_failed": []}
+    for chunk_start in range(0, len(item_datas), _CREATE_BATCH_SIZE):
+        chunk = item_datas[chunk_start:chunk_start + _CREATE_BATCH_SIZE]
+        titles = [d.get("title") or "(untitled)" for d in chunk]
+        created_keys: dict[int, str] = {}
+        collections_failed_by_index: dict[int, list[str]] = {}
 
-    item_key = next(iter(result["success"].values()))
+        with zotero_api_lock():
+            try:
+                result = write_zot.create_items(chunk)
+            except Exception as e:
+                for i, title in enumerate(titles):
+                    results[chunk_start + i] = {
+                        "ok": False, "key": None, "doi": None, "pdf_status": None,
+                        "error": str(e), "title": title, "collections_failed": []}
+                continue
 
-    # #235 backstop: atomic filing via item["collections"] is intermittent.
-    collections_failed = _helpers.ensure_collection_membership(
-        write_zot, item_key, item_data.get("collections") or [], ctx=ctx
-    )
+            if not isinstance(result, dict):
+                for i, title in enumerate(titles):
+                    results[chunk_start + i] = {
+                        "ok": False, "key": None, "doi": None, "pdf_status": None,
+                        "error": f"create_items failed: {result}", "title": title,
+                        "collections_failed": []}
+                continue
 
-    doi_raw = item_data.get("DOI") or ""
-    doi = _helpers._normalize_doi(doi_raw) if doi_raw else None
+            success = result.get("success") or {}
+            failed = result.get("failed") or {}
+            created_keys = {int(idx): key for idx, key in success.items()}
 
-    pdf_status = None
-    if doi:
-        try:
-            pdf_status = _helpers._try_attach_oa_pdf(
-                write_zot, item_key, doi, ctx, attach_mode=attach_mode
-            )
-        except Exception as e:
-            pdf_status = f"OA PDF attach failed: {e}"
+            for i, title in enumerate(titles):
+                if i in created_keys:
+                    continue
+                err = failed.get(str(i), "create_items did not report this entry as created")
+                results[chunk_start + i] = {
+                    "ok": False, "key": None, "doi": None, "pdf_status": None,
+                    "error": f"create_items failed: {err}", "title": title,
+                    "collections_failed": []}
 
-    return {"ok": True, "key": item_key, "doi": doi, "pdf_status": pdf_status,
-            "error": None, "title": title,
-            "collections_failed": collections_failed}
+            if created_keys:
+                # #235 backstop: atomic filing via item["collections"] is
+                # intermittent. One bulk read for the whole chunk instead of
+                # one item() GET per created item.
+                keys_in_order = [created_keys[i] for i in sorted(created_keys)]
+                actual_collections: dict[str, set] = {}
+                try:
+                    fetched = write_zot.items(itemKey=",".join(keys_in_order))
+                    for fetched_item in fetched:
+                        k = fetched_item.get("key", "")
+                        actual_collections[k] = set(
+                            fetched_item.get("data", {}).get("collections") or []
+                        )
+                except Exception as e:
+                    if ctx is not None:
+                        ctx.warning(f"Batch collection-membership read failed: {e}")
+
+                for i, item_key in created_keys.items():
+                    requested = chunk[i].get("collections") or []
+                    actual = actual_collections.get(item_key, set())
+                    missing = [k for k in requested if k not in actual]
+                    collections_failed_by_index[i] = (
+                        _helpers.ensure_collection_membership(
+                            write_zot, item_key, requested, ctx=ctx
+                        ) if missing else []
+                    )
+
+        # Attempt open-access PDF attachment — outside the lock, one DOI
+        # download+upload at a time (#A5b: the lock only needs to cover the
+        # Zotero API calls above, not third-party network work).
+        for i, item_key in created_keys.items():
+            item_data = chunk[i]
+            title = titles[i]
+            doi_raw = item_data.get("DOI") or ""
+            doi = _helpers._normalize_doi(doi_raw) if doi_raw else None
+
+            pdf_status = None
+            error = None
+            if doi:
+                try:
+                    pdf_status = _helpers._try_attach_oa_pdf(
+                        write_zot, item_key, doi, ctx,
+                        crossref_metadata=(crossref_by_doi or {}).get(doi),
+                        attach_mode=attach_mode,
+                    )
+                except _helpers.OaPdfRequiredError as e:
+                    error = (
+                        f"item created (key: {item_key}) but attach_mode='required' "
+                        f"found no open-access PDF: {e}"
+                    )
+                except Exception as e:
+                    pdf_status = f"OA PDF attach failed: {e}"
+
+            results[chunk_start + i] = {
+                "ok": error is None, "key": item_key, "doi": doi,
+                "pdf_status": None if error else pdf_status, "error": error,
+                "title": title,
+                "collections_failed": collections_failed_by_index.get(i, [])}
+
+    return results
 
 
 def _maybe_reuse_existing(read_zot, write_zot, item_data, coll_keys, tags,
@@ -3626,7 +5267,12 @@ def add_by_bibtex(
 
         ctx.info(f"Parsed {len(entries)} BibTeX entries")
 
-        results = []
+        # Two passes (#A4): resolve each entry to either a final result
+        # (conversion error or reused-existing) or a ready-to-create
+        # item_data, then create all pending item_datas via one batched
+        # call instead of one create_items() POST per entry.
+        results: list[dict] = []
+        pending: list[tuple[int, dict]] = []
         for entry in entries:
             try:
                 item_data = _citation_import.bibtex_entry_to_zotero(
@@ -3648,7 +5294,15 @@ def add_by_bibtex(
                 continue
 
             _apply_caller_tags_and_collections(item_data, tags, coll_keys)
-            results.append(_create_and_attach(write_zot, item_data, attach_mode, ctx))
+            pending.append((len(results), item_data))
+            results.append(None)
+
+        if pending:
+            created = _create_and_attach_batch(
+                write_zot, [d for _, d in pending], attach_mode, ctx
+            )
+            for (idx, _), cr_result in zip(pending, created):
+                results[idx] = cr_result
 
         return _format_batch_result("# zotero_add_by_bibtex", results)
 
@@ -3709,7 +5363,12 @@ def add_by_csl_json(
 
         ctx.info(f"Processing {len(entries)} CSL JSON entries")
 
-        results = []
+        # Two passes (#A4): resolve each entry to either a final result
+        # (conversion error or reused-existing) or a ready-to-create
+        # item_data, then create all pending item_datas via one batched
+        # call instead of one create_items() POST per entry.
+        results: list[dict] = []
+        pending: list[tuple[int, dict]] = []
         for entry in entries:
             try:
                 item_data = _citation_import.csl_json_to_zotero(
@@ -3731,7 +5390,15 @@ def add_by_csl_json(
                 continue
 
             _apply_caller_tags_and_collections(item_data, tags, coll_keys)
-            results.append(_create_and_attach(write_zot, item_data, attach_mode, ctx))
+            pending.append((len(results), item_data))
+            results.append(None)
+
+        if pending:
+            created = _create_and_attach_batch(
+                write_zot, [d for _, d in pending], attach_mode, ctx
+            )
+            for (idx, _), cr_result in zip(pending, created):
+                results[idx] = cr_result
 
         return _format_batch_result("# zotero_add_by_csl_json", results)
 
@@ -3776,6 +5443,31 @@ _COMMON_TLDS = {
 }
 
 
+def _looks_like_url(s: str) -> bool:
+    """True when *s* has the shape of a web URL.
+
+    Shared by ``detect_source_type`` and the batch-split gate in
+    ``_split_multi_value``. DOI and ISBN have real normalizers to validate
+    against; a URL has only this heuristic, so it lives in one place rather
+    than being re-spelled at each call site.
+    """
+    s = (s or "").strip()
+    if not s or re.search(r"\s", s):
+        # A raw space can't occur in a URL (it must be percent-encoded), and
+        # rejecting it is what lets the batch-split gate tell
+        # "https://a.com, not a url" — two tokens, one bad — apart from a
+        # single URL that merely contains a comma.
+        return False
+    if s.lower().startswith(("http://", "https://")):
+        return True
+    host = _BARE_HOST_RE.match(s)
+    return bool(host and (
+        s.lower().startswith("www.")
+        or host.group("rest")
+        or host.group("tld").lower() in _COMMON_TLDS
+    ))
+
+
 def _looks_like_path(s: str) -> bool:
     """True when *s* has the shape of a filesystem path (POSIX or Windows)."""
     return (
@@ -3810,11 +5502,15 @@ def detect_source_type(source: str) -> str:
     with the implementation it routes to:
 
     1. inline BibTeX (``@entry{...}``) and inline CSL JSON (``[``/``{``)
-       are structural and unambiguous;
+       are structural and unambiguous — except a JSON array of bare strings
+       that are *all* DOIs, which is a multi-DOI batch, not CSL JSON (CSL
+       JSON entries are objects, never bare strings);
     2. http(s) URLs are resolved to a DOI first (``https://doi.org/10.x``
        is a DOI, not a generic web page) and are otherwise a URL;
     3. bare DOIs (``10.x/y``, ``doi:10.x/y``) beat everything below —
-       they contain a ``/`` and would otherwise look path-ish;
+       they contain a ``/`` and would otherwise look path-ish; a
+       comma/newline-separated list where *every* token is independently a
+       valid DOI is a multi-DOI batch;
     4. arXiv IDs route through the URL implementation, which owns the
        arXiv metadata path;
     5. path shapes are classified by extension (``.bib`` -> bibtex,
@@ -3829,12 +5525,32 @@ def detect_source_type(source: str) -> str:
     if _BIBTEX_ENTRY_RE.search(s):
         return "bibtex"
     if s[0] in "[{":
+        if s[0] == "[":
+            try:
+                parsed = json.loads(s)
+            except json.JSONDecodeError:
+                parsed = None
+            if (
+                isinstance(parsed, list) and len(parsed) >= 2
+                and all(isinstance(v, str) for v in parsed)
+                and all(_helpers._normalize_doi(v) for v in parsed)
+            ):
+                return "doi"
         return "csl_json"
 
     if s.lower().startswith(("http://", "https://")):
         return "doi" if _helpers._normalize_doi(s) else "url"
     if _helpers._normalize_doi(s):
         return "doi"
+    if "," in s or "\n" in s:
+        # Split exactly the way the adder will, so detection can't classify a
+        # string as a batch that add_by_doi then treats as one DOI (or vice
+        # versa). _split_multi_value's comma gate already requires every
+        # comma-token to be a DOI; the check below extends that to newline
+        # tokens, which it separates unconditionally.
+        tokens = _split_multi_value(s, "source", _helpers._normalize_doi)
+        if len(tokens) >= 2 and all(_helpers._normalize_doi(t) for t in tokens):
+            return "doi"
     if _helpers._normalize_arxiv_id(s):
         return "url"
 
@@ -3847,12 +5563,7 @@ def detect_source_type(source: str) -> str:
 
     if _helpers._normalize_isbn(s):
         return "isbn"
-    host = _BARE_HOST_RE.match(s)
-    if host and (
-        s.lower().startswith("www.")
-        or host.group("rest")
-        or host.group("tld").lower() in _COMMON_TLDS
-    ):
+    if _looks_like_url(s):
         return "url"
 
     raise ValueError(
@@ -3869,18 +5580,20 @@ def detect_source_type(source: str) -> str:
         "CSL JSON, or a local file. Use for every 'add this to Zotero' "
         "request. "
         "source: the identifier, URL, citation text, or ABSOLUTE file "
-        "path. BibTeX/CSL JSON may be inline (many entries per call) or "
-        "a path to .bib/.bibtex/.json/.csljson; documents are .pdf, "
-        ".epub, .docx and similar. "
-        "source_type: 'auto' (default) detects it; override a wrong "
-        "guess. Routing: doi → CrossRef (best metadata — prefer a DOI "
-        "when you have one); url → doi.org/arxiv.org get full metadata, "
-        "anything else becomes a bare 'webpage' item that is often not "
-        "citable, so resolve to a DOI first; isbn → Open Library then "
-        "Google Books (noisy — verify after); bibtex/csl_json → one item "
-        "per entry, citation key kept in Extra; file → extracts the "
-        "PDF's DOI and enriches via CrossRef, else guesses from "
-        "filename/text, then attaches the file. "
+        "path. DOI/URL/ISBN also take many at once (list or "
+        "comma/newline-separated), each resolved independently. "
+        "BibTeX/CSL JSON may be inline (many entries per call) or a path "
+        "to .bib/.bibtex/.json/.csljson; documents are .pdf, .epub, .docx "
+        "and similar. "
+        "source_type: 'auto' (default) detects it, incl. comma/newline "
+        "DOI lists; override for URL/ISBN batches. Routing: doi → CrossRef "
+        "(best metadata — prefer a DOI when you have one); url → "
+        "doi.org/arxiv.org get full metadata, anything else becomes a bare "
+        "'webpage' item that is often not citable, so resolve to a DOI "
+        "first; isbn → Open Library then Google Books (noisy — verify "
+        "after); bibtex/csl_json → one item per entry, citation key kept "
+        "in Extra; file → extracts the PDF's DOI and enriches via "
+        "CrossRef, else guesses from filename/text, then attaches the file. "
         "collections: keys, names, or '/'-paths ('_project/topic'), "
         "validated before anything is created — an unknown or ambiguous "
         "spec fails the call rather than leaving an unfiled item; "
@@ -3889,8 +5602,8 @@ def detect_source_type(source: str) -> str:
         "idempotent — reuses the item matching the DOI/ISBN/URL, adding "
         "missing collections/tags, never removing; 'skip' leaves a match "
         "untouched. "
-        "attach_mode: 'auto' (default) attaches an open-access PDF when "
-        "available, 'none' skips, 'required' fails without one. "
+        "attach_mode: 'auto' (default) attaches an OA PDF, 'linked_url' "
+        "bookmarks it, 'none' skips, 'required' fails without one. "
         "title: file sources only, when extraction misses. "
         "Requires a writable library (fails in local-only mode). Run "
         "zotero_update_search_database afterwards for semantic search. "

@@ -10,10 +10,12 @@ import contextlib
 import json
 import logging
 import os
+import queue
 import re
 import sys
 import threading
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,14 +28,77 @@ except Exception:
     _tokenizer = None
 
 
-from . import openai_batch
+from . import batch_common, fulltext_cache, gemini_batch, openai_batch
 from .chroma_client import ChromaClient, create_chroma_client
 from .client import get_active_group_id, get_zotero_client
+from .embeddings.registry import batch_capable_providers
 from .extract import PAGE_SEPARATOR
 from .local_db import PERSONAL_LIBRARY_GROUP_ID, LocalZoteroReader
+
+# Re-exported so callers keep importing them from here, while the
+# ChromaDB-free definitions stay importable without this module (#485).
+from .config_light import (  # noqa: F401
+    _DEFAULT_RERANKER_CONFIG,
+    _DEFAULT_UPDATE_CONFIG,
+    load_reranker_config,
+    load_update_config,
+    reranker_enabled,
+    should_update,
+)
 from .utils import _paginate, format_creators, is_local_mode, suppress_stdout
 
 logger = logging.getLogger(__name__)
+
+# Batch-capable providers, by name. Everything provider-specific beyond the
+# module itself lives on the module's ``ADAPTER`` (see batch_common.
+# BatchAdapter), so this table stays a lookup rather than a second, parallel
+# description of each provider that could drift from the adapter.
+_BATCH_MODULES = {"openai": openai_batch, "gemini": gemini_batch}
+
+# How each provider spells "ready to import", for error text only. OpenAI
+# reports "completed", Gemini "succeeded"; both normalize to
+# batch_common.STATE_SUCCEEDED, which is what decision logic actually uses.
+_IMPORTABLE_DESC = {"openai": "completed", "gemini": "succeeded"}
+
+
+def _batch_module(provider: str):
+    """Module implementing ``provider``'s Batch API flows."""
+    try:
+        return _BATCH_MODULES[provider]
+    except KeyError:
+        raise ValueError(
+            f"Unknown batch provider {provider!r}; expected one of {sorted(_BATCH_MODULES)}"
+        ) from None
+
+
+def _batch_adapter(provider: str):
+    """``provider``'s BatchAdapter, read off its module so that monkeypatched
+    module attributes are still honored (adapter methods call by bare name)."""
+    return _batch_module(provider).ADAPTER
+
+
+def _report(message: str) -> None:
+    """Write a progress message to stderr, never failing the caller.
+
+    Progress output is a courtesy, so a closed or broken stderr must not take
+    down a multi-hour indexing run with it.
+    """
+    try:
+        sys.stderr.write(message)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _realtime_slice_size(max_parallel: int) -> int:
+    """How many items one preparation pass hands to the embedding workers.
+
+    Scales with parallelism so a single pass yields enough payloads to keep
+    every worker busy, and is capped so the classify step — which holds
+    ``_chroma_call_lock`` — stays short. The floor of 25 is the historical
+    sequential batch size, so an unparallelized run slices exactly as before.
+    """
+    return min(25 * max(1, max_parallel), 200)
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -139,13 +204,6 @@ def _truncate_to_tokens(text: str, max_tokens: int = 8000) -> str:
     return text
 
 
-_DEFAULT_UPDATE_CONFIG = {
-    "auto_update": False,
-    "update_frequency": "manual",
-    "last_update": None,
-    "update_days": 7,
-}
-
 # Bumped when the ChromaDB metadata shape changes in a way that requires a
 # one-time migration of existing documents. Version 2 (#163) added the
 # `group_id` field. A persisted collection whose config.json records a lower
@@ -168,46 +226,75 @@ _MASS_DELETION_MIN_DOCS = 25
 _MASS_DELETION_MIN_FRACTION = 0.25
 
 
-def load_update_config(config_path: str | None) -> dict[str, Any]:
-    """Read the semantic-search ``update_config`` block from disk.
+def _extract_fulltext_batch(reader, items):
+    """Yield ``(item_id, (text, source) | None)`` for every item in ``items``.
 
-    Pure file read with no ChromaDB or embedding-model side effects, so it is
-    safe on the read-only status path. Returns defaults when the file is
-    missing or unreadable.
+    Prefers the reader's batch API, which parallelises across a process pool
+    when configured. Falls back to one call per item for readers that do not
+    provide it — the minimal doubles used in tests implement only
+    ``extract_fulltext_for_item(item_id)``, and they should not have to grow
+    a new method just because the real reader gained a faster path.
     """
-    config = dict(_DEFAULT_UPDATE_CONFIG)
-    if config_path and os.path.exists(config_path):
-        try:
-            with open(config_path) as f:
-                file_config = json.load(f)
-            config.update(file_config.get("semantic_search", {}).get("update_config", {}))
-        except Exception as e:
-            logger.warning(f"Error loading update config: {e}")
-    return config
+    batch = getattr(reader, "extract_fulltext_for_items", None)
+    if batch is not None:
+        yield from batch(items)
+        return
+    for item_id, _item_key in items:
+        yield item_id, reader.extract_fulltext_for_item(item_id)
 
 
-_DEFAULT_RERANKER_CONFIG: dict[str, Any] = {
-    "enabled": False,
-    "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-    "candidate_multiplier": 3,
-}
+#: End-of-stream marker for the streaming index pipeline's queues. A unique
+#: object so it can never collide with a real payload.
+_STREAM_SENTINEL = object()
+
+#: Vectors buffered before the streaming committer writes to ChromaDB. Large
+#: enough that commits are not the bottleneck, small enough that a crash loses
+#: little work and the fulltext cache is evicted steadily rather than at the end.
+_STREAM_COMMIT_THRESHOLD = 200
 
 
-def load_reranker_config(config_path: str | None) -> dict[str, Any]:
-    """Read the semantic-search ``reranker`` block from disk.
+def _split_prepared_into_requests(prepared: dict[str, Any], request_batch_size: int):
+    """Yield ``(documents, metadatas, ids, item_keys)`` request-sized payloads.
 
-    Pure file read with no model load, so the server can consult it (e.g. to
-    decide whether to warm up) without paying the cross-encoder cost.
+    ``item_keys`` is a list of ``(item_key, already_existed)`` pairs, so the
+    committer can keep added-vs-updated accounting item-granular no matter how
+    many chunks an item produced.
+
+    Splits only on item boundaries. A payload may therefore exceed
+    ``request_batch_size`` when a single item contributed more chunks than
+    that, which is deliberate: an item whose chunks were spread across two
+    independently committed requests could end up half-indexed if one of them
+    failed, and ``delete_item_chunks`` runs once per item at preparation time.
     """
-    config = dict(_DEFAULT_RERANKER_CONFIG)
-    if config_path and os.path.exists(config_path):
-        try:
-            with open(config_path) as f:
-                file_config = json.load(f)
-            config.update(file_config.get("semantic_search", {}).get("reranker", {}))
-        except Exception as e:
-            logger.warning(f"Error loading reranker config: {e}")
-    return config
+    documents = prepared["documents"]
+    metadatas = prepared["metadatas"]
+    ids = prepared["ids"]
+    existing = prepared["existing_item_keys"]
+
+    buffer_docs: list[str] = []
+    buffer_metas: list[dict[str, Any]] = []
+    buffer_ids: list[str] = []
+    buffer_keys: list[tuple[str, bool]] = []
+    offset = 0
+
+    for item_key, doc_count in zip(
+        prepared["item_keys_order"], prepared["item_doc_counts"]
+    ):
+        if doc_count <= 0:
+            continue
+        end = offset + doc_count
+        buffer_docs.extend(documents[offset:end])
+        buffer_metas.extend(metadatas[offset:end])
+        buffer_ids.extend(ids[offset:end])
+        buffer_keys.append((item_key, item_key in existing))
+        offset = end
+
+        if len(buffer_docs) >= request_batch_size:
+            yield buffer_docs, buffer_metas, buffer_ids, buffer_keys
+            buffer_docs, buffer_metas, buffer_ids, buffer_keys = [], [], [], []
+
+    if buffer_docs:
+        yield buffer_docs, buffer_metas, buffer_ids, buffer_keys
 
 
 def warmup_reranker(config_path: str | None = None) -> bool:
@@ -228,40 +315,6 @@ def warmup_reranker(config_path: str | None = None) -> bool:
     except Exception as e:
         logger.warning(f"Reranker warmup failed for '{model}': {e}")
         return False
-
-
-def should_update(update_config: dict[str, Any]) -> bool:
-    """Decide whether an auto-update is due from ``update_config`` alone.
-
-    Pure function of the config dict (and the wall clock) — no I/O, no model
-    load — so both :class:`ZoteroSemanticSearch` and the status tool can share
-    one source of truth.
-    """
-    if not update_config.get("auto_update", False):
-        return False
-
-    frequency = update_config.get("update_frequency", "manual")
-
-    if frequency == "manual":
-        return False
-    elif frequency == "startup":
-        return True
-    elif frequency == "daily":
-        last_update = update_config.get("last_update")
-        if not last_update:
-            return True
-        return datetime.now() - datetime.fromisoformat(last_update) >= timedelta(days=1)
-    elif frequency.startswith("every_"):
-        try:
-            days = int(frequency.split("_")[1])
-            last_update = update_config.get("last_update")
-            if not last_update:
-                return True
-            return datetime.now() - datetime.fromisoformat(last_update) >= timedelta(days=days)
-        except (ValueError, IndexError):
-            return False
-
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +494,26 @@ def get_cached_reranker(model_name: str) -> CrossEncoderReranker:
 class ZoteroSemanticSearch:
     """Semantic search interface for Zotero libraries using ChromaDB."""
 
+    # Class-level fallback so instances built without __init__ (test doubles
+    # do this) still resolve the attribute — None means "use the config".
+    extraction_workers: int | None = None
+
+    # Serializes every ChromaDB call made from the streaming index path, where
+    # a producer thread classifies one slice while the main thread commits the
+    # previous one. ChromaDB gives no concurrency guarantee for a single
+    # PersistentClient, and the calls it guards are short local I/O — the
+    # embedding round-trips this pipeline exists to overlap all happen outside
+    # it. Class-level for the same reason as extraction_workers above; real
+    # instances get their own in __init__, and sharing this one would only
+    # over-serialize, never corrupt.
+    _chroma_call_lock = threading.Lock()
+
     def __init__(
-        self, chroma_client: ChromaClient | None = None, config_path: str | None = None, db_path: str | None = None
+        self,
+        chroma_client: ChromaClient | None = None,
+        config_path: str | None = None,
+        db_path: str | None = None,
+        extraction_workers: int | None = None,
     ):
         """
         Initialize semantic search.
@@ -451,11 +522,15 @@ class ZoteroSemanticSearch:
             chroma_client: Optional ChromaClient instance
             config_path: Path to configuration file
             db_path: Optional path to Zotero database (overrides config file)
+            extraction_workers: Optional parallel-extraction worker count
+                (overrides ``semantic_search.extraction.workers`` in config)
         """
         self.chroma_client = chroma_client or create_chroma_client(config_path)
         self.zotero_client = get_zotero_client()
+        self._chroma_call_lock = threading.Lock()
         self.config_path = config_path
         self.db_path = db_path  # CLI override for Zotero database path
+        self.extraction_workers = extraction_workers  # CLI override, None = use config
         # Item keys seen by the most recent local sqlite scan (set by
         # _get_items_from_local_db); used to verify watermark promotion.
         self._last_scan_snapshot_keys: set[str] | None = None
@@ -497,6 +572,32 @@ class ZoteroSemanticSearch:
     @property
     def _chunking_enabled(self) -> bool:
         return bool(self._chunking_config.get("enabled", False))
+
+    # Message shown when the requested chunking setting cannot take effect.
+    # Kept as a constant so the CLI, the logs and the tests all quote the
+    # same wording (#416).
+    # Templated per provider so a Gemini run is not told to pass a flag that
+    # only turns OpenAI off. The OpenAI wording is unchanged from #416.
+    CHUNKING_IGNORED_ON_BATCH_PATH_TEMPLATE = (
+        "Passage chunking is NOT applied on the {label} Batch API path. "
+        "semantic_search.chunking.enabled is true, but this run indexes one "
+        "vector per item, truncated at the embedding model's input limit, so "
+        "text past that limit will not be searchable. To index with chunking, "
+        "set semantic_search.{provider}_batch.enabled to false or pass "
+        "--no-batch. Otherwise this run proceeds item-level."
+    )
+
+    def _chunking_ignored_message(self, provider: str = "openai") -> str:
+        """The #416 warning, worded for whichever provider is running."""
+        return self.CHUNKING_IGNORED_ON_BATCH_PATH_TEMPLATE.format(
+            label=_batch_adapter(provider).label, provider=provider
+        )
+
+    def _warn_chunking_ignored_on_batch_path(self, provider: str = "openai") -> None:
+        """Surface the batch-path chunking limitation on stderr and in logs."""
+        message = self._chunking_ignored_message(provider)
+        logger.warning(message)
+        _report(f"\nWarning: {message}\n")
 
     def _load_reranker_config(self) -> dict[str, Any]:
         """Load reranker configuration from file or use defaults."""
@@ -540,8 +641,13 @@ class ZoteroSemanticSearch:
             logger.warning(f"Error loading include_fulltext setting: {e}")
             return True
 
-    def _load_openai_batch_enabled(self) -> bool:
-        """Whether OpenAI Batch API indexing is enabled by semantic config."""
+    def _load_batch_enabled(self, provider: str) -> bool:
+        """Whether Batch API indexing is enabled by config for ``provider``.
+
+        Reads ``semantic_search.<provider>_batch.enabled`` — sibling keys
+        (``openai_batch``, ``gemini_batch``), so an existing config keeps
+        working and no migration is needed.
+        """
         if not self.config_path or not os.path.exists(self.config_path):
             return False
         try:
@@ -550,18 +656,113 @@ class ZoteroSemanticSearch:
                 value = (
                     file_config
                     .get("semantic_search", {})
-                    .get("openai_batch", {})
+                    .get(f"{provider}_batch", {})
                     .get("enabled", False)
                 )
                 return bool(value)
         except Exception as e:
-            logger.warning(f"Error loading OpenAI batch setting: {e}")
+            logger.warning(f"Error loading {provider} batch setting: {e}")
             return False
+
+    def _load_openai_batch_enabled(self) -> bool:
+        """Whether OpenAI Batch API indexing is enabled by semantic config."""
+        return self._load_batch_enabled("openai")
+
+    def _load_batch_throttle_config(self, provider: str) -> dict[str, Any]:
+        """Throttling limits for ``provider``'s Batch API submissions.
+
+        ``semantic_search.<provider>_batch.batch_max_enqueued_tokens`` caps how
+        many estimated tokens may sit queued with the provider at once — the
+        quota whose violation surfaces as a 429 on a large library.
+        ``batch_max_requests`` caps requests per uploaded JSONL file. Defaults
+        are the providers' Tier 1 limits; raise them in config on higher tiers.
+        """
+        config: dict[str, Any] = {
+            "batch_max_enqueued_tokens": _batch_adapter(provider).default_max_enqueued_tokens,
+            "batch_max_requests": _batch_adapter(provider).max_requests,
+        }
+        if self.config_path and os.path.exists(self.config_path):
+            try:
+                with open(self.config_path) as f:
+                    file_config = json.load(f)
+                block = file_config.get("semantic_search", {}).get(f"{provider}_batch", {})
+                for key in config:
+                    if block.get(key) is not None:
+                        config[key] = int(block[key])
+            except Exception as e:
+                logger.warning(f"Error loading {provider} batch throttle config: {e}")
+        return config
+
+    def _resolve_batch_enabled(self, provider: str, override: bool | None) -> bool:
+        """Resolve CLI override + config default for ``provider``'s batch indexing.
+
+        Batch mode is only active when the configured embedding model matches
+        ``provider``: submission builds requests from
+        ``self.chroma_client.embedding_config``, so running a provider whose
+        embedding space is not the configured one would write vectors that no
+        query could ever match.
+        """
+        requested = self._load_batch_enabled(provider) if override is None else override
+        return bool(requested and self.chroma_client.embedding_model == provider)
 
     def _resolve_openai_batch_enabled(self, use_openai_batch: bool | None) -> bool:
         """Resolve CLI override + config default for OpenAI batch indexing."""
-        requested = self._load_openai_batch_enabled() if use_openai_batch is None else use_openai_batch
-        return bool(requested and self.chroma_client.embedding_model == "openai")
+        return self._resolve_batch_enabled("openai", use_openai_batch)
+
+    def _resolve_gemini_batch_enabled(self, use_gemini_batch: bool | None) -> bool:
+        """Resolve CLI override + config default for Gemini batch indexing."""
+        return self._resolve_batch_enabled("gemini", use_gemini_batch)
+
+    def _resolve_batch_mode(
+        self,
+        use_batch: bool | None = None,
+        batch_provider: str | None = None,
+        use_openai_batch: bool | None = None,
+        use_gemini_batch: bool | None = None,
+    ) -> tuple[bool, str]:
+        """Resolve which provider (if any) runs the Batch API this run.
+
+        Returns ``(enabled, provider)``. Priority: explicit ``batch_provider``
+        > explicit ``use_batch`` > the deprecated per-provider flags > config.
+
+        An explicit ``batch_provider`` that disagrees with the configured
+        embedding model raises rather than silently falling back to realtime:
+        the caller asked for something that cannot be honored, and quietly
+        doing something else is how a multi-hour run ends up in the wrong
+        embedding space. ``use_batch=False`` still forces realtime without
+        discarding an explicit provider choice.
+        """
+        providers_with_batch = batch_capable_providers()
+        if batch_provider is not None and batch_provider not in providers_with_batch:
+            raise ValueError(
+                f"Unknown batch_provider {batch_provider!r}; must be one of "
+                f"{providers_with_batch} (providers with Batch API support)."
+            )
+        if batch_provider is not None:
+            if use_batch is False:
+                return False, batch_provider
+            if self.chroma_client.embedding_model != batch_provider:
+                raise ValueError(
+                    f"batch_provider={batch_provider!r} requires embedding_model "
+                    f"{batch_provider!r}, but '{self.chroma_client.embedding_model}' "
+                    "is configured."
+                )
+            return True, batch_provider
+        if use_batch is not None:
+            model = self.chroma_client.embedding_model
+            if use_batch and model not in providers_with_batch:
+                raise ValueError(
+                    f"use_batch=True requires a batch-capable embedding_model; "
+                    f"'{model}' has no Batch API support (supported: {providers_with_batch})."
+                )
+            provider = model if model in providers_with_batch else providers_with_batch[0]
+            return self._resolve_batch_enabled(provider, use_batch), provider
+        # Nothing explicit: per-provider config-driven resolution, which is
+        # exactly the pre-existing behaviour for an OpenAI-only config.
+        resolved_openai = self._resolve_batch_enabled("openai", use_openai_batch)
+        resolved_gemini = self._resolve_batch_enabled("gemini", use_gemini_batch)
+        provider = "openai" if resolved_openai else "gemini"
+        return resolved_openai or resolved_gemini, provider
 
     def _client_group_id(self) -> int:
         """group_id of the library ``self.zotero_client`` is actually scoped to.
@@ -1125,6 +1326,7 @@ class ZoteroSemanticSearch:
             attachment_priority = None
             zotero_db_path = self.db_path  # CLI override takes precedence
             collection_keys = None
+            config_workers = None
             # If semantic_search config file exists, prefer its setting
             try:
                 if self.config_path and os.path.exists(self.config_path):
@@ -1134,6 +1336,7 @@ class ZoteroSemanticSearch:
                         extraction_cfg = semantic_cfg.get("extraction", {})
                         pdf_max_pages = extraction_cfg.get("pdf_max_pages")
                         attachment_priority = extraction_cfg.get("attachment_priority")
+                        config_workers = extraction_cfg.get("workers")
                         collection_keys = semantic_cfg.get("collection_keys")
                         # Use config db_path only if no CLI override
                         if not zotero_db_path:
@@ -1141,12 +1344,24 @@ class ZoteroSemanticSearch:
             except Exception:
                 pass
 
+            # CLI flag beats config; 1 (fully sequential) when neither is set.
+            # Never exceed the core count — extraction is CPU-bound, so extra
+            # workers only add process-spawn and scheduling overhead.
+            workers = self.extraction_workers or config_workers or 1
+            workers = max(1, min(int(workers), os.cpu_count() or 1))
+
             with (
                 suppress_stdout(),
                 LocalZoteroReader(
                     db_path=zotero_db_path,
                     pdf_max_pages=pdf_max_pages,
                     attachment_priority=attachment_priority,
+                    extraction_workers=workers,
+                    # The indexing path is the one place the transient cache
+                    # is safe to write: it extracts under the *indexing* page
+                    # cap, which is what a later run will want to reuse.
+                    fulltext_cache_enabled=True,
+                    config_path=self.config_path,
                 ) as reader,
             ):
                 # Stamped on every document so a later run can tell that the
@@ -1247,6 +1462,10 @@ class ZoteroSemanticSearch:
                     skipped_existing = 0
                     updated_existing = 0
                     items_to_process = []
+                    # Items whose attachment still needs parsing. Collected
+                    # here rather than parsed inline so the expensive half can
+                    # run as one batch — see the phase 2b loop below.
+                    pending_extraction = []
 
                     total_local = len(local_items)
                     _skipped_failed = []  # Items skipped because extraction previously failed
@@ -1395,19 +1614,41 @@ class ZoteroSemanticSearch:
                                     skipped_existing += 1
 
                         if should_extract:
-                            # Extract fulltext if item doesn't have it yet
+                            # Defer the parse itself — see phase 2b.
                             if not getattr(it, "fulltext", None):
-                                text = reader.extract_fulltext_for_item(it.item_id)
-                                if text:
-                                    it.fulltext, it.fulltext_source = text
-                                else:
-                                    # Nothing readable — mark so the metadata
-                                    # records that we did try.
-                                    it._fulltext_attempted = True
+                                pending_extraction.append(it)
                             extracted += 1
                             items_to_process.append(it)
 
                             # (progress shown inline above via \r)
+
+                    # Phase 2b: parse the chosen attachments. With
+                    # extraction_workers == 1 this is the same sequential walk
+                    # as before; above 1 it fans out over a process pool, and
+                    # results arrive out of order — hence the lookup by id.
+                    if pending_extraction:
+                        by_id = {it.item_id: it for it in pending_extraction}
+                        done = 0
+                        for item_id, result in _extract_fulltext_batch(
+                            reader, [(it.item_id, it.key) for it in pending_extraction]
+                        ):
+                            target = by_id.get(item_id)
+                            if target is None:
+                                continue
+                            if result:
+                                target.fulltext, target.fulltext_source = result
+                            else:
+                                # Nothing readable — mark so the metadata
+                                # records that we did try.
+                                target._fulltext_attempted = True
+                            done += 1
+                            if done % 10 == 0 or done == len(pending_extraction):
+                                try:
+                                    line = f"  Extracting text: {done}/{len(pending_extraction)}"
+                                    sys.stderr.write(f"\r{line}{' ' * 40}")
+                                    sys.stderr.flush()
+                                except Exception:
+                                    pass
 
                     _extract_logger.setLevel(_prev_level)
 
@@ -1845,14 +2086,20 @@ class ZoteroSemanticSearch:
 
         return records, stats
 
-    def _submit_openai_batch_index(
+    def _submit_batch_index(
         self,
+        provider: str,
         items: list[dict[str, Any]],
         force_full_rebuild: bool,
         target_sync_version: int | None,
         stats: dict[str, Any],
+        max_enqueued_tokens: int | None = None,
+        max_requests: int | None = None,
     ) -> dict[str, Any]:
-        """Prepare records and submit asynchronous OpenAI embedding batches."""
+        """Prepare records and submit asynchronous embedding batches."""
+        module = _batch_module(provider)
+        adapter = _batch_adapter(provider)
+        label = adapter.label
         records, prepare_stats = self._prepare_index_records(items)
         stats["processed_items"] += prepare_stats["processed"]
         stats["skipped_items"] += prepare_stats["skipped"]
@@ -1860,13 +2107,18 @@ class ZoteroSemanticSearch:
 
         if not records:
             stats["batch_submitted"] = False
-            stats["batch_error"] = "No documents were prepared for OpenAI Batch API submission"
+            stats["batch_error"] = f"No documents were prepared for {label} Batch API submission"
             return stats
 
         ids = [record["id"] for record in records]
         existing_ids = self.chroma_client.get_existing_ids(ids) if ids and not force_full_rebuild else set()
-        model_name = self.chroma_client.embedding_config.get("model_name", "text-embedding-3-small")
-        manifest = openai_batch.submit_embedding_batches(
+        model_name = self.chroma_client.embedding_config.get("model_name", adapter.default_model)
+        submit_kwargs: dict[str, Any] = {}
+        if max_enqueued_tokens is not None:
+            submit_kwargs["max_enqueued_tokens"] = max_enqueued_tokens
+        if max_requests is not None:
+            submit_kwargs["max_requests"] = max_requests
+        manifest = module.submit_embedding_batches(
             records=records,
             model_name=model_name,
             embedding_config=self.chroma_client.embedding_config,
@@ -1876,15 +2128,51 @@ class ZoteroSemanticSearch:
             # The manifest's group_id keys the watermark save at import time;
             # it must carry the run's pinned identity, not the live override.
             group_id=self._pinned_group_id(),
+            **submit_kwargs,
         )
+        stats["batch_provider"] = provider
         stats["batch_submitted"] = True
         stats["batch_run_id"] = manifest["run_id"]
         stats["batch_manifest"] = manifest["manifest_path"]
-        stats["batch_ids"] = [batch["batch_id"] for batch in manifest.get("batches", [])]
+        # Pending (throttled, not yet submitted) chunks have no batch_id yet.
+        stats["batch_ids"] = [b["batch_id"] for b in manifest.get("batches", []) if b.get("batch_id")]
+        stats["batch_pending"] = sum(
+            1 for b in manifest.get("batches", []) if b.get("status") == batch_common.STATE_PENDING
+        )
         stats["submitted_items"] = len(records)
         stats["estimated_updated_items"] = len(existing_ids)
         stats["estimated_added_items"] = len(ids) - len(existing_ids)
         return stats
+
+    def _submit_openai_batch_index(
+        self,
+        items: list[dict[str, Any]],
+        force_full_rebuild: bool,
+        target_sync_version: int | None,
+        stats: dict[str, Any],
+        max_enqueued_tokens: int | None = None,
+        max_requests: int | None = None,
+    ) -> dict[str, Any]:
+        """Prepare records and submit asynchronous OpenAI embedding batches."""
+        return self._submit_batch_index(
+            "openai", items, force_full_rebuild, target_sync_version, stats,
+            max_enqueued_tokens=max_enqueued_tokens, max_requests=max_requests,
+        )
+
+    def _submit_gemini_batch_index(
+        self,
+        items: list[dict[str, Any]],
+        force_full_rebuild: bool,
+        target_sync_version: int | None,
+        stats: dict[str, Any],
+        max_enqueued_tokens: int | None = None,
+        max_requests: int | None = None,
+    ) -> dict[str, Any]:
+        """Prepare records and submit asynchronous Gemini embedding batches."""
+        return self._submit_batch_index(
+            "gemini", items, force_full_rebuild, target_sync_version, stats,
+            max_enqueued_tokens=max_enqueued_tokens, max_requests=max_requests,
+        )
 
     def update_database(
         self,
@@ -1893,6 +2181,13 @@ class ZoteroSemanticSearch:
         extract_fulltext: bool = False,
         include_fulltext: bool | None = None,
         use_openai_batch: bool | None = None,
+        use_gemini_batch: bool | None = None,
+        use_batch: bool | None = None,
+        batch_provider: str | None = None,
+        batch_max_tokens: int | None = None,
+        batch_max_requests: int | None = None,
+        auto_loop: bool = False,
+        batch_poll_interval: int = 60,
         allow_mass_deletion: bool = False,
     ) -> dict[str, Any]:
         """
@@ -1908,8 +2203,25 @@ class ZoteroSemanticSearch:
                 `semantic_search.include_fulltext` config setting (True
                 unless explicitly disabled). Ignored in local mode since
                 `extract_fulltext` provides richer local extraction.
-            use_openai_batch: Override for OpenAI Batch API indexing. None
-                uses `semantic_search.openai_batch.enabled`.
+            use_openai_batch: Deprecated in favour of `use_batch` /
+                `batch_provider`. Override for OpenAI Batch API indexing.
+                None uses `semantic_search.openai_batch.enabled`. Ignored
+                whenever `use_batch` or `batch_provider` is given.
+            use_gemini_batch: Deprecated in favour of `use_batch` /
+                `batch_provider`. Override for Gemini Batch API indexing.
+                None uses `semantic_search.gemini_batch.enabled`.
+            use_batch: Provider-neutral on/off for Batch API indexing; the
+                provider is inferred from the configured embedding model
+                unless `batch_provider` names one.
+            batch_provider: Which batch provider to use. Must match the
+                configured embedding model.
+            batch_max_tokens: Override for the enqueued-token throttle
+                (`semantic_search.<provider>_batch.batch_max_enqueued_tokens`).
+            batch_max_requests: Override for the per-file request cap
+                (`semantic_search.<provider>_batch.batch_max_requests`).
+            auto_loop: After submitting, keep polling, importing completed
+                batches and submitting parked ones until the run finishes.
+            batch_poll_interval: Seconds between auto-loop polls.
             allow_mass_deletion: One-run opt-in for a deletion pass that
                 would remove a large share of the library's indexed docs
                 (or all of them, when item_versions() reports the library
@@ -2055,11 +2367,31 @@ class ZoteroSemanticSearch:
             # Web-API fulltext only applies when not using the local sqlite
             # extractor (extract_fulltext=True takes precedence in local mode)
             include_fulltext_via_api = include_fulltext and not extract_fulltext
-            use_openai_batch = self._resolve_openai_batch_enabled(use_openai_batch)
+            batch_enabled, active_batch_provider = self._resolve_batch_mode(
+                use_batch=use_batch,
+                batch_provider=batch_provider,
+                use_openai_batch=use_openai_batch,
+                use_gemini_batch=use_gemini_batch,
+            )
+            throttle = self._load_batch_throttle_config(active_batch_provider)
+            if batch_max_tokens is not None:
+                throttle["batch_max_enqueued_tokens"] = batch_max_tokens
+            if batch_max_requests is not None:
+                throttle["batch_max_requests"] = batch_max_requests
+
+            # The Batch API path builds one item-level record per item
+            # (_prepare_index_records) and has no chunking step, so a config
+            # asking for passage chunking silently produced a truncated,
+            # item-level index instead. Say so once, before the run does any
+            # work, rather than leaving it visible only by reading the
+            # generated JSONL by hand (#416).
+            if batch_enabled and self._chunking_enabled:
+                stats["chunking_ignored"] = True
+                self._warn_chunking_ignored_on_batch_path(active_batch_provider)
 
             # In batch mode, defer destructive rebuilds until import so the
             # existing search index remains usable while the batch runs.
-            if force_full_rebuild and not use_openai_batch:
+            if force_full_rebuild and not batch_enabled:
                 logger.info("Force rebuilding database...")
                 self.chroma_client.reset_collection()
 
@@ -2251,34 +2583,45 @@ class ZoteroSemanticSearch:
             stats["total_items"] = len(all_items)
             logger.info(f"Found {stats['total_items']} items to process")
 
-            if use_openai_batch:
+            if batch_enabled:
                 stats["batch_mode"] = True
+                stats["batch_provider"] = active_batch_provider
+                batch_label = _batch_adapter(active_batch_provider).label
                 if stats.get("deletion_skipped_reason"):
                     # The manifest's target_sync_version is promoted at import
                     # time; a skipped deletion pass must stay retryable there
                     # exactly as on the realtime path.
                     target_sync_version = None
-                try:
-                    sys.stderr.write(f"\nSubmitting {len(all_items)} items to OpenAI Batch API...\n")
-                    sys.stderr.flush()
-                except Exception:
-                    pass
-                stats = self._submit_openai_batch_index(
+                _report(f"\nSubmitting {len(all_items)} items to {batch_label} Batch API...\n")
+                stats = self._submit_batch_index(
+                    active_batch_provider,
                     all_items,
                     force_full_rebuild=force_full_rebuild,
                     target_sync_version=target_sync_version,
                     stats=stats,
+                    max_enqueued_tokens=throttle["batch_max_enqueued_tokens"],
+                    max_requests=throttle["batch_max_requests"],
                 )
-                try:
-                    batch_ids = ", ".join(stats.get("batch_ids", []))
-                    sys.stderr.write(
-                        "  Submitted OpenAI embedding batch"
-                        f"{'es' if len(stats.get('batch_ids', [])) != 1 else ''}: {batch_ids}\n"
+                batch_ids = ", ".join(stats.get("batch_ids", []))
+                _report(
+                    f"  Submitted {batch_label} embedding batch"
+                    f"{'es' if len(stats.get('batch_ids', [])) != 1 else ''}: {batch_ids}\n"
+                )
+                if stats.get("batch_pending"):
+                    _report(
+                        f"  {stats['batch_pending']} chunk(s) held back by the enqueued-token "
+                        "budget; they submit as running batches finish.\n"
                     )
-                    sys.stderr.write("  Run 'zotero-mcp openai-batch-status' to check progress.\n")
-                    sys.stderr.write("  Run 'zotero-mcp openai-batch-import' after the batch completes.\n")
-                except Exception:
-                    pass
+                if auto_loop and stats.get("batch_submitted"):
+                    self.auto_loop_batch_pipeline(
+                        active_batch_provider,
+                        poll_interval=batch_poll_interval,
+                        max_enqueued_tokens=throttle["batch_max_enqueued_tokens"],
+                        stats=stats,
+                    )
+                else:
+                    _report("  Run 'zotero-mcp batch-status' to check progress.\n")
+                    _report("  Run 'zotero-mcp batch-import' after the batch completes.\n")
                 end_time = datetime.now()
                 stats["duration"] = str(end_time - start_time)
                 stats["end_time"] = end_time.isoformat()
@@ -2303,33 +2646,72 @@ class ZoteroSemanticSearch:
             batch_size = 25
             seen_items = 0
             _failed_docs = []  # Collect failures for end-of-run retry
-            for i in range(0, len(all_items), batch_size):
-                batch = all_items[i : i + batch_size]
 
-                # Show per-item progress within this batch
-                for item in batch:
-                    seen_items += 1
-                    title = item.get("data", {}).get("title", "")
-                    if title and len(title) > 60:
-                        title = title[:57] + "..."
-                    pct = int(seen_items / total * 100) if total else 0
-                    try:
-                        sys.stderr.write(f"\r  [{pct:3d}%] {seen_items}/{total} — {title or 'processing...'}")
-                        sys.stderr.flush()
-                    except Exception:
-                        pass
+            def _report_item_progress(item: dict[str, Any]) -> None:
+                """Advance the single-line progress display by one item.
 
-                batch_stats = self._process_item_batch(batch, force_full_rebuild, _failed_docs)
+                Called from exactly one thread on both paths — the loop below,
+                or the streaming producer — so the `\\r` line never interleaves
+                and items are still announced in input order.
+                """
+                nonlocal seen_items
+                seen_items += 1
+                title = item.get("data", {}).get("title", "")
+                if title and len(title) > 60:
+                    title = title[:57] + "..."
+                pct = int(seen_items / total * 100) if total else 0
+                try:
+                    sys.stderr.write(f"\r  [{pct:3d}%] {seen_items}/{total} — {title or 'processing...'}")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
 
-                stats["processed_items"] += batch_stats["processed"]
-                stats["added_items"] += batch_stats["added"]
-                stats["updated_items"] += batch_stats["updated"]
-                stats["skipped_items"] += batch_stats["skipped"]
-                stats["errors"] += batch_stats["errors"]
+            # Overlap preparation, embedding and commits when the embedding
+            # function is configured for concurrent requests. Off unless
+            # embedding_config.max_parallel_requests says otherwise, so the
+            # default run is byte-for-byte the historical sequential path. The
+            # upsert_embeddings check also keeps the minimal ChromaDB doubles
+            # used in tests — which implement only upsert_documents — on it.
+            embedding_function = getattr(self.chroma_client, "embedding_function", None)
+            max_parallel = getattr(embedding_function, "max_parallel_requests", 1) or 1
+            use_streaming = (
+                embedding_function is not None
+                and max_parallel > 1
+                and hasattr(self.chroma_client, "upsert_embeddings")
+            )
 
+            if use_streaming:
                 logger.info(
-                    f"Processed {seen_items}/{total} items (added: {stats['added_items']}, skipped: {stats['skipped_items']})"
+                    f"Streaming index: {max_parallel} parallel embedding requests"
                 )
+                self._stream_index_items(
+                    all_items,
+                    force_full_rebuild,
+                    stats,
+                    _failed_docs,
+                    embedding_function,
+                    max_parallel,
+                    _report_item_progress,
+                )
+            else:
+                for i in range(0, len(all_items), batch_size):
+                    batch = all_items[i : i + batch_size]
+
+                    # Show per-item progress within this batch
+                    for item in batch:
+                        _report_item_progress(item)
+
+                    batch_stats = self._process_item_batch(batch, force_full_rebuild, _failed_docs)
+
+                    stats["processed_items"] += batch_stats["processed"]
+                    stats["added_items"] += batch_stats["added"]
+                    stats["updated_items"] += batch_stats["updated"]
+                    stats["skipped_items"] += batch_stats["skipped"]
+                    stats["errors"] += batch_stats["errors"]
+
+                    logger.info(
+                        f"Processed {seen_items}/{total} items (added: {stats['added_items']}, skipped: {stats['skipped_items']})"
+                    )
 
             # Retry any documents that failed during the main run
             if _failed_docs:
@@ -2413,21 +2795,30 @@ class ZoteroSemanticSearch:
             # for the path where we actually hold the lock.
             lock_cm.__exit__(None, None, None)
 
-    def _process_item_batch(
+    def _prepare_and_classify_slice(
         self,
         items: list[dict[str, Any]],
         force_rebuild: bool = False,
-        _failed_docs: list | None = None,
-    ) -> dict[str, int]:
-        """Process a batch of items.
+    ) -> dict[str, Any]:
+        """Build the documents for ``items`` and classify them existing-vs-new.
 
-        _failed_docs: optional list (passed by reference from update_database)
-        that collects (doc_text, metadata, doc_id) tuples for batches that fail
-        mid-run. Without this, the retry path at update_database:839-865 is
-        dead code — a NameError raised here would crash the whole reindex,
-        making every transient ChromaDB error fatal instead of recoverable.
+        Everything :meth:`_process_item_batch` does up to, but not including,
+        handing documents to ChromaDB: assembling each item's text and
+        metadata, splitting it into passages when chunking is on, truncating to
+        the embedding model's limit, probing which items are already indexed,
+        and clearing an item's stale passages before its new ones are written.
+
+        Safe to call from a worker thread. The assembly loop touches no shared
+        state; the two ChromaDB calls at the end are guarded by
+        ``_chroma_call_lock`` so they can never interleave with a commit
+        running on another thread.
+
+        Returns the prepared parallel lists plus ``item_doc_counts`` — how many
+        documents each entry in ``item_keys_order`` contributed — so a caller
+        can split the batch on item boundaries without re-deriving them from
+        the ids.
         """
-        stats = {"processed": 0, "added": 0, "updated": 0, "skipped": 0, "errors": 0}
+        stats = {"processed": 0, "skipped": 0, "errors": 0}
 
         chunking = self._chunking_enabled
         chunk_size = int(self._chunking_config.get("chunk_size", 1500))
@@ -2440,6 +2831,9 @@ class ZoteroSemanticSearch:
         # One entry per *item* successfully prepared (not per chunk) so add/
         # update accounting stays item-granular regardless of chunking.
         item_keys_order: list[str] = []
+        # Documents contributed by each entry of item_keys_order, so callers
+        # can slice the flat lists back into whole items.
+        item_doc_counts: list[int] = []
 
         for item in items:
             try:
@@ -2447,6 +2841,7 @@ class ZoteroSemanticSearch:
                 if not item_key:
                     stats["skipped"] += 1
                     continue
+                docs_before = len(documents)
 
                 # Create document text and metadata
                 # Always include structured fields; append fulltext when available
@@ -2491,19 +2886,19 @@ class ZoteroSemanticSearch:
                     ids.append(item_key)
 
                 item_keys_order.append(item_key)
+                item_doc_counts.append(len(documents) - docs_before)
                 stats["processed"] += 1
 
             except Exception as e:
                 logger.error(f"Error processing item {item.get('key', 'unknown')}: {e}")
                 stats["errors"] += 1
 
-        # Add documents to ChromaDB if any
-        if documents:
-            # Which items already existed (drives added-vs-updated). When
-            # chunking, also clear an item's stale passages before re-adding so
-            # a shrinking document never leaves orphaned chunks behind.
-            existing_item_keys: set[str] = set()
-            if not force_rebuild:
+        # Which items already existed (drives added-vs-updated). When chunking,
+        # also clear an item's stale passages before re-adding so a shrinking
+        # document never leaves orphaned chunks behind.
+        existing_item_keys: set[str] = set()
+        if documents and not force_rebuild:
+            with self._chroma_call_lock:
                 if chunking:
                     probe_ids = [f"{k}#0" for k in item_keys_order]
                     existing_chunk0 = self.chroma_client.get_existing_ids(probe_ids)
@@ -2517,13 +2912,305 @@ class ZoteroSemanticSearch:
                 else:
                     existing_item_keys = self.chroma_client.get_existing_ids(ids)
 
+        return {
+            "documents": documents,
+            "metadatas": metadatas,
+            "ids": ids,
+            "item_keys_order": item_keys_order,
+            "item_doc_counts": item_doc_counts,
+            "existing_item_keys": existing_item_keys,
+            "prep_stats": stats,
+        }
+
+    def _stream_index_items(
+        self,
+        all_items: list[dict[str, Any]],
+        force_rebuild: bool,
+        stats: dict[str, Any],
+        failed_docs: list,
+        embedding_function: Any,
+        max_parallel: int,
+        report_progress: Any,
+    ) -> None:
+        """Index ``all_items`` with preparation, embedding and commits overlapped.
+
+        One producer thread prepares slices and splits them into request-sized
+        payloads; ``max_parallel`` worker threads embed those payloads; the
+        calling thread is the sole committer, buffering vectors and writing
+        them with ``upsert_embeddings``. Only the workers block on the network,
+        so several embedding requests are in flight while the next slice is
+        being prepared and the previous one committed.
+
+        Mutates ``stats`` and ``failed_docs`` in place, exactly as the
+        synchronous path does, so the caller's end-of-run retry pass is shared
+        between both paths.
+        """
+        slice_size = _realtime_slice_size(max_parallel)
+        request_batch_size = (
+            getattr(embedding_function, "request_batch_size", None) or 64
+        )
+
+        # Bounded in payloads, not items: the producer must never materialize
+        # the whole library's prepared documents or computed vectors at once.
+        queue_size = max(2 * max_parallel, 4)
+        chunk_queue: queue.Queue = queue.Queue(maxsize=queue_size)
+        vector_queue: queue.Queue = queue.Queue(maxsize=queue_size)
+
+        stop_event = threading.Event()
+        stats_lock = threading.Lock()
+        failed_lock = threading.Lock()
+        errors_lock = threading.Lock()
+        thread_errors: list[BaseException] = []
+
+        def bump(key: str, amount: int = 1) -> None:
+            # The producer and the committer both write to `stats`, and
+            # `stats[key] += n` is several bytecodes with a GIL release
+            # possible in between, so every update goes through this lock.
+            if not amount:
+                return
+            with stats_lock:
+                stats[key] += amount
+
+        def record_failures(documents, metadatas, ids) -> None:
+            with failed_lock:
+                failed_docs.extend(zip(documents, metadatas, ids))
+
+        def record_thread_error(exc: BaseException) -> None:
+            with errors_lock:
+                thread_errors.append(exc)
+
+        def producer() -> None:
             try:
-                self.chroma_client.upsert_documents(documents, metadatas, ids)
+                for start in range(0, len(all_items), slice_size):
+                    if stop_event.is_set():
+                        break
+                    slice_items = all_items[start : start + slice_size]
+                    for item in slice_items:
+                        report_progress(item)
+
+                    prepared = self._prepare_and_classify_slice(
+                        slice_items, force_rebuild
+                    )
+                    prep = prepared["prep_stats"]
+                    bump("processed_items", prep["processed"])
+                    bump("skipped_items", prep["skipped"])
+                    bump("errors", prep["errors"])
+
+                    for payload in _split_prepared_into_requests(
+                        prepared, request_batch_size
+                    ):
+                        if stop_event.is_set():
+                            break
+                        chunk_queue.put(payload)
+            except BaseException as exc:  # noqa: BLE001 - re-raised by the caller
+                record_thread_error(exc)
+            finally:
+                # Unconditional. A producer that died early must still release
+                # every worker, or they block on get() forever and the commit
+                # loop never sees the sentinels that end it.
+                for _ in range(max_parallel):
+                    chunk_queue.put(_STREAM_SENTINEL)
+
+        def worker() -> None:
+            try:
+                while True:
+                    payload = chunk_queue.get()
+                    if payload is _STREAM_SENTINEL:
+                        break
+                    documents, metadatas, ids, item_keys = payload
+                    try:
+                        vectors = embedding_function(documents)
+                    except Exception as exc:
+                        # One sub-batch failing is not fatal: hand it to the
+                        # end-of-run retry pass and keep the worker alive, so a
+                        # single bad request cannot end the whole run.
+                        logger.warning(
+                            f"Embedding request failed ({exc}), saving for retry"
+                        )
+                        record_failures(documents, metadatas, ids)
+                        bump("errors", len(documents))
+                        continue
+                    vector_queue.put((documents, metadatas, ids, item_keys, vectors))
+            except BaseException as exc:  # noqa: BLE001 - re-raised by the caller
+                record_thread_error(exc)
+            finally:
+                # Also unconditional, and exactly one per worker, so the commit
+                # loop's countdown always reaches zero.
+                vector_queue.put(_STREAM_SENTINEL)
+
+        write_docs: list[str] = []
+        write_metas: list[dict[str, Any]] = []
+        write_ids: list[str] = []
+        write_vectors: list[Any] = []
+        write_keys: dict[str, bool] = {}
+        accounted_keys: set[str] = set()
+
+        def flush() -> None:
+            nonlocal write_docs, write_metas, write_ids, write_vectors, write_keys
+            if not write_vectors:
+                return
+            try:
+                with self._chroma_call_lock:
+                    self.chroma_client.upsert_embeddings(
+                        write_docs, write_metas, write_ids, write_vectors
+                    )
+            except Exception as exc:
+                logger.warning(f"Batch upsert failed ({exc}), saving for retry")
+                record_failures(write_docs, write_metas, write_ids)
+                bump("errors", len(write_docs))
+            else:
+                for item_key, already_existed in write_keys.items():
+                    if item_key in accounted_keys:
+                        continue
+                    accounted_keys.add(item_key)
+                    bump("updated_items" if already_existed else "added_items")
+                # Same contract as the synchronous path: the transient copy of
+                # an item's extracted text has done its job once its embedding
+                # is persisted, so evict per commit rather than at the end.
+                try:
+                    fulltext_cache.evict_many(
+                        list(write_keys), config_path=self.config_path
+                    )
+                except Exception as exc:
+                    logger.debug(f"Fulltext cache eviction failed: {exc}")
+            finally:
+                write_docs, write_metas, write_ids, write_vectors = [], [], [], []
+                write_keys = {}
+
+        producer_thread = threading.Thread(
+            target=producer, name="zmcp-index-producer", daemon=True
+        )
+        worker_threads = [
+            threading.Thread(target=worker, name=f"zmcp-index-worker-{i}", daemon=True)
+            for i in range(max_parallel)
+        ]
+        producer_thread.start()
+        for thread in worker_threads:
+            thread.start()
+
+        active_workers = max_parallel
+        try:
+            while active_workers > 0:
+                try:
+                    payload = vector_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if payload is _STREAM_SENTINEL:
+                    # Each worker emits its sentinel only after its last
+                    # result, so once all of them have arrived the queue is
+                    # drained by construction.
+                    active_workers -= 1
+                    continue
+                documents, metadatas, ids, item_keys, vectors = payload
+                write_docs.extend(documents)
+                write_metas.extend(metadatas)
+                write_ids.extend(ids)
+                write_vectors.extend(vectors)
+                for item_key, already_existed in item_keys:
+                    write_keys[item_key] = already_existed
+                if len(write_vectors) >= _STREAM_COMMIT_THRESHOLD:
+                    flush()
+            flush()
+        except BaseException:
+            # Ctrl-C lands here: it is delivered to the main thread, which is
+            # this commit loop. Commit what has already been paid for, then
+            # unblock any thread stalled on a full queue so it can reach its
+            # sentinel-pushing finally block.
+            stop_event.set()
+            try:
+                flush()
+            except Exception:
+                pass
+            self._drain_stream_queues(
+                (chunk_queue, vector_queue), [producer_thread, *worker_threads]
+            )
+            raise
+        finally:
+            producer_thread.join(timeout=5)
+            for thread in worker_threads:
+                thread.join(timeout=5)
+
+        if thread_errors:
+            raise thread_errors[0]
+
+    @staticmethod
+    def _drain_stream_queues(queues, threads, timeout: float = 5.0) -> None:
+        """Discard queued work until every thread has exited, or ``timeout``.
+
+        A thread blocked in ``put()`` on a full queue cannot reach its
+        ``finally`` block, so on the abort path the queues have to be emptied
+        for the pipeline to unwind. Whatever is discarded is safe to lose:
+        indexing is idempotent per item key and Zotero remains the source of
+        truth, so the next run picks those items up again.
+
+        Thread cancellation is cooperative — a worker inside an HTTP request
+        cannot be interrupted — so this bounds how long the caller waits, not
+        how long the thread runs.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and any(t.is_alive() for t in threads):
+            for q in queues:
+                try:
+                    while True:
+                        q.get_nowait()
+                except queue.Empty:
+                    pass
+            time.sleep(0.05)
+
+    def _process_item_batch(
+        self,
+        items: list[dict[str, Any]],
+        force_rebuild: bool = False,
+        _failed_docs: list | None = None,
+    ) -> dict[str, int]:
+        """Prepare a batch of items and hand it to ChromaDB for embedding.
+
+        The synchronous index path: preparation and classification happen in
+        :meth:`_prepare_and_classify_slice`, then ``upsert_documents`` blocks
+        while ChromaDB embeds the batch. The streaming path in
+        ``update_database`` replaces only this second half.
+
+        _failed_docs: optional list (passed by reference from update_database)
+        that collects (doc_text, metadata, doc_id) tuples for batches that fail
+        mid-run. Without this, the retry path at update_database:839-865 is
+        dead code — a NameError raised here would crash the whole reindex,
+        making every transient ChromaDB error fatal instead of recoverable.
+        """
+        prepared = self._prepare_and_classify_slice(items, force_rebuild)
+        prep_stats = prepared["prep_stats"]
+        stats = {
+            "processed": prep_stats["processed"],
+            "added": 0,
+            "updated": 0,
+            "skipped": prep_stats["skipped"],
+            "errors": prep_stats["errors"],
+        }
+
+        documents = prepared["documents"]
+        metadatas = prepared["metadatas"]
+        ids = prepared["ids"]
+        item_keys_order = prepared["item_keys_order"]
+        existing_item_keys = prepared["existing_item_keys"]
+
+        # Add documents to ChromaDB if any
+        if documents:
+            try:
+                with self._chroma_call_lock:
+                    self.chroma_client.upsert_documents(documents, metadatas, ids)
                 for k in item_keys_order:
                     if k in existing_item_keys:
                         stats["updated"] += 1
                     else:
                         stats["added"] += 1
+                # These items are embedded and persisted, so the transient
+                # copy of their extracted text has done its job. Evicting per
+                # batch rather than at the end of the run keeps the cache
+                # roughly proportional to what is still un-embedded, instead
+                # of growing to the size of the whole library.
+                try:
+                    fulltext_cache.evict_many(item_keys_order, config_path=self.config_path)
+                except Exception as e:
+                    logger.debug(f"Fulltext cache eviction failed: {e}")
             except Exception as e:
                 # Batch failed — collect failures for end-of-run retry.
                 # ChromaDB's ONNX tokenizer can fail intermittently in bursts;
@@ -2542,14 +3229,16 @@ class ZoteroSemanticSearch:
 
         return stats
 
-    def get_openai_batch_status(self, batch_ids: list[str] | None = None) -> dict[str, Any]:
-        """Refresh and return OpenAI Batch API status for the latest run or selected batches."""
+    def _get_batch_status(self, provider: str, batch_ids: list[str] | None = None) -> dict[str, Any]:
+        """Refresh and return Batch API status for the latest run or selected batches."""
+        module = _batch_module(provider)
+        label = _batch_adapter(provider).label
         selected_ids = set(batch_ids or [])
-        manifest = openai_batch.find_manifest(
+        manifest = module.find_manifest(
             config_path=self.config_path,
             batch_id=next(iter(selected_ids), None),
         )
-        manifest = openai_batch.refresh_manifest_status(
+        manifest = module.refresh_manifest_status(
             manifest,
             embedding_config=self.chroma_client.embedding_config,
             batch_ids=selected_ids or None,
@@ -2560,8 +3249,9 @@ class ZoteroSemanticSearch:
         ]
         missing_ids = selected_ids - {batch.get("batch_id") for batch in batches}
         if missing_ids:
-            raise FileNotFoundError(f"No OpenAI batch manifest entries found for: {', '.join(sorted(missing_ids))}")
+            raise FileNotFoundError(f"No {label} batch manifest entries found for: {', '.join(sorted(missing_ids))}")
         return {
+            "provider": provider,
             "run_id": manifest.get("run_id"),
             "manifest_path": manifest.get("manifest_path"),
             "model": manifest.get("model"),
@@ -2569,14 +3259,35 @@ class ZoteroSemanticSearch:
             "batches": batches,
         }
 
-    def import_openai_batch(self, batch_ids: list[str] | None = None) -> dict[str, Any]:
-        """Import completed OpenAI Batch API embeddings into ChromaDB."""
+    def get_openai_batch_status(self, batch_ids: list[str] | None = None) -> dict[str, Any]:
+        """Refresh and return OpenAI Batch API status for the latest run or selected batches."""
+        return self._get_batch_status("openai", batch_ids)
+
+    def get_gemini_batch_status(self, batch_ids: list[str] | None = None) -> dict[str, Any]:
+        """Refresh and return Gemini Batch API status for the latest run or selected batches."""
+        return self._get_batch_status("gemini", batch_ids)
+
+
+    def _import_batch(
+        self,
+        provider: str,
+        batch_ids: list[str] | None = None,
+        _skip_lock: bool = False,
+    ) -> dict[str, Any]:
+        """Import completed Batch API embeddings into ChromaDB.
+
+        ``_skip_lock`` is for the auto-loop, which already holds the update
+        lock via ``update_database``; re-acquiring it would self-deadlock.
+        """
+        module = _batch_module(provider)
+        adapter = _batch_adapter(provider)
+        label = adapter.label
         selected_ids = set(batch_ids or [])
-        manifest = openai_batch.find_manifest(
+        manifest = module.find_manifest(
             config_path=self.config_path,
             batch_id=next(iter(selected_ids), None),
         )
-        manifest = openai_batch.refresh_manifest_status(
+        manifest = module.refresh_manifest_status(
             manifest,
             embedding_config=self.chroma_client.embedding_config,
             batch_ids=selected_ids or None,
@@ -2589,24 +3300,26 @@ class ZoteroSemanticSearch:
         ]
         missing_ids = selected_ids - {batch.get("batch_id") for batch in batches}
         if missing_ids:
-            raise FileNotFoundError(f"No OpenAI batch manifest entries found for: {', '.join(sorted(missing_ids))}")
+            raise FileNotFoundError(f"No {label} batch manifest entries found for: {', '.join(sorted(missing_ids))}")
         if not batches:
-            raise ValueError("No matching OpenAI batches found in the local manifest")
+            raise ValueError(f"No matching {label} batches found in the local manifest")
         if manifest.get("force_full_rebuild") and selected_ids and len(batches) != len(all_batches):
-            raise RuntimeError("Force-rebuild OpenAI batch runs must be imported as a complete run")
+            raise RuntimeError(f"Force-rebuild {label} batch runs must be imported as a complete run")
         if manifest.get("force_full_rebuild"):
             incomplete = [
-                batch.get("batch_id")
+                batch.get("batch_id") or "(pending)"
                 for batch in all_batches
-                if not batch.get("imported_at") and batch.get("status") != "completed"
+                if not batch.get("imported_at")
+                and batch_common._entry_state(adapter, batch) not in batch_common.IMPORTABLE_STATES
             ]
             if incomplete:
                 raise RuntimeError(
-                    "Force-rebuild OpenAI batch runs can only be imported after all batches complete: "
+                    f"Force-rebuild {label} batch runs can only be imported after all batches complete: "
                     + ", ".join(incomplete)
                 )
 
         stats = {
+            "provider": provider,
             "run_id": manifest.get("run_id"),
             "manifest_path": manifest.get("manifest_path"),
             "batches_seen": len(batches),
@@ -2621,7 +3334,7 @@ class ZoteroSemanticSearch:
         }
 
         lock_path = Path.home() / ".config" / "zotero-mcp" / "update.lock"
-        lock_cm = _acquire_update_lock(lock_path)
+        lock_cm = contextlib.nullcontext(True) if _skip_lock else _acquire_update_lock(lock_path)
         acquired = lock_cm.__enter__()
         if not acquired:
             lock_cm.__exit__(None, None, None)
@@ -2636,37 +3349,45 @@ class ZoteroSemanticSearch:
             ):
                 self.chroma_client.reset_collection()
 
-            client = openai_batch.create_openai_client(self.chroma_client.embedding_config)
+            client = adapter.create_client(self.chroma_client.embedding_config)
             for batch in batches:
                 if batch.get("imported_at"):
                     stats["batches_skipped"] += 1
                     continue
-                if batch.get("status") != "completed":
+                if not batch.get("batch_id"):
+                    # A pending chunk parked by the enqueued-token throttle;
+                    # the auto-loop or a later import submits it.
+                    stats["batches_skipped"] += 1
+                    continue
+                if batch_common._entry_state(adapter, batch) not in batch_common.IMPORTABLE_STATES:
                     stats["batches_skipped"] += 1
                     stats["errors"].append({
                         "batch_id": batch.get("batch_id"),
-                        "error": f"Batch status is {batch.get('status')}, not completed",
+                        "error": f"Batch status is {batch.get('status')}, not {_IMPORTABLE_DESC[provider]}",
                     })
                     continue
-                output_file_id = batch.get("output_file_id")
-                if not output_file_id:
+                if adapter.uses_error_file and not batch.get("output_file_id"):
                     stats["batches_skipped"] += 1
                     stats["errors"].append({"batch_id": batch.get("batch_id"), "error": "Missing output_file_id"})
                     continue
 
-                output_path = Path(batch["records_path"]).with_name(Path(batch["records_path"]).stem + "-output.jsonl")
+                records_path = Path(batch["records_path"])
+                output_path = records_path.with_name(records_path.stem + "-output.jsonl")
                 if output_path.exists():
                     output_text = output_path.read_text(encoding="utf-8")
                 else:
-                    output_text = openai_batch.download_file_text(client, output_file_id, output_path)
-                embeddings_by_id, row_failures = openai_batch.parse_embedding_output(output_text)
+                    output_text = adapter.download_output(client, batch, output_path)
 
-                if batch.get("error_file_id"):
-                    error_path = Path(batch["records_path"]).with_name(Path(batch["records_path"]).stem + "-errors.jsonl")
-                    error_text = openai_batch.download_file_text(client, batch["error_file_id"], error_path)
-                    row_failures.extend(openai_batch.parse_error_output(error_text))
+                # Rows without a correlation key are matched positionally
+                # against the exact submitted order, so the records file is
+                # read before parsing rather than after.
+                chunk_records = module.read_jsonl(records_path)
+                records = {record["id"]: record for record in chunk_records}
+                id_order = [record["id"] for record in chunk_records]
+                embeddings_by_id, row_failures = adapter.parse_output(output_text, id_order)
 
-                records = {record["id"]: record for record in openai_batch.read_jsonl(Path(batch["records_path"]))}
+                error_path = records_path.with_name(records_path.stem + "-errors.jsonl")
+                row_failures.extend(adapter.download_errors(client, batch, error_path))
                 ids = [doc_id for doc_id in embeddings_by_id if doc_id in records]
                 unexpected_output_ids = [doc_id for doc_id in embeddings_by_id if doc_id not in records]
                 failure_ids = {
@@ -2702,12 +3423,25 @@ class ZoteroSemanticSearch:
                     stats["imported_items"] += len(ids)
                     stats["updated_items"] += len(existing_ids)
                     stats["added_items"] += len(ids) - len(existing_ids)
+                    # Same contract as the realtime path: the embeddings are
+                    # in ChromaDB, so the transient copy of their extracted
+                    # text has done its job. Without this the cache grows to
+                    # hold the whole library on the batch flow, since nothing
+                    # else on it ever evicts. Ids are ``<key>`` or
+                    # ``<key>#<n>``, so strip any chunk suffix first.
+                    try:
+                        fulltext_cache.evict_many(
+                            {doc_id.split("#", 1)[0] for doc_id in ids},
+                            config_path=self.config_path,
+                        )
+                    except Exception as e:
+                        logger.debug(f"Fulltext cache eviction failed: {e}")
 
                 batch["imported_at"] = datetime.now().isoformat()
                 batch["imported_count"] = len(ids)
                 stats["batches_imported"] += 1
 
-            openai_batch.save_manifest(manifest)
+            module.save_manifest(manifest)
             if all(batch.get("imported_at") for batch in all_batches):
                 self.update_config["last_update"] = datetime.now().isoformat()
                 # Promote the watermark of the library the batch was submitted
@@ -2720,6 +3454,91 @@ class ZoteroSemanticSearch:
             return stats
         finally:
             lock_cm.__exit__(None, None, None)
+
+    def import_openai_batch(self, batch_ids: list[str] | None = None) -> dict[str, Any]:
+        """Import completed OpenAI Batch API embeddings into ChromaDB."""
+        return self._import_batch("openai", batch_ids)
+
+    def import_gemini_batch(self, batch_ids: list[str] | None = None) -> dict[str, Any]:
+        """Import completed Gemini Batch API embeddings into ChromaDB."""
+        return self._import_batch("gemini", batch_ids)
+
+    def auto_loop_batch_pipeline(
+        self,
+        provider: str,
+        poll_interval: int = 60,
+        max_enqueued_tokens: int | None = None,
+        stats: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Drive a throttled batch run to completion: poll, import, submit pending.
+
+        Loops until every entry in the latest run's manifest is imported, or
+        until no further progress is possible (everything left is terminal and
+        nothing can be submitted). The on-disk manifest is consistent at every
+        step, so Ctrl-C or a crash resumes cleanly from the next
+        ``batch-import`` or ``--auto-loop``.
+
+        Must be called with the update lock already held (``update_database``
+        holds it), hence ``_skip_lock`` on the imports below.
+        """
+        import time
+
+        module = _batch_module(provider)
+        adapter = _batch_adapter(provider)
+        label = adapter.label
+        aggregate = {"provider": provider, "polls": 0, "imported_items": 0, "submitted_chunks": 0}
+
+        while True:
+            try:
+                import_stats = self._import_batch(provider, _skip_lock=True)
+                aggregate["imported_items"] += import_stats.get("imported_items", 0)
+            except RuntimeError as e:
+                # Force-rebuild manifests are all-or-nothing, so _import_batch
+                # refuses until every chunk is importable. Expected mid-run.
+                logger.debug(f"auto-loop import deferred: {e}")
+            aggregate["polls"] += 1
+
+            manifest = module.find_manifest(config_path=self.config_path)
+            client = adapter.create_client(self.chroma_client.embedding_config)
+            submitted = module.submit_pending_batches(
+                manifest,
+                embedding_config=self.chroma_client.embedding_config,
+                max_enqueued_tokens=max_enqueued_tokens,
+                client=client,
+            )
+            aggregate["submitted_chunks"] += submitted
+
+            entries = manifest.get("batches", [])
+            remaining = [b for b in entries if not b.get("imported_at")]
+            if not remaining:
+                break
+            active = [
+                b for b in remaining
+                if b.get("batch_id")
+                and batch_common._entry_state(adapter, b) not in batch_common.TERMINAL_STATES
+            ]
+            if not active and submitted == 0:
+                failed = [b.get("batch_id") or "(pending)" for b in remaining]
+                _report(
+                    f"  [{label} auto-loop] no progress possible - {len(remaining)} chunk(s) "
+                    f"failed or are stuck ({', '.join(failed)}). Inspect with 'zotero-mcp batch-status'.\n"
+                )
+                aggregate["stalled"] = failed
+                break
+
+            n_pending = sum(1 for b in remaining if b.get("status") == batch_common.STATE_PENDING)
+            _report(
+                f"  [{label} auto-loop] {len(entries) - len(remaining)}/{len(entries)} chunks imported, "
+                f"{submitted} newly submitted, {n_pending} pending; next poll in {poll_interval}s.\n"
+            )
+            time.sleep(poll_interval)
+
+        if "stalled" not in aggregate:
+            _report(f"  [{label} auto-loop] run complete: {aggregate['imported_items']} embeddings imported.\n")
+        if stats is not None:
+            stats["auto_loop"] = aggregate
+        return aggregate
+
 
     def search(self,
                query: str,
@@ -2850,57 +3669,127 @@ class ZoteroSemanticSearch:
             if "char_start" not in enriched_result and passage_offset:
                 enriched_result["passage_offset"] = passage_offset
 
-            try:
-                if is_local_mode():
-                    # Local mode fast path: build the result entirely from
-                    # ChromaDB metadata. Every field needed to render a search
-                    # result is persisted at indexing time, so this avoids one
-                    # HTTP request per hit — the local Zotero HTTP server
-                    # (port 23119) saturates quickly and returns 502 at even
-                    # modest result counts.
-                    m = meta if isinstance(meta, dict) else {}
-                    creators_str = m.get("creators", "") or ""
-                    tags_raw = m.get("tags", "") or ""
-                    tags = [{"tag": t} for t in tags_raw.split(" ") if t]
-                    zotero_item = {
-                        "key": item_key,
-                        "data": {
-                            "key": item_key,
-                            "itemType": m.get("item_type", "") or "",
-                            "title": m.get("title", "") or "",
-                            "date": m.get("date", "") or "",
-                            "dateAdded": m.get("date_added", "") or "",
-                            "dateModified": m.get("date_modified", "") or "",
-                            "creators": [creators_str] if creators_str else [],
-                            "publicationTitle": m.get("publication", "") or "",
-                            "url": m.get("url", "") or "",
-                            "DOI": m.get("doi", "") or "",
-                            "tags": tags,
-                        },
-                    }
-                else:
-                    zotero_item = self.zotero_client.item(item_key)
-                enriched_result["zotero_item"] = zotero_item
-            except Exception as e:
-                logger.error(f"Error enriching result for item {item_key}: {e}")
-                enriched_result["error"] = f"Could not fetch full item data: {e}"
-
             enriched.append(enriched_result)
             if limit and len(enriched) >= limit:
                 break
 
+        self._attach_zotero_items(enriched)
         return enriched
+
+    def _attach_zotero_items(self, enriched: list[dict[str, Any]]) -> None:
+        """Fill in each result's ``zotero_item``, in place.
+
+        Hits from the library ``self.zotero_client`` is scoped to are fetched
+        through it, as before. Hits from any *other* library cannot be: the
+        client is bound to one library and a foreign key simply 404s, which is
+        why a group-library paper was found by semantic search and then
+        reported as an error rather than a result (#163). Those are hydrated
+        from ``zotero.sqlite`` instead, in one batched query, and arrive
+        already carrying their ``library`` attribution.
+
+        A document whose ``group_id`` is missing cannot be recognised as
+        foreign up front — every index built before #396 is untagged, which
+        is most of them. Those go to the client first and fall back to the
+        local database when it cannot serve them, so the fix does not depend
+        on having re-indexed.
+        """
+        try:
+            client_group_id = self._client_group_id()
+        except ValueError:
+            client_group_id = None
+
+        def _is_foreign(result: dict[str, Any]) -> bool:
+            group_id = (result.get("metadata") or {}).get("group_id")
+            if group_id is None or client_group_id is None:
+                return False
+            return int(group_id) != int(client_group_id)
+
+        already_tried = {r["item_key"] for r in enriched if _is_foreign(r)}
+        local_items = self._hydrate_locally(sorted(already_tried))
+
+        unresolved: list[dict[str, Any]] = []
+        for result in enriched:
+            item_key = result["item_key"]
+            if item_key in local_items:
+                result["zotero_item"] = local_items[item_key]
+                continue
+            try:
+                result["zotero_item"] = self.zotero_client.item(item_key)
+            except Exception as e:
+                result["_enrich_error"] = e
+                unresolved.append(result)
+
+        # Second chance for anything the client could not serve: on an
+        # untagged index that is exactly how a foreign hit presents itself.
+        # Keys the pass above already looked up are skipped — they are known
+        # to be absent, and asking twice cannot change that.
+        retry = [r for r in unresolved if r["item_key"] not in already_tried]
+        if retry:
+            recovered = self._hydrate_locally([r["item_key"] for r in retry])
+            for result in retry:
+                item = recovered.get(result["item_key"])
+                if item is not None:
+                    result["zotero_item"] = item
+                    result.pop("_enrich_error", None)
+
+        for result in enriched:
+            error = result.pop("_enrich_error", None)
+            if error is not None:
+                logger.error(
+                    f"Error enriching result for item {result['item_key']}: {error}"
+                )
+                result["error"] = f"Could not fetch full item data: {error}"
+
+    def _hydrate_locally(self, keys: list[str]) -> dict[str, dict]:
+        """Hydrate `keys` from zotero.sqlite, or {} if that is not possible."""
+        if not keys:
+            return {}
+        try:
+            reader = self._open_local_reader()
+        except Exception as e:
+            logger.debug(f"Cross-library enrichment: no local database ({e})")
+            return {}
+        if reader is None:
+            return {}
+        try:
+            return reader.get_items_by_keys(keys)
+        except Exception as e:
+            logger.warning(f"Cross-library enrichment failed: {e}")
+            return {}
+        finally:
+            reader.close()
+
+    def _open_local_reader(self) -> LocalZoteroReader | None:
+        """A reader over this install's ``zotero.sqlite``, or None outside
+        local mode. Resolves the database path the same way the group_id
+        backfill does: an explicit ``db_path``, else the one recorded in the
+        semantic-search config, else auto-detection."""
+        if not is_local_mode():
+            return None
+        zotero_db_path = self.db_path
+        if not zotero_db_path and self.config_path and os.path.exists(self.config_path):
+            with open(self.config_path) as f:
+                zotero_db_path = json.load(f).get("semantic_search", {}).get("zotero_db_path")
+        return LocalZoteroReader(db_path=zotero_db_path)
 
     def get_database_status(self) -> dict[str, Any]:
         """Get status information about the semantic search database."""
         collection_info = self.chroma_client.get_collection_info()
+        batch_active = self._resolve_openai_batch_enabled(None)
 
         return {
             "collection_info": collection_info,
             "update_config": self.update_config,
             "openai_batch": {
                 "enabled": self._load_openai_batch_enabled(),
-                "active": self._resolve_openai_batch_enabled(None),
+                "active": batch_active,
+            },
+            # `enabled` is what the config asks for; `effective` is what the
+            # next indexing run will actually do. They diverge on the Batch
+            # API path, which has no chunking step (#416).
+            "chunking": {
+                "enabled": self._chunking_enabled,
+                "effective": self._chunking_enabled and not batch_active,
             },
             "should_update": self.should_update_database(),
             "last_update": self.update_config.get("last_update"),
@@ -2916,15 +3805,23 @@ class ZoteroSemanticSearch:
             return False
 
 
-def create_semantic_search(config_path: str | None = None, db_path: str | None = None) -> ZoteroSemanticSearch:
+def create_semantic_search(
+    config_path: str | None = None,
+    db_path: str | None = None,
+    extraction_workers: int | None = None,
+) -> ZoteroSemanticSearch:
     """
     Create a ZoteroSemanticSearch instance.
 
     Args:
         config_path: Path to configuration file
         db_path: Optional path to Zotero database (overrides config file)
+        extraction_workers: Optional parallel-extraction worker count
+            (overrides the value in the config file)
 
     Returns:
         Configured ZoteroSemanticSearch instance
     """
-    return ZoteroSemanticSearch(config_path=config_path, db_path=db_path)
+    return ZoteroSemanticSearch(
+        config_path=config_path, db_path=db_path, extraction_workers=extraction_workers
+    )

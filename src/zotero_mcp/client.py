@@ -3,9 +3,12 @@ Zotero client wrapper for MCP server.
 """
 
 import functools
+import logging
 import os
+import re
 import shutil
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,17 +17,26 @@ import httpx
 from dotenv import load_dotenv
 from pyzotero import zotero
 
+from zotero_mcp import schema
 from zotero_mcp.extract import (
     categorize_attachment,
     extract_file,
     normalize_attachment_priority,
     pick_by_priority,
 )
-from zotero_mcp.utils import _paginate, format_creators
+from zotero_mcp.utils import (
+    _paginate,
+    format_creators,
+    html_to_text,
+    item_display_date,
+    item_display_title,
+)
 from zotero_mcp.webdav import (
     WebDAVNotConfiguredError,
     download_attachment_from_webdav,
 )
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -66,6 +78,38 @@ class ZoteroApiBusyError(RuntimeError):
     """
 
 
+@contextmanager
+def zotero_api_lock():
+    """Hold the shared Zotero API lock for a block of code.
+
+    The context-manager form of :func:`with_zotero_api_lock`, with identical
+    semantics (bounded acquire, ZoteroApiBusyError for waiters, RLock
+    reentrancy, ZOTERO_MCP_LOCK_TIMEOUT honoured). Use it when only part of a
+    tool touches the Zotero API and the rest is long local work — parsing a
+    downloaded PDF, running a subprocess — that no other tool needs to be
+    blocked behind (#431).
+    """
+    timeout = _lock_timeout()
+    if timeout <= 0:
+        # Opt-out: original unbounded behaviour.
+        with _zotero_api_lock:
+            yield
+        return
+    acquired = _zotero_api_lock.acquire(timeout=timeout)
+    if not acquired:
+        raise ZoteroApiBusyError(
+            f"Another Zotero API operation is still in progress and did not "
+            f"release within {timeout:.0f}s. This usually means a previous "
+            f"call is slow or stuck (e.g. a large PDF upload or an "
+            f"unreachable Zotero cloud). Please retry shortly; if it "
+            f"persists, restart the Zotero MCP server."
+        )
+    try:
+        yield
+    finally:
+        _zotero_api_lock.release()
+
+
 def with_zotero_api_lock(func):
     """Serialize Zotero API access across concurrent MCP tool threads.
 
@@ -76,24 +120,8 @@ def with_zotero_api_lock(func):
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        timeout = _lock_timeout()
-        if timeout <= 0:
-            # Opt-out: original unbounded behaviour.
-            with _zotero_api_lock:
-                return func(*args, **kwargs)
-        acquired = _zotero_api_lock.acquire(timeout=timeout)
-        if not acquired:
-            raise ZoteroApiBusyError(
-                f"Another Zotero API operation is still in progress and did not "
-                f"release within {timeout:.0f}s. This usually means a previous "
-                f"call is slow or stuck (e.g. a large PDF upload or an "
-                f"unreachable Zotero cloud). Please retry shortly; if it "
-                f"persists, restart the Zotero MCP server."
-            )
-        try:
+        with zotero_api_lock():
             return func(*args, **kwargs)
-        finally:
-            _zotero_api_lock.release()
     return wrapper
 
 
@@ -282,9 +310,15 @@ def format_item_metadata(item: dict[str, Any], include_abstract: bool = True) ->
     data = item.get("data", {})
     item_type = data.get("itemType", "unknown")
 
+    # Type-specific base fields (a statute's title is "nameOfAct"), notes
+    # (whose title is their first line) and standalone attachments (which have
+    # only a filename) all resolve here, so a search result and an item lookup
+    # can never disagree about what something is called (#452, #447).
+    heading = item_display_title(data)
+
     # Basic information
     lines = [
-        f"# {data.get('title', 'Untitled')}",
+        f"# {heading}",
         f"**Type:** {item_type}",
         f"**Item Key:** {data.get('key')}",
     ]
@@ -296,8 +330,9 @@ def format_item_metadata(item: dict[str, Any], include_abstract: bool = True) ->
     if data.get("deleted"):
         lines.append("**Status:** 🗑️ In Trash (recoverable from Zotero Trash view)")
 
-    # Date
-    if date := data.get("date"):
+    # Date. Resolved the same way as the title: a case's date is
+    # `dateDecided`, a statute's `dateEnacted`, a patent's `issueDate` (#452).
+    if date := item_display_date(data):
         lines.append(f"**Date:** {date}")
 
     # Authors/Creators
@@ -339,6 +374,40 @@ def format_item_metadata(item: dict[str, Any], include_abstract: bool = True) ->
     if url := data.get("url"):
         lines.append(f"**URL:** {url}")
 
+    # Whatever the branches above did not cover. The formatter knows about
+    # journalArticle and bookSection by name and renders nothing type-specific
+    # for anything else, so a case lost `court`, `docketNumber` and `reporter`
+    # entirely — the whole reason its record looked empty (#452). Rather than
+    # adding a branch per type forever, ask the schema what fields this type
+    # has and show the populated ones that are not already above.
+    _shown = {
+        "key", "itemType", "title", "date", "creators", "tags", "collections",
+        "relations", "abstractNote", "extra", "note", "deleted", "version",
+        "dateAdded", "dateModified", "parentItem", "filename", "contentType",
+        "publicationTitle", "bookTitle", "volume", "issue", "pages",
+        "publisher", "place", "DOI", "ISBN", "ISSN", "url", "shortTitle",
+        "accessDate", "libraryCatalog", "callNumber", "archive",
+        "archiveLocation", "rights", "language",
+    }
+    # The type's own spellings of title and date are already in the heading
+    # and the Date line; showing them again under their raw names would read
+    # as two different pieces of information.
+    try:
+        _shown.add(schema.resolve_field(item_type, "title"))
+        _shown.add(schema.resolve_field(item_type, "date"))
+        _type_fields = schema.valid_fields(item_type)
+    except Exception:
+        _type_fields = set()
+
+    _extra_lines = []
+    for field in sorted(_type_fields - _shown):
+        value = data.get(field)
+        if value and isinstance(value, str):
+            # camelCase -> "Docket Number"
+            label = re.sub(r"(?<!^)(?=[A-Z])", " ", field).title()
+            _extra_lines.append(f"**{label}:** {value}")
+    lines.extend(_extra_lines)
+
     # Extra field often holds citation key / misc metadata
     if extra := data.get("extra"):
         lines.extend(["", "## Extra", extra])
@@ -359,6 +428,12 @@ def format_item_metadata(item: dict[str, Any], include_abstract: bool = True) ->
     # Abstract
     if include_abstract and (abstract := data.get("abstractNote")):
         lines.extend(["", "## Abstract", abstract])
+
+    # A note's body IS its content -- there is nothing else to show, and
+    # returning the metadata alone told a caller the note existed while
+    # withholding the only thing they asked for (#447).
+    if item_type == "note" and (note_body := data.get("note")):
+        lines.extend(["", "## Note", html_to_text(note_body)])
 
     # Related Items (dc:relation URIs → item keys)
     dc_relations = data.get("relations", {}).get("dc:relation", [])
@@ -394,19 +469,49 @@ def generate_bibtex(item: dict[str, Any]) -> str:
         BibTeX formatted string
     """
     data = item.get("data", {})
-    item_key = data.get("key")
+    # The key lives at ``data.key`` in Zotero API responses but only at the
+    # top level in some locally-assembled items; accept either.
+    item_key = data.get("key") or item.get("key")
 
-    # Try Better BibTeX first
+    # A trashed item exports a perfectly plausible entry, and BibTeX has no
+    # field that would say otherwise — markdown shows a trash status and JSON
+    # carries data.deleted, but a BibTeX consumer sees nothing. That gap is
+    # what made a trashed duplicate look like a healthy record to a caller
+    # reading only this format. A comment line is inert to every BibTeX
+    # parser and visible to every human.
+    trash_marker = "% Status: in trash\n" if data.get("deleted") else ""
+
+    # Try Better BibTeX first — it produces better entries and the user's
+    # real pinned citekeys. Any failure falls through to the local generator
+    # below; BBT is an enhancement, never a prerequisite.
     try:
         from zotero_mcp.better_bibtex_client import ZoteroBetterBibTexAPI
-        bibtex = ZoteroBetterBibTexAPI()
 
-        if bibtex.is_zotero_running():
-            return bibtex.export_bibtex(item_key)
+        if item_key:
+            bibtex = ZoteroBetterBibTexAPI()
 
-    except Exception:
-        # Continue to fallback method if Better BibTeX fails
-        pass
+            if bibtex.is_zotero_running():
+                exported = bibtex.export_bibtex(item_key)
+                # Guard the result even though export_bibtex now raises on a
+                # blank export: returning "" here is indistinguishable from
+                # "no BibTeX" and from "no such item", which is the whole
+                # defect being fixed.
+                if exported and exported.strip():
+                    return trash_marker + exported
+                logger.warning(
+                    "Better BibTeX returned no entry for %s; "
+                    "falling back to local BibTeX generation", item_key
+                )
+
+    except Exception as e:
+        # BBT does not index trashed items and returns a null citekey for
+        # them, so a perfectly readable item can fail here. Fall back rather
+        # than fail: the local generator below works from the item data we
+        # already hold.
+        logger.warning(
+            "Better BibTeX export failed for %s (%s); "
+            "falling back to local BibTeX generation", item_key, e
+        )
 
     # Fallback to basic BibTeX generation
     item_type = data.get("itemType", "misc")
@@ -433,14 +538,35 @@ def generate_bibtex(item: dict[str, Any]) -> str:
         first = creators[0]
         author = first.get("lastName", first.get("name", "").split()[-1] if first.get("name") else "").replace(" ", "")
 
-    year = data.get("date", "")[:4] if data.get("date") else "nodate"
-    cite_key = f"{author}{year}_{item_key}"
+    # Resolved, not read straight off `date` — a case keeps its date in
+    # `dateDecided`, a statute in `dateEnacted` (#452). Take the first
+    # four-digit run rather than the leading four characters: these are
+    # display strings ("8 October 2024"), not ISO dates.
+    _display_date = item_display_date(data)
+    _year_match = re.search(r"\b(\d{4})\b", _display_date) if _display_date else None
+    year = _year_match.group(1) if _year_match else "nodate"
+    # ``item_key`` can be absent on items assembled locally; never render the
+    # literal string "None" into a citekey.
+    cite_key = f"{author}{year}_{item_key}" if item_key else f"{author}{year}"
+    if not cite_key:
+        cite_key = "untitled"
 
     # Build BibTeX entry
     bib_type = type_map.get(item_type, "misc")
     lines = [f"@{bib_type}{{{cite_key},"]
 
-    # Add fields
+    # Add fields. `title` and `date` are resolved through the base-field map
+    # first, so a case or statute exports with its name and year rather than
+    # as an empty `@misc{nodate_KEY}` (#452).
+    resolved = dict(data)
+    if title := item_display_title(data):
+        if title not in ("Untitled", "Untitled Note"):
+            resolved["title"] = title
+
+    # No ("date", "year") entry: the block below already emits `year` from the
+    # resolved four-digit year. Mapping it here as well emitted it twice, the
+    # first time as the raw display string ("8 October 2024"), which is not a
+    # BibTeX year.
     field_mappings = [
         ("title", "title"),
         ("publicationTitle", "journal"),
@@ -458,7 +584,7 @@ def generate_bibtex(item: dict[str, Any]) -> str:
     ]
 
     for zotero_field, bibtex_field in field_mappings:
-        if value := data.get(zotero_field):
+        if value := resolved.get(zotero_field):
             # Escape special characters
             value = value.replace("{", "\\{").replace("}", "\\}")
             lines.append(f'  {bibtex_field} = {{{value}}},')
@@ -484,7 +610,7 @@ def generate_bibtex(item: dict[str, Any]) -> str:
         lines[-1] = lines[-1][:-1]
     lines.append("}")
 
-    return "\n".join(lines)
+    return trash_marker + "\n".join(lines)
 
 
 def configured_attachment_priority() -> tuple[str, ...]:

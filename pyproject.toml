@@ -19,7 +19,16 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "pyzotero>=1.8.0",
+    # 1.13.5 retries a rate-limited read internally and raises
+    # TooManyRetriesError once the backoff is exhausted (upstream
+    # urschrei/pyzotero#352). Below it, every read method hands the HTTP 429
+    # error body back as bytes, which callers read as data — dedup searches
+    # most damagingly, where it looks like "no match" and duplicates the item.
+    # _helpers.find_existing_items relies on that exception, so this floor is
+    # load-bearing, not just preferred. (1.13.3 is also required, for sending
+    # Path(filename).name as the stored-file filename — upstream #341, without
+    # which every attach pays for the two-step fallback in _attach_and_verify.)
+    "pyzotero>=1.13.5",
     "python-dotenv>=1.0.0",
     # PDF text extraction. Rust with prebuilt abi3 wheels for every platform
     # we support and no Python dependencies of its own. Pinned exactly while
@@ -66,6 +75,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21",
     "pytest-timeout>=2.0.0",
+    "pytest-httpserver>=1.0",
     "ruff>=0.9.0",
 ]
 

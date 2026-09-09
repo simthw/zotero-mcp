@@ -224,6 +224,9 @@ def setup_semantic_search(
         print(f"  - Embedding model name: {name}")
         if model == "openai":
             print(f"  - OpenAI Batch API updates: {'enabled' if openai_batch else 'disabled'}")
+        elif model == "gemini":
+            gemini_batch = existing_semantic_config.get("gemini_batch", {}).get("enabled", False)
+            print(f"  - Gemini Batch API updates: {'enabled' if gemini_batch else 'disabled'}")
         print(f"  - Update frequency: {update_freq}")
         print(f"  - Zotero database path: {db_path}")
         print("You can keep it or change it.")
@@ -327,6 +330,23 @@ def setup_semantic_search(
             print(f"Using custom Gemini base URL: {base_url}")
         else:
             print("Using default Gemini base URL")
+
+        existing_gemini_batch = existing_semantic_config.get("gemini_batch", {}) if existing_semantic_config else {}
+        default_gemini_batch = bool(existing_gemini_batch.get("enabled", False))
+        default_hint = "Y/n" if default_gemini_batch else "y/N"
+        print("\nGemini indexing mode:")
+        print("Batch API lowers costs for database updates, but results are imported later after the batch completes.")
+        print("Note: Google marks the Gemini embeddings Batch API as experimental.")
+        raw = input(f"Use Gemini Batch API for database updates? [{default_hint}]: ").strip().lower()
+        if raw == "":
+            gemini_batch_enabled = default_gemini_batch
+        else:
+            gemini_batch_enabled = raw in ["y", "yes"]
+        config["gemini_batch"] = {"enabled": gemini_batch_enabled}
+        if gemini_batch_enabled:
+            print("Gemini Batch API will be used by default for update-db.")
+        else:
+            print("Realtime Gemini embeddings will be used by default for update-db.")
 
     elif choice == "4":
         config["embedding_model"] = "ollama"
@@ -437,6 +457,27 @@ def setup_semantic_search(
         except ValueError:
             print("Please enter a valid number")
 
+    print("\nAttachment parsing can run across several CPU cores.")
+    print("1 keeps the classic sequential behaviour; higher values speed up")
+    print("the extraction phase of 'update-db --fulltext' on large libraries.")
+    default_workers = (
+        existing_semantic_config.get("extraction", {}).get("workers", 1)
+        if existing_semantic_config
+        else 1
+    )
+    while True:
+        raw = input(f"Parallel extraction workers [{default_workers}]: ").strip()
+        if raw == "":
+            extraction_workers = default_workers
+            break
+        try:
+            extraction_workers = int(raw)
+            if extraction_workers > 0:
+                break
+            print("Please enter a positive integer")
+        except ValueError:
+            print("Please enter a valid number")
+
     # Configure Zotero database path
     print("\n=== Zotero Database Path ===")
     print("By default, zotero-mcp auto-detects the Zotero database location.")
@@ -469,6 +510,7 @@ def setup_semantic_search(
         (existing_semantic_config or {}).get("extraction") or {}
     )
     extraction_config["pdf_max_pages"] = pdf_max_pages
+    extraction_config["workers"] = extraction_workers
     config["extraction"] = extraction_config
     # Web-API users: index fulltext from Zotero's server-side extraction by
     # default. Users can set this to false to keep the old metadata-only
@@ -481,7 +523,9 @@ def setup_semantic_search(
     #             precision (needs sentence-transformers; adds a model load).
     #   chunking: index each item as overlapping passages so search returns
     #             grounded quotes and long PDFs stay searchable. Enabling it
-    #             requires a one-time `update-db --force-rebuild`.
+    #             requires a one-time `update-db --force-rebuild`. It has no
+    #             effect while `openai_batch.enabled` is true: that path
+    #             indexes item-level and update-db warns about it (#416).
     if existing_semantic_config and existing_semantic_config.get("reranker"):
         config["reranker"] = existing_semantic_config["reranker"]
     else:

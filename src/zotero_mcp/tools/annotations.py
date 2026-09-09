@@ -648,6 +648,18 @@ def get_notes(
         else:
             notes = _helpers._paginate(zot.items, max_items=limit, **params)
 
+        if not notes and item_key:
+            # `item_key` may name a note itself rather than its parent. A note
+            # has no children, so the query above finds nothing and the tool
+            # reported "No notes found" for a note that plainly exists —
+            # leaving no way to read one whose key you already hold (#447).
+            try:
+                candidate = zot.item(item_key)
+            except Exception:
+                candidate = None
+            if candidate and candidate.get("data", {}).get("itemType") == "note":
+                notes = [candidate]
+
         if not notes:
             return f"No notes found{f' for item {item_key}' if item_key else ''}."
 
@@ -1432,7 +1444,7 @@ def create_annotation(
     attachment_key: str,
     page: int,
     text: str | None = None,
-    rect: list[float] | None = None,
+    rect: list[float] | str | None = None,
     comment: str | None = None,
     color: str = "#ffd400",
     tags: list[str] | str | None = None,
@@ -1456,13 +1468,17 @@ def create_annotation(
         )
 
     if rect is not None:
-        if not isinstance(rect, (list, tuple)) or len(rect) != 4:
+        # MCP clients that stringify untyped params (same as the sibling
+        # `tags` parameter, see _helpers._normalize_str_list_input) may send
+        # rect as JSON text rather than a list.
+        normalized_rect = _helpers._normalize_float_list_input(rect, 4, "rect")
+        if normalized_rect is None:
             return (
                 "Error: rect must be exactly four numbers, "
                 "[x, y, width, height], normalized to 0-1. "
                 f"Got: {rect!r}"
             )
-        x, y, width, height = rect
+        x, y, width, height = normalized_rect
         return create_area_annotation(
             attachment_key=attachment_key,
             page=page,
