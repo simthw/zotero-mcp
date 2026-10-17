@@ -14,9 +14,12 @@ class object, so the re-exported name has to *be* the registered class.
 import json
 import logging
 import os
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+
+from zotero_mcp.config import resolve_chroma_dir
 
 # Re-exported for backward compatibility; see the module docstring.
 from zotero_mcp.embeddings.providers import (  # noqa: F401
@@ -28,7 +31,7 @@ from zotero_mcp.embeddings.providers import (  # noqa: F401
     ensure_embedding_functions_registered,
 )
 from zotero_mcp.embeddings.registry import create_embedding_function, merge_env_config
-from zotero_mcp.utils import install_hint, suppress_stdout
+from zotero_mcp.utils import ensure_private_dir, install_hint, suppress_stdout
 
 try:
     import chromadb
@@ -64,13 +67,21 @@ class ChromaClient:
         self.embedding_config = embedding_config or {}
 
         # Set up persistent directory
-        if persist_directory is None:
+        if not persist_directory:
             # Use user's config directory by default
-            config_dir = Path.home() / ".config" / "zotero-mcp"
-            config_dir.mkdir(parents=True, exist_ok=True)
-            persist_directory = str(config_dir / "chroma_db")
+            ensure_private_dir(Path.home() / ".config" / "zotero-mcp")
 
-        self.persist_directory = persist_directory
+        self.persist_directory = str(resolve_chroma_dir(persist_directory))
+        if sys.platform == "win32" and not os.path.abspath(self.persist_directory).isascii():
+            # Below hnsw:sync_threshold (1000) the index lives in SQLite and
+            # works; past it the HNSW files go to a garbled path and every
+            # later read fails (#617).
+            logger.warning(
+                "ChromaDB cannot reliably store its index under a non-ASCII path "
+                "on Windows (%s). Set semantic_search.persist_directory in "
+                "~/.config/zotero-mcp/config.json to an ASCII-only directory.",
+                self.persist_directory,
+            )
 
         # Make sure our classes — not ChromaDB's same-named built-ins — answer
         # the registry lookup used when a persisted collection config is
@@ -286,18 +297,16 @@ class ChromaClient:
                 "where_document": where_document,
             }
 
-            # Use embed_query for our custom embedding functions that implement
-            # correct query-time task types (e.g. Gemini retrieval_query).
-            # Do NOT use embed_query on ChromaDB's DefaultEmbeddingFunction —
-            # its embed_query returns chunked results, not a single vector.
-            _is_custom_ef = isinstance(
-                self.embedding_function,
-                (OpenAIEmbeddingFunction, GeminiEmbeddingFunction, HuggingFaceEmbeddingFunction, OllamaEmbeddingFunction),
-            )
-            if _is_custom_ef and hasattr(self.embedding_function, 'embed_query') and query_texts:
+            # Embed queries ourselves through embed_query_text, so our custom
+            # embedding functions apply their query-time tuning (e.g. Gemini's
+            # retrieval_query task type). Only our own classes have that
+            # method; anything else — ChromaDB's DefaultEmbeddingFunction
+            # included — is handed query_texts and left to embed them itself.
+            _is_custom_ef = isinstance(self.embedding_function, CUSTOM_EMBEDDING_FUNCTIONS)
+            if _is_custom_ef and query_texts:
                 query_embeddings = []
                 for qt in query_texts:
-                    emb = self.embedding_function.embed_query(qt)
+                    emb = self.embedding_function.embed_query_text(qt)
                     # Ensure plain Python floats (some providers return numpy)
                     if hasattr(emb, 'tolist'):
                         emb = emb.tolist()
@@ -350,6 +359,21 @@ class ChromaClient:
             self.collection.delete(where=where)
         except Exception as e:
             logger.warning(f"delete_item_chunks({item_key}) failed: {e}")
+
+    def prune_item_chunks(self, item_key: str, keep: int) -> None:
+        """Delete an item's passages from ``chunk_index >= keep`` onward.
+
+        Called after an item's new passages ``<item_key>#0..keep-1`` have been
+        upserted, so a document that shrank leaves no orphaned tail, while a
+        failed re-embed leaves the old passages searchable instead of none.
+        Also drops a bare ``<item_key>`` document left by a pre-chunking index.
+        """
+        where = {"$and": [{"parent_item_key": item_key}, {"chunk_index": {"$gte": int(keep)}}]}
+        try:
+            self.collection.delete(where=where)
+            self.collection.delete(ids=[item_key])
+        except Exception as e:
+            logger.warning(f"prune_item_chunks({item_key}) failed: {e}")
 
     def get_collection_info(self) -> dict[str, Any]:
         """Get information about the collection."""
@@ -568,6 +592,7 @@ def create_chroma_client(config_path: str | None = None) -> ChromaClient:
 
     return ChromaClient(
         collection_name=config["collection_name"],
+        persist_directory=config.get("persist_directory"),
         embedding_model=config["embedding_model"],
         embedding_config=config["embedding_config"]
     )
@@ -619,11 +644,12 @@ def read_collection_status(
     opens the persisted database directly and reads the count, mirroring the
     shape returned by :meth:`ChromaClient.get_collection_info`.
 
-    ``persist_directory`` defaults to ``ChromaClient``'s location
-    (``~/.config/zotero-mcp/chroma_db``); it is parameterised for testing.
+    ``persist_directory`` defaults to the configured location, as
+    ``create_chroma_client`` resolves it; it is parameterised for testing.
     """
     collection_name = "zotero_library"
     embedding_model = "default"
+    configured_dir = None
 
     if config_path and os.path.exists(config_path):
         try:
@@ -631,6 +657,7 @@ def read_collection_status(
                 semantic_cfg = json.load(f).get("semantic_search", {})
             collection_name = semantic_cfg.get("collection_name", collection_name)
             embedding_model = semantic_cfg.get("embedding_model", embedding_model)
+            configured_dir = semantic_cfg.get("persist_directory")
         except Exception as e:
             logger.warning(f"Error loading config from {config_path}: {e}")
 
@@ -641,7 +668,7 @@ def read_collection_status(
         embedding_model = env_model
 
     if persist_directory is None:
-        persist_directory = str(Path.home() / ".config" / "zotero-mcp" / "chroma_db")
+        persist_directory = str(resolve_chroma_dir(configured_dir))
     base = {
         "name": collection_name,
         "embedding_model": embedding_model,

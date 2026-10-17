@@ -27,6 +27,7 @@ class FakeZoteroCollections(FakeZotero):
         self.removed_from_collections = []  # (collection_key, item)
         self.created_collections = []
         self.deleted_collections = []
+        self.updated_collections = []
 
     def create_collections(self, colls, **kwargs):
         self.created_collections.extend(colls)
@@ -52,6 +53,13 @@ class FakeZoteroCollections(FakeZotero):
     def delete_collection(self, collection, **kwargs):
         self.deleted_collections.append(collection)
         return _FakeResponse(204)
+
+    def update_collection(self, payload, **kwargs):
+        self.updated_collections.append(payload)
+        return _FakeResponse(204)
+
+    def collections_sub(self, key, **kwargs):
+        return [c for c in self._collections if c["data"].get("parentCollection") == key]
 
 
 class _FakeResponse:
@@ -563,3 +571,134 @@ class TestDeleteCollection:
 
         assert "local-only mode" in result
         assert fake_zot.deleted_collections == []
+
+
+# ===========================================================================
+# zotero_update_collection (#517)
+# ===========================================================================
+
+class TestUpdateCollection:
+    def test_rename_keeps_the_key(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+        result = server.update_collection(collection_key="ABC00003", name="NLP & Speech", ctx=ctx)
+        assert "Updated collection" in result
+        (payload,) = fake_zot.updated_collections
+        assert payload["key"] == "ABC00003"
+        assert payload["name"] == "NLP & Speech"
+        assert payload["parentCollection"] is False
+
+    def test_move_under_parent_by_key(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+        server.update_collection(collection_key="ABC00003", parent_collection="ABC00001", ctx=ctx)
+        (payload,) = fake_zot.updated_collections
+        assert payload["parentCollection"] == "ABC00001"
+        assert payload["name"] == "NLP Papers"
+
+    def test_move_under_parent_by_name(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+        server.update_collection(collection_key="ABC00003", parent_collection="Machine Learning", ctx=ctx)
+        (payload,) = fake_zot.updated_collections
+        assert payload["parentCollection"] == "ABC00001"
+
+    def test_move_to_top_level(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+        result = server.update_collection(collection_key="ABC00002", to_top_level=True, ctx=ctx)
+        assert "top level" in result
+        (payload,) = fake_zot.updated_collections
+        assert payload["parentCollection"] is False
+
+    def test_refuses_to_move_under_itself(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+        result = server.update_collection(collection_key="ABC00001", parent_collection="ABC00001", ctx=ctx)
+        assert result.startswith("Error")
+        assert fake_zot.updated_collections == []
+
+    def test_refuses_to_move_under_its_own_subcollection(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+        result = server.update_collection(collection_key="ABC00001", parent_collection="ABC00002", ctx=ctx)
+        assert result.startswith("Error")
+        assert "subcollections" in result
+        assert fake_zot.updated_collections == []
+
+    def test_nothing_to_change_is_an_error(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+        result = server.update_collection(collection_key="ABC00001", ctx=ctx)
+        assert result.startswith("Error: nothing to change")
+
+    def test_parent_and_top_level_together_is_an_error(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+        result = server.update_collection(
+            collection_key="ABC00003", parent_collection="ABC00001", to_top_level=True, ctx=ctx,
+        )
+        assert result.startswith("Error")
+        assert fake_zot.updated_collections == []
+
+    def test_unknown_collection(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+        result = server.update_collection(collection_key="NOPE0000", name="x", ctx=ctx)
+        assert "Collection not found" in result
+
+    def test_same_name_writes_nothing(self, monkeypatch, fake_zot, ctx):
+        _patch_web_only(monkeypatch, fake_zot)
+        result = server.update_collection(collection_key="ABC00003", name="NLP Papers", ctx=ctx)
+        assert result.startswith("No change")
+        assert fake_zot.updated_collections == []
+
+    def test_local_only_mode_returns_error(self, monkeypatch, fake_zot, ctx):
+        _patch_local_only(monkeypatch, fake_zot)
+        result = server.update_collection(collection_key="ABC00003", name="x", ctx=ctx)
+        assert "local-only" in result
+
+
+# ===========================================================================
+# A parent named by an ambiguous name must not be picked arbitrarily
+# ===========================================================================
+
+
+@pytest.fixture
+def twin_readings(fake_zot):
+    """Two courses, each with its own 'Readings' subcollection."""
+    fake_zot._collections += [
+        {"key": "COURSEA1", "version": 1, "data": {"key": "COURSEA1", "name": "Course A", "parentCollection": False}},
+        {"key": "COURSEB1", "version": 1, "data": {"key": "COURSEB1", "name": "Course B", "parentCollection": False}},
+        {"key": "READA001", "version": 1, "data": {"key": "READA001", "name": "Readings", "parentCollection": "COURSEA1"}},
+        {"key": "READB001", "version": 1, "data": {"key": "READB001", "name": "Readings", "parentCollection": "COURSEB1"}},
+    ]
+    return fake_zot
+
+
+class TestAmbiguousParentCollection:
+    def test_create_refuses_an_ambiguous_parent_name(self, monkeypatch, twin_readings, ctx):
+        _patch_web_only(monkeypatch, twin_readings)
+        result = server.create_collection(name="Week 3", parent_collection="Readings", ctx=ctx)
+        assert twin_readings.created_collections == []
+        assert "READA001" in result and "READB001" in result
+
+    def test_create_accepts_a_parent_path(self, monkeypatch, twin_readings, ctx):
+        _patch_web_only(monkeypatch, twin_readings)
+        server.create_collection(name="Week 3", parent_collection="Course B/Readings", ctx=ctx)
+        assert twin_readings.created_collections[0]["parentCollection"] == "READB001"
+
+    def test_create_reads_an_all_caps_name_as_a_name(self, monkeypatch, fake_zot, ctx):
+        # Eight capitals look like a key; it is only one if such a key exists.
+        fake_zot._collections.append(
+            {"key": "PRJ00001", "version": 1, "data": {"key": "PRJ00001", "name": "PROJECTS", "parentCollection": False}}
+        )
+        _patch_web_only(monkeypatch, fake_zot)
+        server.create_collection(name="Sub", parent_collection="PROJECTS", ctx=ctx)
+        assert fake_zot.created_collections[0]["parentCollection"] == "PRJ00001"
+
+    def test_update_refuses_an_ambiguous_parent_name(self, monkeypatch, twin_readings, ctx):
+        _patch_web_only(monkeypatch, twin_readings)
+        result = server.update_collection(
+            collection_key="ABC00003", parent_collection="Readings", ctx=ctx
+        )
+        assert twin_readings.updated_collections == []
+        assert "READA001" in result and "READB001" in result
+
+    def test_update_accepts_a_parent_path(self, monkeypatch, twin_readings, ctx):
+        _patch_web_only(monkeypatch, twin_readings)
+        server.update_collection(
+            collection_key="ABC00003", parent_collection="Course A/Readings", ctx=ctx
+        )
+        assert twin_readings.updated_collections[0]["parentCollection"] == "READA001"

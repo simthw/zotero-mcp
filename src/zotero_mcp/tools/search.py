@@ -8,7 +8,10 @@ import time as _time
 from pathlib import Path
 from typing import Literal
 
+from fastmcp.exceptions import ToolError
+
 from zotero_mcp import client as _client
+from zotero_mcp import library as _library
 from zotero_mcp import search_semantics as _semantics
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
@@ -127,6 +130,78 @@ def _canonical_item_type(value: str) -> str | None:
     return None
 
 
+_FALLBACK_TAG_OR = re.compile(r"\s+OR\s+|\|\|")
+
+
+def _fallback_filters_active(item_type: str | None, tag: list[str]) -> bool:
+    """Whether the caller narrowed the search beyond the default."""
+    return bool(tag) or (item_type or "-attachment") != "-attachment"
+
+
+def _filter_fallback_items(
+    items: list[dict], item_type: str | None, tag: list[str]
+) -> list[dict] | None:
+    """Keep the semantic-fallback items that satisfy the caller's `tag` and
+    `item_type` filters, which the semantic index itself cannot apply.
+
+    The text searches hand both filters to the backend; the semantic fallback
+    did not, so `tag='a'` returned untagged items. The syntax is the one
+    those searches accept: tag entries are ANDed, ` OR ` / `||` disjoins within
+    an entry and a leading `-` excludes; `item_type` is a type name, `-type`
+    or `a || b`. Returns None when a filter cannot be honoured here (a `*` or
+    `%` wildcard in a tag), so the caller skips the fallback rather than show
+    items that may not match.
+    """
+    if any("*" in t or "%" in t for t in tag):
+        return None
+
+    def _tags(item: dict) -> set[str]:
+        data = item.get("data", item)
+        return {
+            _semantics.normalize(str(t.get("tag", "")).strip())
+            for t in (data.get("tags") or [])
+            if isinstance(t, dict)
+        }
+
+    def _tag_ok(item: dict) -> bool:
+        have = _tags(item)
+        for entry in tag:
+            hit = False
+            for term in (t.strip() for t in _FALLBACK_TAG_OR.split(entry)):
+                excluded = term.startswith("-")
+                name = _semantics.normalize((term[1:] if excluded else term).strip())
+                if not name:
+                    continue
+                if excluded != (name in have):
+                    hit = True
+                    break
+            if not hit:
+                return False
+        return True
+
+    def _type_ok(item: dict) -> bool:
+        kind = str((item.get("data", item)).get("itemType", ""))
+        wanted = (item_type or "-attachment").strip()
+        for term in (t.strip() for t in wanted.split("||")):
+            if not term:
+                continue
+            if term.startswith("-"):
+                if kind == term[1:].strip():
+                    return False
+            elif kind == term:
+                return True
+        return all(t.strip().startswith("-") for t in wanted.split("||") if t.strip())
+
+    return [i for i in items if _tag_ok(i) and _type_ok(i)]
+
+
+def _is_note(item: dict) -> bool:
+    """Whether *item* is a note — the one itemType whose *content* Zotero's
+    quicksearch matches in `titleCreatorYear` mode, standing in for the
+    title a note doesn't have."""
+    return item.get("data", {}).get("itemType") == "note"
+
+
 def _exclude_note_content_matches(items: list[dict], qmode: str) -> list[dict]:
     """Drop standalone notes from a `titleCreatorYear` result set.
 
@@ -142,7 +217,7 @@ def _exclude_note_content_matches(items: list[dict], qmode: str) -> list[dict]:
     """
     if qmode != "titleCreatorYear":
         return items
-    return [item for item in items if item.get("data", {}).get("itemType") != "note"]
+    return [item for item in items if not _is_note(item)]
 
 
 @with_zotero_api_lock
@@ -167,6 +242,8 @@ def _search_with_variants(zot, query: str, qmode: str, limit: int,
 
     all_items: list[dict] = []
     seen_keys: set[str] = set()
+    kept = 0  # unique items that survive the note filter
+    failure: Exception | None = None
     for variant in variants:
         # Check cascade timeout before each API call
         if cascade_start is not None and cascade_timeout is not None:
@@ -179,22 +256,53 @@ def _search_with_variants(zot, query: str, qmode: str, limit: int,
         }
         if tag:
             params["tag"] = tag
-        zot.add_parameters(**params)
-        try:
-            t0 = _time.monotonic()
-            batch = zot.items()
-            elapsed = _time.monotonic() - t0
-            _search_logger.debug(f"[SEARCH] variant='{variant}' qmode={qmode}: {len(batch)} results in {elapsed:.2f}s")
+        # Page past child notes in titleCreatorYear mode (#542): the server
+        # matches a note's content there, and the filter below drops those
+        # notes, so one page can spend the whole limit on nothing. /items/top
+        # is no substitute: the Web API answers with the matching child's
+        # parent, and the local API returns child notes from /top anyway.
+        # 'everything' keeps its notes, so one page is the whole answer.
+        start = 0
+        t0 = _time.monotonic()
+        pages = 0
+        while True:
+            zot.add_parameters(**({**params, "start": start} if start else params))
+            try:
+                batch = zot.items()
+            except Exception as e:
+                _search_logger.debug(f"[SEARCH] variant='{variant}' failed: {e}")
+                failure = e
+                break  # Skip failed variant, try next
+            pages += 1
             for item in batch:
                 key = item.get("key", "")
                 if key and key not in seen_keys:
                     seen_keys.add(key)
                     all_items.append(item)
-        except Exception as e:
-            _search_logger.debug(f"[SEARCH] variant='{variant}' failed: {e}")
-            continue  # Skip failed variant, try next
+                    if not _is_note(item):
+                        kept += 1
+            if len(batch) < limit:
+                break  # short page: the server is out of matches
+            if qmode != "titleCreatorYear" or kept >= limit:
+                break
+            if cascade_start is not None and cascade_timeout is not None:
+                if _time.monotonic() - cascade_start > cascade_timeout:
+                    _search_logger.debug("[SEARCH] Cascade timeout reached, skipping remaining variants")
+                    break
+            start += limit
+        elapsed = _time.monotonic() - t0
+        _search_logger.debug(
+            f"[SEARCH] variant='{variant}' qmode={qmode}: {pages} page(s), {kept} kept, in {elapsed:.2f}s"
+        )
 
-    return _exclude_note_content_matches(all_items, qmode)
+    results = _exclude_note_content_matches(all_items, qmode)
+    if failure is not None and not results:
+        # A failed request is not an empty result: reporting "no items" here
+        # would send the caller down the fallback cascade, or away, for a
+        # library that was never actually searched. Checked after the note
+        # filter, which can empty a page that looked like matches.
+        raise failure
+    return results
 
 
 class GlobalSearchUnsupported(Exception):
@@ -276,8 +384,8 @@ def _search_items_via_backend(zot, query: str, qmode: str, limit: int,
         "collections nested beneath it (default False). "
         "search_all_libraries: search personal + all group libraries at "
         "once, labelling each result with its library — use it when you "
-        "don't know which library holds the item. Needs "
-        "ZOTERO_SEARCH_BACKEND=sqlite; excludes collection_key. "
+        "don't know which library holds the item. Needs the SQLite "
+        "backend (the default in local mode); excludes collection_key. "
         "Example: zotero_search_items(query='Cladder-Micus') or "
         "zotero_search_items(query='Brewer 2011', search_all_libraries=True)."
     )
@@ -352,37 +460,26 @@ def search_items(
             tag_condition_str = f" with tags: '{', '.join(tag)}'"
 
         ctx.info(f"Searching Zotero for '{query}'{tag_condition_str}")
+        backend = _library.get_library_backend()
+        # Constructing the client makes no request — only calling it does — so
+        # the cascade below still has one to fall back to.
         zot = _client.get_zotero_client()
 
         limit = _helpers._normalize_limit(limit, default=10)
 
         if collection_key:
-            # Collection-scoped search — query the collection directly, no cascade needed
-            try:
-                _col = zot.collection(collection_key)
-            except Exception:
-                _col = None
-            if not _col or _col.get("key") != collection_key:
+            # Collection-scoped search — query the collection directly, no
+            # cascade needed. Both the existence check and the scoped query go
+            # through the backend: asking the HTTP API whether a collection
+            # exists made this branch answer "Collection not found" for a
+            # collection sitting in the database, whenever Zotero was closed.
+            if backend.get_collection(collection_key) is None:
                 return f"Collection not found: '{collection_key}'. Use zotero_get_collections or zotero_search_collections to find valid collection keys."
-            scope_keys = _helpers.expand_collection_scope(
-                zot, collection_key, include_subcollections
+            items = backend.search_items(
+                query, qmode=qmode, item_type=item_type, tag=tag, limit=limit,
+                collection_keys=[collection_key],
+                include_subcollections=include_subcollections,
             )
-            items = []
-            _seen: set[str] = set()
-            for _scope_key in scope_keys:
-                # limit applies to the merged result, so each subcollection may
-                # still contribute up to it before deduplication.
-                for _item in _helpers._paginate(
-                    zot.collection_items, _scope_key,
-                    q=query, qmode=qmode, itemType=item_type,
-                    max_items=limit, **({"tag": tag} if tag else {}),
-                ):
-                    _key = _item.get("key")
-                    if _key and _key in _seen:
-                        continue
-                    if _key:
-                        _seen.add(_key)
-                    items.append(_item)
             # Ahead of the slice, so a dropped note never costs a result slot
             # that a real match could have filled.
             items = _exclude_note_content_matches(items, qmode)
@@ -484,8 +581,15 @@ def search_items(
                             # by surfacing a group-library hit, and a global
                             # one narrows to the active library on its last
                             # step. `scope_group_id` is already either.
+                            # The index cannot filter by tag or item type, so
+                            # when either is set it is applied to the hits
+                            # below; over-fetch so the limit survives it.
+                            sem_limit = limit or 10
+                            filtered_fallback = _fallback_filters_active(item_type, tag)
+                            if filtered_fallback:
+                                sem_limit = min(max(sem_limit * 5, 50), 200)
                             sem_results = sem_search.search(
-                                query=query, limit=limit or 10, group_id=scope_group_id
+                                query=query, limit=sem_limit, group_id=scope_group_id
                             )
                             _search_logger.debug(f"[CASCADE] semantic query: {_time.monotonic() - t0:.2f}s")
                             if sem_results and sem_results.get("results"):
@@ -498,6 +602,11 @@ def search_items(
                                         if "key" not in zot_item:
                                             zot_item["key"] = key
                                         items.append(zot_item)
+                                if filtered_fallback:
+                                    # None: a filter we cannot evaluate here,
+                                    # so show nothing rather than unfiltered hits.
+                                    items = _filter_fallback_items(items, item_type, tag) or []
+                                items = items[: limit or 10]
                                 if items:
                                     fallback_strategy = "semantic search"
                     except Exception as e:
@@ -536,9 +645,10 @@ def search_items(
                     f"Found {len(items)} item(s) via {fallback_strategy} — verify the correct one "
                     f"by checking title, authors, journal, and year match your original query.*"
                 )
-            output.insert(1, "")
-            output.insert(2, note_text)
-            output.insert(3, "")
+            # Below the header block (title, scope, tag filter and its blank
+            # line), not wedged between the title and the filter line.
+            note_at = 3 + (1 if search_all_libraries else 0)
+            output[note_at:note_at] = [note_text, ""]
 
         return _helpers._prepend_size_warning("\n".join(output))
 
@@ -547,7 +657,7 @@ def search_items(
         return f"Error: {e}"
     except Exception as e:
         ctx.error(f"Error searching Zotero: {str(e)}")
-        return f"Error searching Zotero: {str(e)}"
+        raise ToolError(f"Error searching Zotero: {str(e)}") from e
 
 @mcp.tool(
     name="zotero_search_by_tag",
@@ -611,38 +721,27 @@ def search_by_tag(
             return "Error: Tag cannot be empty"
 
         ctx.info(f"Searching Zotero for tag '{tag}'")
-        zot = _client.get_zotero_client()
+        backend = _library.get_library_backend()
 
         limit = _helpers._normalize_limit(limit, default=10)
 
         # Search library-wide or scoped to a collection
         if collection_key:
-            try:
-                _col = zot.collection(collection_key)
-            except Exception:
-                _col = None
-            if not _col or _col.get("key") != collection_key:
+            if backend.get_collection(collection_key) is None:
                 return f"Collection not found: '{collection_key}'. Use zotero_get_collections or zotero_search_collections to find valid collection keys."
-            scope_keys = _helpers.expand_collection_scope(
-                zot, collection_key, include_subcollections
+            # Scope goes down into the query rather than filtering a
+            # separately-limited result set, so `limit` still means "this
+            # many matches in this collection" and the tag DSL (`a OR b`,
+            # `-c`) stays evaluated in exactly one place per backend.
+            results = backend.search_items(
+                "", item_type=item_type, tag=tag, limit=limit,
+                collection_keys=[collection_key],
+                include_subcollections=include_subcollections,
             )
-            results = []
-            _seen: set[str] = set()
-            for _scope_key in scope_keys:
-                for _item in _helpers._paginate(
-                    zot.collection_items, _scope_key,
-                    tag=tag, itemType=item_type, max_items=limit,
-                ):
-                    _key = _item.get("key")
-                    if _key and _key in _seen:
-                        continue
-                    if _key:
-                        _seen.add(_key)
-                    results.append(_item)
-            results = results[:limit]
         else:
-            zot.add_parameters(q="", tag=tag, itemType=item_type, limit=limit)
-            results = zot.items()
+            results = backend.search_items(
+                "", item_type=item_type, tag=tag, limit=limit
+            )
 
         if not results:
             if collection_key:
@@ -673,7 +772,7 @@ def search_by_tag(
 
     except Exception as e:
         ctx.error(f"Error searching Zotero: {str(e)}")
-        return f"Error searching Zotero: {str(e)}"
+        raise ToolError(f"Error searching Zotero: {str(e)}") from e
 
 
 @mcp.tool(
@@ -718,27 +817,79 @@ def search_by_citation_key(
         citekey = citekey.strip()
         ctx.info(f"Looking up citation key: {citekey}")
 
-        # Strategy A: pyzotero search across all fields, then verify via Extra.
-        # Note: the previous BetterBibTeX ``item.search`` JSON-RPC call was
-        # removed in #293 — that BBT method does not exist in current versions
-        # (always returned -32601 Method not found) and the exception handler
-        # silently fell through to the same Extra-field search, so the BBT
-        # branch only added noise.
-        zot = _client.get_zotero_client()
-        zot.add_parameters(q=citekey, qmode="everything", itemType="-attachment", limit=25)
-        results = zot.items()
-
-        for item in results:
-            data = item.get("data", {})
-            extra = data.get("extra", "")
-            if data.get("citationKey") == citekey or _helpers._extra_has_citekey(extra, citekey):
-                return _helpers._format_citekey_result(item, citekey)
+        # The BetterBibTeX ``item.search`` JSON-RPC call was removed in #293 —
+        # that BBT method does not exist in current versions (always returned
+        # -32601 Method not found) and the handler fell through to the same
+        # Extra-field search anyway, so the BBT branch only added noise.
+        #
+        # The SQLite backend matches Zotero 7's real ``citationKey`` field
+        # exactly. The API backend still has to rank a substring search and
+        # verify the top 25 candidates, since there is nothing to query
+        # server-side — which is why a key outside that window used to be
+        # reported as missing.
+        item = _library.get_library_backend().find_by_citation_key(citekey)
+        if item is not None:
+            return _helpers._format_citekey_result(item, citekey)
 
         return f"No item found with citation key: '{citekey}'"
 
     except Exception as e:
         ctx.error(f"Error looking up citation key: {str(e)}")
         return f"Error looking up citation key: {str(e)}"
+
+
+# Names advanced_search accepts beyond the per-item-type field names in the
+# schema: the aliases both backends resolve, `year`, and the item-level keys an
+# API item carries.
+_EXTRA_CONDITION_FIELDS = frozenset(
+    {"year", "key", "version", "parentItem", "dateAdded", "dateModified", "itemType"}
+)
+
+
+def _known_condition_fields() -> set[str]:
+    """Every field name a condition can meaningfully name, or an empty set when
+    the field schema is unavailable (nothing is then rejected)."""
+    from zotero_mcp import schema as _schema
+
+    try:
+        table = _schema.get_table()["itemTypes"]
+    except Exception:
+        return set()
+    names: set[str] = set()
+    for fields in table.values():
+        for actual, base in fields.items():
+            names.add(actual)
+            names.add(base)
+    if not names:
+        return set()
+    return names | _EXTRA_CONDITION_FIELDS | set(_semantics.FIELD_ALIASES)
+
+
+def _unknown_condition_field_error(
+    field: str, index: int, valid_operations: set[str]
+) -> str | None:
+    """An error naming close matches when `field` is not a field any backend
+    can match on, else None. Without it a typo ("titel") is a valid-looking
+    condition that matches nothing, and the tool answers "No items found"."""
+    known = _known_condition_fields()
+    if not known or field in known or field.lower() in _semantics.FIELD_ALIASES:
+        return None
+    import difflib
+
+    by_lower = {name.lower(): name for name in sorted(known)}
+    close: list[str] = []
+    for lowered in difflib.get_close_matches(field.lower(), list(by_lower), n=3, cutoff=0.6):
+        if by_lower[lowered] not in close:
+            close.append(by_lower[lowered])
+    hint = f" Did you mean: {', '.join(close)}?" if close else ""
+    return (
+        f"Error: Unknown field '{field}' in condition {index}.{hint} "
+        "Field names are Zotero field names and case-sensitive (title, date, "
+        "itemType, dateAdded, dateModified, publicationTitle, abstractNote, "
+        "extra, publisher, ...); the aliases creator, tag, collection and year "
+        "match in any case. "
+        f"Supported operations: {', '.join(sorted(valid_operations))}"
+    )
 
 
 @mcp.tool(
@@ -768,8 +919,8 @@ def search_by_citation_key(
         "anywhere in that collection's subtree, for the is/isNot operations "
         "(default False). "
         "search_all_libraries: search every accessible library at once, "
-        "labelling each result with its library; needs "
-        "ZOTERO_SEARCH_BACKEND=sqlite. 'tag' conditions work; 'collection' "
+        "labelling each result with its library; needs the SQLite backend "
+        "(the default in local mode). 'tag' conditions work; 'collection' "
         "conditions and include_subcollections do not. "
         "Example: zotero_advanced_search(conditions=[{'field': 'itemType', "
         "'operation': 'is', 'value': 'preprint'}, {'field': 'dateAdded', "
@@ -779,7 +930,7 @@ def search_by_citation_key(
 )
 @with_zotero_api_lock
 def advanced_search(
-    conditions: list[dict[str, str]] | str,
+    conditions: list[dict[str, str]] | dict[str, str] | str,
     join_mode: Literal["all", "any"] = "all",
     sort_by: str | None = None,
     sort_direction: Literal["asc", "desc"] = "asc",
@@ -835,6 +986,13 @@ def advanced_search(
                     f"({parse_error})"
                 )
 
+        # One condition sent as a bare object, rather than a list of one, is
+        # a shape models produce often. Without `dict` on the annotation it was
+        # a raw pydantic list_type error at the boundary, and as a JSON string
+        # it reached here as "No search conditions provided".
+        if isinstance(conditions, dict) and conditions:
+            conditions = [conditions]
+
         if not isinstance(conditions, list) or not conditions:
             return "Error: No search conditions provided"
 
@@ -880,6 +1038,8 @@ def advanced_search(
                 )
             if not field:
                 return f"Error: Condition {i} has an empty field"
+            if (unknown := _unknown_condition_field_error(field, i, valid_operations)):
+                return unknown
 
             parsed_conditions.append(
                 {"field": field, "operation": operation, "value": value}
@@ -930,8 +1090,36 @@ def advanced_search(
                         _helpers.collection_descendants(_all_collections, _value)
                     )
 
-        def _extract_values(data: dict[str, object], field: str) -> list[str]:
+        def _extract_values(
+            data: dict[str, object],
+            field: str,
+            operation: str | None = None,
+            meta: dict[str, object] | None = None,
+        ) -> list[str]:
             field_lower = field.lower()
+
+            def _typed(name: str) -> str:
+                """`name` routed to the key THIS item's type actually uses.
+
+                A case's title is ``caseName``, a statute's ``nameOfAct``, an
+                email's ``subject``; a case's date is ``dateDecided``. Reading
+                ``data["title"]`` finds nothing for those, so the condition
+                silently never matched them (#570) — while the SQLite backend,
+                which resolves through ``baseFieldMappingsCombined``, does
+                match. The two backends have to agree, so both resolve.
+
+                Falls back to the plain field when the schema is unavailable,
+                as ``utils.item_display_title`` does for the same lookup.
+                """
+                item_type = str(data.get("itemType", "") or "")
+                if not item_type:
+                    return name
+                try:
+                    from zotero_mcp import schema as _schema
+
+                    return _schema.resolve_field(item_type, name)
+                except Exception:  # schema unavailable — use the plain field
+                    return name
 
             if field_lower in {"author", "authors", "creator", "creators"}:
                 creators = data.get("creators", []) or []
@@ -973,19 +1161,37 @@ def advanced_search(
                 # _matches_condition rejects outright).
                 return keys or [""]
 
+            if field_lower == "date":
+                display = str(data.get(_typed("date"), "") or "").strip()
+                if operation in _semantics.RANGE_OPS:
+                    # Never the display text, which is free-form (#551).
+                    key = _semantics.date_range_key((meta or {}).get("parsedDate"), display)
+                    return [key] if key else []
+                # An item with no date satisfies no condition, as in SQL.
+                return [display] if display else []
+
             if field_lower == "year":
-                date_value = str(data.get("date", "")).strip()
-                return [date_value[:4]] if len(date_value) >= 4 else []
+                display = str(data.get(_typed("date"), "") or "").strip()
+                if not display:
+                    return []
+                # The year of the ISO half, like SQL's SUBSTR(value, 1, 4);
+                # the display text often does not start with it.
+                key = _semantics.date_range_key((meta or {}).get("parsedDate"), display)
+                return [key[:4]] if key else []
 
             source_field = _semantics.FIELD_ALIASES.get(field_lower, field)
-            raw_value = data.get(source_field, "")
+            raw_value = data.get(_typed(source_field), "")
             if raw_value is None:
                 return []
             return [str(raw_value).strip()]
 
-        def _matches_condition(data: dict[str, object], condition: dict[str, str]) -> bool:
-            values = _extract_values(data, condition["field"])
+        def _matches_condition(
+            data: dict[str, object],
+            condition: dict[str, str],
+            meta: dict[str, object] | None = None,
+        ) -> bool:
             operation = condition["operation"]
+            values = _extract_values(data, condition["field"], operation, meta)
             target = condition["value"]
 
             # Subtree membership, when asked for. Only is/isNot are membership
@@ -1082,7 +1288,8 @@ def advanced_search(
                     if data.get("itemType") in {"attachment", "note", "annotation"}:
                         continue
 
-                    checks = [_matches_condition(data, c) for c in parsed_conditions]
+                    meta = item.get("meta") or {}
+                    checks = [_matches_condition(data, c, meta) for c in parsed_conditions]
                     matched = all(checks) if join_mode == "all" else any(checks)
                     if matched:
                         results.append(item)
@@ -1099,8 +1306,9 @@ def advanced_search(
                         f"examined {start} items; results below are partial. This "
                         f"backend filters client-side, so a broad condition over a "
                         f"large library has to read the library. Narrow the "
-                        f"conditions, or set ZOTERO_SEARCH_BACKEND=sqlite (local "
-                        f"mode) to evaluate the search in SQL instead."
+                        f"conditions, or use the SQLite backend (the default in "
+                        f"local mode, unless ZOTERO_BACKEND=api) to evaluate the "
+                        f"search in SQL instead."
                     )
                     break
 
@@ -1199,14 +1407,16 @@ def advanced_search(
         "search_all_libraries=True to cover every indexed library. "
         "query: the topic or concept; natural-language phrases work well. "
         "limit: max results (default 10). "
-        "filters: optional metadata filters as a dict (e.g. "
-        "{'itemType': 'journalArticle', 'year': '2023'}); also accepts a "
-        "JSON string. "
+        "filters: optional ChromaDB metadata filter, one key per dict (e.g. "
+        "{'item_type': 'journalArticle'}); also accepts a JSON string. Keys: "
+        "item_type, item_key, citation_key, doi, publication, tags, "
+        "has_fulltext. Combine keys with {'$and': [{...}, {...}]}. There is "
+        "no year filter: 'date' holds the raw Zotero date string. "
         "library_id: optional — scope to one library other than the active "
         "one: 0 or 'user' for personal, else a groupID (see "
         "zotero_list_libraries). search_all_libraries: search every indexed "
-        "library at once, labelling each result with its library; needs "
-        "ZOTERO_SEARCH_BACKEND=sqlite, excludes library_id. "
+        "library at once, labelling each result with its library; needs the "
+        "SQLite backend (the default in local mode), excludes library_id. "
         "Requires the semantic search database to be POPULATED — run "
         "zotero_update_search_database first if you just installed the "
         "server or added new items; check readiness with "
@@ -1463,6 +1673,10 @@ def update_search_database(
             output.append(f"**Added:** {stats.get('added_items', 0)}")
             output.append(f"**Updated:** {stats.get('updated_items', 0)}")
             output.append(f"**Skipped:** {stats.get('skipped_items', 0)}")
+            if stats.get("deleted_items"):
+                output.append(f"**Deleted:** {stats['deleted_items']} (no longer in Zotero)")
+            if stats.get("deletion_skipped_reason"):
+                output.append(f"**Deletion check skipped:** {stats['deletion_skipped_reason']}")
             output.append(f"**Errors:** {stats.get('errors', 0)}")
             output.append(f"**Duration:** {stats.get('duration', 'Unknown')}")
 

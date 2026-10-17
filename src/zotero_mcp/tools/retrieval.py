@@ -8,12 +8,16 @@ import tempfile
 import time as _time
 from typing import Literal
 
+from fastmcp.exceptions import ToolError
+
 from zotero_mcp import client as _client
+from zotero_mcp import library as _library
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
 from zotero_mcp._context import Context
 from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.config import load_config
+from zotero_mcp.extract import extract_file
 from zotero_mcp.tools import _helpers
 
 #: Pages of a PDF to surface when an agent reads a paper inline, if nothing
@@ -36,6 +40,33 @@ def _fulltext_display_max_pages() -> int:
     except Exception:
         return DEFAULT_FULLTEXT_DISPLAY_MAX
     return DEFAULT_FULLTEXT_DISPLAY_MAX if configured is None else configured
+
+
+def _fulltext_error(metadata: str, detail: str) -> str:
+    """Return a fulltext failure with an error marker before the metadata."""
+    return f"Error: {detail}\n\n---\n\n{metadata}"
+
+
+def _fulltext_section_heading(
+    truncated: bool, page_count: int | None, max_pages: int, item_key: str
+) -> tuple[str, str]:
+    """Return the "Full Text" heading and any page-limit notice.
+
+    A capped read is byte-for-byte indistinguishable from a complete one, so
+    an agent summarizes and cites the first ten pages of a 442-page book as
+    if it had read the paper (#448). Name the range that was read instead,
+    and where to pick the document up again.
+    """
+    if not truncated:
+        return "## Full Text", ""
+    return (
+        f"## Full Text (pages 1-{max_pages} of {page_count} — TRUNCATED)",
+        f"> Only the first {max_pages} of {page_count} pages were extracted. "
+        f"Raise `semantic_search.extraction.fulltext_display_max_pages` in the "
+        f"zotero-mcp config to read more of the document in one call, or use "
+        f"zotero_read_pdf_pages(item_key='{item_key}', start_page={max_pages + 1}) "
+        f"to read on from where this stops.",
+    )
 
 
 @mcp.tool(
@@ -92,72 +123,13 @@ def get_item_metadata(
     _ret_logger = _logging.getLogger("zotero_mcp.retrieval")
     try:
         ctx.info(f"Fetching metadata for item {item_key} in {format} format")
-
-        # Local mode fast path: read metadata from Zotero's SQLite DB directly.
-        # The local Zotero HTTP server (port 23119) has very low concurrency
-        # and frequently returns 502 Bad Gateway under repeated metadata
-        # lookups; the SQLite DB is already on disk, so skip the HTTP hop.
-        # BibTeX export still needs Zotero running (Better BibTeX or API), so
-        # we only take this path for the markdown format.
-        if _utils.is_local_mode() and format != "bibtex":
-            try:
-                from zotero_mcp.local_db import LocalZoteroReader
-
-                config = load_config()
-                with LocalZoteroReader(db_path=config.resolve_zotero_db_path()) as reader:
-                    local_item = reader.get_item_by_key(item_key)
-                    if local_item:
-                        if format == "json":
-                            return json.dumps(
-                                {
-                                    "key": local_item.key,
-                                    "data": {
-                                        "itemType": local_item.item_type or "",
-                                        "title": local_item.title or "",
-                                        "creators": (
-                                            [{"name": c} for c in local_item.creators.split("; ")]
-                                            if local_item.creators else []
-                                        ),
-                                        "DOI": local_item.doi or "",
-                                        "abstractNote": local_item.abstract or "",
-                                        "extra": local_item.extra or "",
-                                        "dateAdded": local_item.date_added or "",
-                                        "dateModified": local_item.date_modified or "",
-                                    },
-                                },
-                                ensure_ascii=False, indent=2, sort_keys=True,
-                            )
-                        md_lines = [
-                            f"# {local_item.title or 'Untitled'}",
-                            f"**Type:** {local_item.item_type or 'unknown'}",
-                            f"**Item Key:** {local_item.key}",
-                        ]
-                        if local_item.creators:
-                            md_lines.append(f"**Authors:** {local_item.creators}")
-                        if local_item.doi:
-                            md_lines.append(f"**DOI:** {local_item.doi}")
-                        if local_item.date_added:
-                            md_lines.append(f"**Added:** {local_item.date_added}")
-                        if local_item.date_modified:
-                            md_lines.append(f"**Modified:** {local_item.date_modified}")
-                        if include_abstract and local_item.abstract:
-                            md_lines.extend(["", "## Abstract", local_item.abstract])
-                        if local_item.extra:
-                            md_lines.extend(["", "## Extra", local_item.extra])
-                        _ret_logger.debug(
-                            f"[METADATA] SQLite fast-path for {item_key} (no HTTP API)"
-                        )
-                        return "\n\n".join(md_lines)
-                    # Item not in local DB — fall through to HTTP API
-                    ctx.info(f"Item {item_key} not in local SQLite; falling back to HTTP API")
-            except Exception as local_err:
-                ctx.info(f"Local metadata fast-path failed: {local_err}")
-
-        zot = _client.get_zotero_client()
+        backend = _library.get_library_backend()
 
         t0 = _time.monotonic()
-        item = zot.item(item_key)
-        _ret_logger.debug(f"[METADATA] zot.item({item_key}): {_time.monotonic() - t0:.2f}s")
+        item = backend.get_item(item_key)
+        _ret_logger.debug(
+            f"[METADATA] {backend.name}.get_item({item_key}): {_time.monotonic() - t0:.2f}s"
+        )
         if not item:
             return f"No item found with key: {item_key}"
 
@@ -175,15 +147,18 @@ def get_item_metadata(
 @mcp.tool(
     name="zotero_get_item_fulltext",
     description=(
-        "Return the full extracted text of a Zotero item's primary "
+        "Return the extracted text of a Zotero item's primary "
         "attachment (PDF or EPUB). In local mode, prioritizes MinerU "
         "content_list.json structured text when available (higher quality "
         "than raw PDF extraction). "
-        "WARNING: returns the entire paper (often 10K+ tokens). Use ONLY "
-        "when the user explicitly wants to READ the paper — not for "
+        "WARNING: returns most or all of the paper (often 10K+ tokens). Use "
+        "ONLY when the user explicitly wants to READ the paper — not for "
         "searching or browsing. For topic search use "
         "zotero_semantic_search; for metadata only use "
         "zotero_get_item_metadata. "
+        "PDFs are read up to fulltext_display_max_pages (10 by default); "
+        "when that cuts a document short the heading names the page range "
+        "and TRUNCATED — read on with zotero_read_pdf_pages. "
         "Avoid calling this on multiple papers in one conversation unless "
         "the user specifically asked to read several. "
         "item_key: 8-character Zotero item key. Normally the parent item — "
@@ -224,10 +199,10 @@ def get_item_fulltext(
     """
     try:
         ctx.info(f"Fetching full text for item {item_key}")
-        zot = _client.get_zotero_client()
+        backend = _library.get_library_backend()
 
         # First get the item metadata
-        item = zot.item(item_key)
+        item = backend.get_item(item_key)
         if not item:
             return f"No item found with key: {item_key}"
 
@@ -258,22 +233,31 @@ def get_item_fulltext(
                     db_path=zotero_db_path,
                     pdf_max_pages=max_pages,
                     attachment_priority=config.semantic_search.extraction.attachment_priority,
+                    reuse_pdf_parse=True,
                 ) as reader:
                     local_item = reader.get_item_by_key(item_key)
                     if local_item:
-                        extracted = reader.extract_fulltext_for_item(local_item.item_id)
-                        if extracted and extracted[0]:
-                            source = extracted[1] if len(extracted) > 1 else "file"
-                            ctx.info(f"Retrieved full text from local storage ({source})")
+                        extracted = reader.extract_fulltext_detailed(local_item.item_id)
+                        if extracted and extracted.text:
+                            ctx.info(f"Retrieved full text from local storage ({extracted.source})")
+                            heading, notice = _fulltext_section_heading(
+                                extracted.truncated, extracted.page_count, max_pages, item_key
+                            )
+                            body = "\n\n".join(
+                                part for part in (heading, notice, extracted.text) if part
+                            )
                             return _helpers._prepend_size_warning(
-                                f"{metadata}\n\n---\n\n## Full Text\n\n{extracted[0]}",
+                                f"{metadata}\n\n---\n\n{body}",
                                 "Consider using zotero_semantic_search to find specific content instead of reading full papers."
                             )
         except Exception as local_extract_error:
             local_extract_error_msg = str(local_extract_error)
             ctx.info(f"Local extraction fallback not available: {str(local_extract_error)}")
 
-        # Try to get attachment details
+        # Everything below is the API fallback, reached only when local
+        # extraction did not produce text. The client is built here rather
+        # than at the top so a read that SQLite can serve never needs one.
+        zot = _client.get_zotero_client()
         attachment = _client.get_attachment_details(zot, item)
         if not attachment:
             return f"{metadata}\n\n---\n\nNo suitable attachment found for this item."
@@ -303,31 +287,43 @@ def get_item_fulltext(
                     attachment.filename or f"{attachment.key}.pdf",
                     local_client=_client.get_local_zotero_client(),
                     web_client=None if _utils.is_local_mode() else zot,
+                    in_place=True,  # only read, then converted
                 )
 
                 if download.path and download.path.exists():
                     ctx.info(f"Downloaded file via {download.source} to {download.path}, converting to markdown")
-                    converted_text = _client.convert_to_markdown(download.path, max_pages=max_pages)
+                    # extract_file rather than convert_to_markdown: this path
+                    # applies the same page cap, so it needs the document's
+                    # page bookkeeping and not only its text (#448).
+                    doc = extract_file(download.path, max_pages=max_pages)
+                    if doc is None:
+                        return _fulltext_error(
+                            metadata,
+                            f"converting file to markdown: {download.path.name}",
+                        )
+                    heading, notice = _fulltext_section_heading(
+                        doc.truncated, doc.page_count, max_pages, item_key
+                    )
+                    body = "\n\n".join(part for part in (heading, notice, doc.text) if part)
                     return _helpers._prepend_size_warning(
-                        f"{metadata}\n\n---\n\n## Full Text\n\n{converted_text}",
+                        f"{metadata}\n\n---\n\n{body}",
                         "Consider using zotero_semantic_search to find specific content instead of reading full papers."
                     )
 
                 error_details = "\n".join(f"  - {err}" for err in download.errors) or "  - No download source succeeded"
-                return (
-                    f"{metadata}\n\n---\n\nFile download failed.\n\n"
+                return _fulltext_error(
+                    metadata,
+                    "File download failed.\n\n"
                     f"Attempted sources:\n{error_details}\n\n"
                     "For WebDAV-backed attachments, configure "
-                    "ZOTERO_WEBDAV_URL / ZOTERO_WEBDAV_USERNAME / ZOTERO_WEBDAV_PASSWORD."
+                    "ZOTERO_WEBDAV_URL / ZOTERO_WEBDAV_USERNAME / ZOTERO_WEBDAV_PASSWORD.",
                 )
         except Exception as download_error:
             ctx.error(f"Error downloading/converting file: {str(download_error)}")
+            detail = f"accessing attachment: {str(download_error)}"
             if local_extract_error_msg:
-                return (
-                    f"{metadata}\n\n---\n\nError accessing attachment: {str(download_error)}\n\n"
-                    f"Local extraction fallback error: {local_extract_error_msg}"
-                )
-            return f"{metadata}\n\n---\n\nError accessing attachment: {str(download_error)}"
+                detail += f"\n\nLocal extraction fallback error: {local_extract_error_msg}"
+            return _fulltext_error(metadata, detail)
 
     except Exception as e:
         ctx.error(f"Error fetching item full text: {str(e)}")
@@ -359,6 +355,14 @@ def get_attachment_path(
 
         with LocalZoteroReader(db_path=load_config().resolve_zotero_db_path()) as reader:
             attachments = reader.get_attachment_paths(item_key)
+            if not attachments:
+                # item_key may be the attachment's OWN key (get_item_by_key
+                # excludes attachments, so the parent lookup yields nothing).
+                att = reader.get_attachment_by_key(item_key)
+                if att:
+                    resolved = reader._resolve_attachment_path(att["key"], att.get("zotero_path") or "")
+                    attachments = [{**att, "resolved_path": resolved,
+                                    "exists": bool(resolved and resolved.exists())}]
 
         if not attachments:
             return f"No attachments found for item `{item_key}`."
@@ -427,20 +431,16 @@ def get_collections(
     """
     try:
         ctx.info("Fetching collections")
-        zot = _client.get_zotero_client()
+        backend = _library.get_library_backend()
 
         limit = _helpers._normalize_limit(limit, default=100, max_val=5000)
 
-        collections = _helpers._paginate(zot.collections, max_items=limit)
-        trashed_keys: set[str] = set()
-        if include_trashed:
-            trashed = _helpers.fetch_trashed_collections(zot)
-            existing_keys = {c.get("key") for c in collections}
-            for coll in trashed:
-                key = coll.get("key")
-                if key and key not in existing_keys:
-                    trashed_keys.add(key)
-                    collections.append(coll)
+        collections = backend.list_collections(include_trashed=include_trashed)
+        trashed_keys = {
+            c["key"] for c in collections
+            if c.get("key") and c.get("data", {}).get("deleted")
+        }
+        collections = collections[:limit]
 
         # Always return the header, even if empty
         output = ["# Zotero Collections", ""]
@@ -582,22 +582,21 @@ def get_collection_items(
     """
     try:
         ctx.info(f"Fetching items for collection {collection_key}")
-        zot = _client.get_zotero_client()
+        backend = _library.get_library_backend()
 
         # First get the collection details. Fail fast on lookup error: the
         # Zotero web API returns library-wide items for invalid or not-yet-
         # propagated collection keys rather than 404ing, so we must not fall
         # through to collection_items() when we can't confirm the collection
         # exists.
-        try:
-            collection = zot.collection(collection_key)
-            collection_name = collection["data"].get("name", "Unnamed Collection")
-        except Exception as e:
-            ctx.error(f"Collection lookup failed for {collection_key}: {e}")
+        collection = backend.get_collection(collection_key)
+        if collection is None:
+            ctx.error(f"Collection lookup failed for {collection_key}")
             return (
                 f"Collection not found or not yet accessible: `{collection_key}`. "
                 f"If you just created this collection, wait a moment and try again."
             )
+        collection_name = collection["data"].get("name", "Unnamed Collection")
 
         # The old ceiling was _normalize_limit's default of 100, which made
         # a collection larger than that impossible to enumerate: raising
@@ -605,24 +604,14 @@ def get_collection_items(
         limit = _helpers._normalize_limit(limit, default=50, max_val=1000)
         offset = _helpers._normalize_offset(offset)
 
-        # Fetch all items (includes children mixed in with parents). With
-        # subcollections requested this is one call per collection in the
-        # subtree; an item filed in several of them is returned once.
-        scope_keys = _helpers.expand_collection_scope(
-            zot, collection_key, include_subcollections
-        )
-        all_items = []
-        seen_keys: set[str] = set()
-        for scope_key in scope_keys:
-            for item in _helpers._paginate(zot.collection_items, scope_key):
-                key = item.get("key")
-                if key and key in seen_keys:
-                    continue
-                if key:
-                    seen_keys.add(key)
-                all_items.append(item)
+        # Fetch all items (includes children mixed in with parents). The
+        # subtree is resolved by the backend, which de-duplicates an item
+        # filed in several of its collections.
+        all_items = backend.collection_items(
+            collection_key, include_subcollections=include_subcollections
+        ) or []
         if not all_items:
-            scope_note = "" if len(scope_keys) == 1 else f" or its {len(scope_keys) - 1} subcollections"
+            scope_note = " or its subcollections" if include_subcollections else ""
             return (
                 f"No items found in collection: {collection_name} "
                 f"(Key: {collection_key}){scope_note}"
@@ -731,19 +720,18 @@ def get_collection_items(
         return f"Error fetching collection items: {str(e)}"
 
 
-def _format_children_detailed(zot, key: str, ctx: Context) -> str:
+def _format_children_detailed(backend, key: str, ctx: Context) -> str:
     """Render one parent's children in full detail (single-key output shape)."""
     ctx.info(f"Fetching children for item {key}")
 
     # First get the parent item details
-    try:
-        parent = zot.item(key)
-        parent_title = parent["data"].get("title", "Untitled Item")
-    except Exception:
-        parent_title = f"Item {key}"
+    parent = backend.get_item(key)
+    parent_title = (
+        parent["data"].get("title", "Untitled Item") if parent else f"Item {key}"
+    )
 
     # Then get the children
-    children = _helpers._paginate(zot.children, key)
+    children = backend.get_children([key]).get(key, [])
     if not children:
         return f"No child items found for: {parent_title} (Key: {key})"
 
@@ -822,23 +810,29 @@ def _format_children_detailed(zot, key: str, ctx: Context) -> str:
     return "\n".join(output)
 
 
-def _format_children_grouped(zot, keys: list[str], ctx: Context) -> str:
+def _format_children_grouped(backend, keys: list[str], ctx: Context) -> str:
     """Render several parents' children, grouped per parent (batch output shape)."""
     ctx.info(f"Fetching children for {len(keys)} items")
 
-    # Batch-resolve parent titles (50 per API call)
-    parent_titles = {}
-    for batch_start in range(0, len(keys), 50):
-        batch = keys[batch_start:batch_start + 50]
-        try:
-            items = zot.items(itemKey=",".join(batch))
-            for item in items:
-                k = item.get("key", "")
-                parent_titles[k] = item.get("data", {}).get("title", "Untitled")
-        except Exception as e:
-            ctx.warning(f"Batch parent lookup failed: {e}")
-            for k in batch:
-                parent_titles.setdefault(k, f"(key: {k})")
+    # Both lookups are one call for the whole batch, not one per key. Against
+    # a real library that is the difference between ~31 ms and ~5.7 s for 100
+    # parents (see library.py) — the per-key loop this replaced existed only
+    # because each call used to be an HTTP round trip.
+    try:
+        parents = backend.get_items(keys)
+    except Exception as e:
+        ctx.warning(f"Batch parent lookup failed: {e}")
+        parents = {}
+    parent_titles = {
+        k: parents[k].get("data", {}).get("title", "Untitled") if k in parents else f"(key: {k})"
+        for k in keys
+    }
+
+    try:
+        children_by_parent = backend.get_children(keys)
+    except Exception as e:
+        ctx.warning(f"Batch children lookup failed: {e}")
+        children_by_parent = {}
 
     output = [f"# Children for {len(keys)} items", ""]
 
@@ -846,13 +840,14 @@ def _format_children_grouped(zot, keys: list[str], ctx: Context) -> str:
         title = parent_titles.get(key, f"(key: {key})")
         output.append(f"## {title} (`{key}`)")
 
-        try:
-            children = _helpers._paginate(zot.children, key)
-        except Exception as e:
-            output.append(f"  Error fetching children: {e}")
+        # Absent means the lookup failed for this key; present-but-empty
+        # means the item genuinely has no children (see LibraryBackend).
+        if key not in children_by_parent:
+            output.append("  Error fetching children for this key.")
             output.append("")
             continue
 
+        children = children_by_parent[key]
         if not children:
             output.append("  No child items.")
             output.append("")
@@ -927,15 +922,15 @@ def get_item_children(
         section per parent.
     """
     try:
-        zot = _client.get_zotero_client()
+        backend = _library.get_library_backend()
         keys = _helpers._normalize_str_list_input(item_key, "item_key")
 
         if not keys:
             return "Error: No item keys provided."
 
         if len(keys) == 1:
-            return _format_children_detailed(zot, keys[0], ctx)
-        return _format_children_grouped(zot, keys, ctx)
+            return _format_children_detailed(backend, keys[0], ctx)
+        return _format_children_grouped(backend, keys, ctx)
 
     except ValueError as e:
         return f"Input error: {e}"
@@ -980,12 +975,14 @@ def get_tags(
     """
     try:
         ctx.info("Fetching tags")
-        zot = _client.get_zotero_client()
+        backend = _library.get_library_backend()
 
         limit = _helpers._normalize_limit(limit, default=500, max_val=5000)
 
-        # Use _paginate instead of zot.everything() to avoid RLock pickling
-        tags = _helpers._paginate(zot.tags)
+        # Unlimited on purpose: the display cap below applies to the *listing*,
+        # and the total is reported alongside it. The SQLite backend answers
+        # this in one query; the API backend still pages (see library.py).
+        tags = backend.list_tags()
         if not tags:
             return "No tags found in your Zotero library."
 
@@ -1027,7 +1024,7 @@ def get_tags(
     name="zotero_list_libraries",
     description=(
         "List every Zotero library this MCP can address: the user's "
-        "personal library (libraryID=1 conventionally), all group "
+        "personal library (switch to it with library_type='user'), all group "
         "libraries the user is a member of (with groupID), and (in "
         "local mode) RSS feed libraries. Each entry shows the "
         "library/group ID, display name, and item count. "
@@ -1087,7 +1084,8 @@ def list_libraries(*, ctx: Context) -> str:
                     for lib in user_libs:
                         output.append(
                             f"- **My Library** — {lib['itemCount']} items "
-                            f"(libraryID={lib['libraryID']})"
+                            f"(libraryID={lib['libraryID']}; switch with "
+                            f"library_type='user')"
                         )
                     output.append("")
 
@@ -1152,6 +1150,12 @@ def list_libraries(*, ctx: Context) -> str:
         return f"Error listing libraries: {str(e)}"
 
 
+#: Closing sentence of a successful ``switch_library``. Right for the MCP
+#: server, whose process keeps the switch; zotero-cli replaces it (each command
+#: is a new process), so it lives here for both to use.
+SWITCH_SUCCESS_NOTE = "All tools now operate on this library."
+
+
 @mcp.tool(
     name="zotero_switch_library",
     description=(
@@ -1163,7 +1167,7 @@ def list_libraries(*, ctx: Context) -> str:
         "first; don't guess. "
         "library_id: library ID string as returned by "
         "zotero_list_libraries (numeric for user/group, numeric for "
-        "feeds). "
+        "feeds); for the personal library 'user' or '0' also work. "
         "library_type: 'user' — the personal library; 'group' (default) "
         "— a group library; 'feeds' — a local RSS feed library; "
         "'default' — RESET to whatever the ZOTERO_LIBRARY_ID / "
@@ -1176,6 +1180,7 @@ def list_libraries(*, ctx: Context) -> str:
         "library_id='', library_type='default')."
     ),
 )
+
 @with_zotero_api_lock
 def switch_library(
     library_id: str,
@@ -1188,7 +1193,8 @@ def switch_library(
 
     Args:
         library_id: The library/group ID to switch to.
-            For user library: "0" (local mode) or your user ID (web mode).
+            For user library: "0" or "user"; in local mode also the
+            libraryID zotero_list_libraries shows; in web mode your user ID.
             For group libraries: the groupID (e.g. "6069773").
         library_type: "user", "group", or "default" to reset to env var defaults.
         ctx: MCP context
@@ -1209,19 +1215,48 @@ def switch_library(
 
         error = validate_library_switch(library_id, library_type)
         if error:
-            return error
+            # Leads with "Error" like every other refusal, which is what the
+            # CLI looks for to turn it into a failed envelope (#595).
+            return f"Error: {error}"
+
+        if library_type == "user":
+            # #603: "user", "0" and (local mode) the SQLite libraryID that
+            # zotero_list_libraries shows all name the one personal library.
+            local = os.getenv("ZOTERO_LOCAL", "").lower() in ["true", "yes", "1"]
+            if local:
+                library_id = "0"
+            elif (
+                library_id in ("user", "0", "")
+                and os.getenv("ZOTERO_LIBRARY_ID")
+                and (os.getenv("ZOTERO_LIBRARY_TYPE") or "user").strip().lower() != "group"
+            ):
+                # With a group configured, ZOTERO_LIBRARY_ID is a groupID,
+                # not the user's id, so there is nothing to map to.
+                library_id = os.getenv("ZOTERO_LIBRARY_ID")
 
         _client.set_active_library(library_id, library_type)
         ctx.info(f"Switched to library {library_id} (type={library_type})")
 
-        # Verify the switch works by making a test call
+        # Verify the switch works by making a test call.
+        #
+        # Skipped when SQLite is serving reads: `validate_library_switch` has
+        # already confirmed the library against zotero.sqlite, and every read
+        # after this point is answered from that same file. The probe would
+        # then only establish that Zotero desktop happens to be running —
+        # a different question, and one whose answer used to be reported as
+        # "Could not access library" for a library that was fully readable.
+        if _library.get_library_backend().name == "sqlite":
+            return (
+                f"Successfully switched to library **{library_id}** "
+                f"(type={library_type}). {SWITCH_SUCCESS_NOTE}"
+            )
         try:
             zot = _client.get_zotero_client()
             zot.add_parameters(limit=1)
             zot.items()
             return (
                 f"Successfully switched to library **{library_id}** "
-                f"(type={library_type}). All tools now operate on this library."
+                f"(type={library_type}). {SWITCH_SUCCESS_NOTE}"
             )
         except Exception as e:
             # Roll back on failure
@@ -1261,6 +1296,23 @@ def validate_library_switch(library_id: str, library_type: str) -> str | None:
                         return (
                             f"Group '{library_id}' not found. "
                             f"Available groups: {', '.join(sorted(valid_ids))}"
+                        )
+                elif library_type == "user":
+                    # Previously unvalidated here, because the HTTP probe below
+                    # caught a bad id. That probe no longer runs when SQLite is
+                    # serving reads, so the check has to live here instead.
+                    # A local database holds exactly one personal library,
+                    # addressed as "0" by convention (see get_zotero_client).
+                    # zotero_list_libraries shows its SQLite libraryID, so
+                    # accept that too (#603).
+                    valid_ids = {"0", "", "user"} | {
+                        str(library["libraryID"]) for library in libraries if library["type"] == "user"
+                    }
+                    if library_id not in valid_ids:
+                        return (
+                            f"Personal library id '{library_id}' is not addressable "
+                            f"in local mode. Use '0' or 'user', or switch to a group with "
+                            f"library_type='group'."
                         )
                 elif library_type == "feed":
                     valid_ids = {str(library["libraryID"]) for library in libraries if library["type"] == "feed"}
@@ -1305,7 +1357,7 @@ def list_feeds(*, ctx: Context) -> str:
     try:
         local = os.getenv("ZOTERO_LOCAL", "").lower() in ["true", "yes", "1"]
         if not local:
-            return "RSS feeds are only accessible in local mode (ZOTERO_LOCAL=true)."
+            return "Error: RSS feeds are only accessible in local mode (ZOTERO_LOCAL=true)."
 
         ctx.info("Listing RSS feeds")
         from zotero_mcp.local_db import LocalZoteroReader
@@ -1378,7 +1430,7 @@ def get_feed_items(
     try:
         local = os.getenv("ZOTERO_LOCAL", "").lower() in ["true", "yes", "1"]
         if not local:
-            return "RSS feed items are only accessible in local mode (ZOTERO_LOCAL=true)."
+            return "Error: RSS feed items are only accessible in local mode (ZOTERO_LOCAL=true)."
 
         ctx.info(f"Fetching items from feed (libraryID={library_id})")
         from zotero_mcp.local_db import LocalZoteroReader
@@ -1472,31 +1524,21 @@ def get_recent(
     """
     try:
         ctx.info(f"Fetching {limit} recent items")
-        zot = _client.get_zotero_client()
+        backend = _library.get_library_backend()
 
         # The Zotero API serves at most 100 items per request, so a single
         # call silently returned 100 for any larger limit -- and then the
         # heading below announced the number that had been *asked* for (#453).
-        # Paginating makes the limit mean what it says; the heading now
-        # reports what actually came back either way.
+        # The backend applies the limit itself now; the heading still reports
+        # what actually came back either way.
         limit = _helpers._normalize_limit(limit, default=10, max_val=1000)
 
         # Get recent items, optionally scoped to a collection
         if collection_key:
-            try:
-                _col = zot.collection(collection_key)
-            except Exception:
-                _col = None
+            _col = backend.get_collection(collection_key)
             if not _col or _col.get("key") != collection_key:
-                return f"Collection not found: '{collection_key}'. Use zotero_get_collections or zotero_search_collections to find valid collection keys."
-            items = _utils._paginate(
-                zot.collection_items, collection_key,
-                sort="dateAdded", direction="desc", max_items=limit,
-            )
-        else:
-            items = _utils._paginate(
-                zot.items, sort="dateAdded", direction="desc", max_items=limit,
-            )
+                raise ToolError(f"Collection not found: '{collection_key}'. Use zotero_get_collections or zotero_search_collections to find valid collection keys.")
+        items = backend.recent_items(limit=limit, collection_key=collection_key)
 
         if not items:
             return "No items found in your Zotero library." if not collection_key else f"No items found in collection: {collection_key}"
@@ -1514,9 +1556,11 @@ def get_recent(
 
         return "\n".join(output)
 
+    except ToolError:
+        raise
     except Exception as e:
         ctx.error(f"Error fetching recent items: {str(e)}")
-        return f"Error fetching recent items: {str(e)}"
+        raise ToolError(f"Error fetching recent items: {str(e)}") from e
 
 
 @mcp.tool(
@@ -1540,12 +1584,11 @@ def get_item_related(
     """
     try:
         ctx.info(f"Fetching related items for {item_key}")
-        zot = _client.get_zotero_client()
+        backend = _library.get_library_backend()
 
         # Fetch the item
-        try:
-            item = zot.item(item_key)
-        except Exception:
+        item = backend.get_item(item_key)
+        if item is None:
             return f"Error: Item '{item_key}' not found."
 
         data = item.get("data", {})
@@ -1590,13 +1633,19 @@ def get_item_related(
                 by_type[rel_type] = []
             by_type[rel_type].append((key, uri))
 
+        # One batched lookup for every related key, rather than one call per
+        # relation as this used to do.
+        related_items = backend.get_items([key for _, key, _ in related_keys])
+
         for rel_type, items in by_type.items():
             output.append(f"## Relation Type: `{rel_type}`")
             output.append("")
 
             for rel_key, uri in items:
                 try:
-                    rel_item = zot.item(rel_key)
+                    rel_item = related_items.get(rel_key)
+                    if rel_item is None:
+                        raise KeyError(f"item {rel_key} is not in this library")
                     rel_data = rel_item.get("data", {})
                     rel_title = rel_data.get("title", "Untitled")
                     rel_type_name = rel_data.get("itemType", "unknown")

@@ -232,6 +232,9 @@ class _BibZotero(FakeZotero):
             return super().collection_items(key, **kwargs)
         return rendered
 
+    def collection_items_top(self, key, **kwargs):
+        return self.collection_items(key, **kwargs)
+
 
 def test_export_bibliography_bib_strips_html(monkeypatch):
     fake = _BibZotero()
@@ -284,6 +287,40 @@ def test_export_bibliography_bibtex_fenced(monkeypatch):
     # meaningless so it is not sent.
     assert fake.last_kwargs.get("format") == "bibtex"
     assert "style" not in fake.last_kwargs
+
+
+def test_export_bibliography_bibtex_from_parsed_database(monkeypatch):
+    """pyzotero parses format=bibtex into a bibtexparser BibDatabase.
+
+    The stub above returns raw bytes, but the real client hands back the
+    parsed database, which used to crash with "'BibDatabase' object is not
+    iterable". It must reach the user as .bib text with every entry.
+    """
+    import bibtexparser
+
+    class _ParsedBibZotero(_BibZotero):
+        def _render(self, kwargs):
+            if kwargs.get("format") == "bibtex":
+                return bibtexparser.loads(
+                    "@inproceedings{yan2023, title={FPDM}, booktitle={ICCV}}\n"
+                    "@article{smith2020, title={Title}, author={Smith, J.}}\n"
+                )
+            return super()._render(kwargs)
+
+    fake = _ParsedBibZotero()
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: fake)
+
+    out = synthesis.export_bibliography(
+        item_keys=["ABCD1234", "EFGH5678"],
+        export_format="bibtex",
+        ctx=DummyContext(),
+    )
+
+    assert "Error" not in out
+    assert "```bibtex" in out
+    assert "@inproceedings{yan2023" in out
+    assert "booktitle = {ICCV}" in out
+    assert "@article{smith2020" in out
 
 
 def test_export_bibliography_collection(monkeypatch):
@@ -398,6 +435,8 @@ class _LooseItemKeyZotero(_AtomRejectingZotero):
         rows.append({"key": "ALSONOISE", include: "<div>More, M. (1998).</div>"})
         return rows
 
+    top = items
+
 
 def test_export_bibliography_item_keys_filters_out_api_extras(monkeypatch):
     """Only the requested keys are rendered, in the order asked for (#371)."""
@@ -415,6 +454,67 @@ def test_export_bibliography_item_keys_filters_out_api_extras(monkeypatch):
     assert "Noise" not in out and "More, M." not in out
 
 
+class _ChildrenFirstZotero(_AtomRejectingZotero):
+    """Zotero's itemKey behaviour, as measured against the local API.
+
+    ``/items`` answers with each requested item *and its children* (notes,
+    attachments), cut off at ``limit``, so the children use up the page.
+    ``/items/top`` answers with the requested top-level items only. Zotero's
+    web API accepts at most 50 keys per itemKey filter.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def _rows(self, kwargs, with_children):
+        keys = [k for k in (kwargs.get("itemKey") or "").split(",") if k]
+        if len(keys) > 50:
+            raise RuntimeError("itemKey takes at most 50 keys")
+        self.calls.append(len(keys))
+        rows = []
+        for k in keys:
+            if with_children:
+                rows += [{"key": f"{k}N{i}", "itemType": "note"} for i in range(2)]
+            rows.append({"key": k})
+        rows = rows[kwargs.get("start", 0):][: kwargs.get("limit", 25)]
+        if kwargs.get("format") == "bibtex":
+            return "".join(f"@article{{{r['key']},}}\n" for r in rows if "itemType" not in r).encode()
+        include = kwargs.get("include")
+        return [
+            r if "itemType" in r else {**r, include: f"<div>Entry {r['key']}</div>"}
+            for r in rows
+        ]
+
+    def items(self, **kwargs):
+        return self._rows(kwargs, with_children=True)
+
+    def top(self, **kwargs):
+        return self._rows(kwargs, with_children=False)
+
+
+@pytest.mark.parametrize("export_format", ["bib", "citation", "bibtex"])
+def test_export_bibliography_item_keys_all_rendered_despite_children(
+    monkeypatch, export_format
+):
+    """60 requested keys give 60 entries; children no longer crowd them out."""
+    fake = _ChildrenFirstZotero()
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: fake)
+    keys = [f"K{i:07d}" for i in range(60)]
+
+    out = synthesis.export_bibliography(
+        item_keys=keys, export_format=export_format, ctx=DummyContext()
+    )
+
+    for k in keys:
+        assert k in out, f"{k} missing from the export"
+    if export_format != "bibtex":
+        assert "60. " in out and "61. " not in out
+        # Entries keep the caller's order across batches.
+        assert out.index("K0000049") < out.index("K0000050")
+    assert max(fake.calls) <= 50
+
+
 def test_export_bibliography_library_wide_uses_top_level_items(monkeypatch):
     """Exporting the library skips attachments/notes, which render as blanks."""
     local = _AtomRejectingZotero()
@@ -423,3 +523,148 @@ def test_export_bibliography_library_wide_uses_top_level_items(monkeypatch):
     synthesis.export_bibliography(ctx=DummyContext())
 
     assert local.last_kwargs.get("include") == "bib"
+
+
+# ---------------------------------------------------------------------------
+# export_bibliography — numbering skips rows that render to nothing
+# ---------------------------------------------------------------------------
+
+
+class _WrapperRowsZotero(_BibZotero):
+    """Rows whose ``bib`` is non-empty HTML but holds no text.
+
+    Zotero's API can answer with rows like these between real entries (the
+    live case was a 12-item collection numbered 4, 5, 7, 9, …). They pass the
+    "field is empty" filter and only turn empty once the HTML is stripped.
+    """
+
+    def _render(self, kwargs):
+        if kwargs.get("include") == "bib":
+            entry = '<div class="csl-entry">{}</div>'
+            wrapper = '<div class="csl-bib-body"><div class="csl-entry"> </div></div>'
+            return [
+                {"key": "WRAP0001", "bib": wrapper},
+                {"key": "ABCD1234", "bib": entry.format("Alpha, A. (2020). One.")},
+                {"key": "WRAP0002", "bib": wrapper},
+                {"key": "EFGH5678", "bib": entry.format("Beta, B. (2021). Two.")},
+                {"key": "IJKL9012", "bib": entry.format("Gamma, C. (2022). Three.")},
+            ]
+        return super()._render(kwargs)
+
+
+def test_export_bibliography_numbers_entries_without_gaps(monkeypatch):
+    fake = _WrapperRowsZotero()
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: fake)
+
+    out = synthesis.export_bibliography(collection_key="COLL1234", ctx=DummyContext())
+
+    numbered = [line for line in out.splitlines() if line[:1].isdigit()]
+    assert numbered == [
+        "1. Alpha, A. (2020). One.",
+        "2. Beta, B. (2021). Two.",
+        "3. Gamma, C. (2022). Three.",
+    ]
+
+
+class _OnlyWrapperRowsZotero(_BibZotero):
+    def _render(self, kwargs):
+        if kwargs.get("include") == "bib":
+            return [{"key": "WRAP0001", "bib": '<div class="csl-entry"> </div>'}]
+        return super()._render(kwargs)
+
+
+def test_export_bibliography_all_rows_empty_after_cleaning(monkeypatch):
+    fake = _OnlyWrapperRowsZotero()
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: fake)
+
+    out = synthesis.export_bibliography(collection_key="COLL1234", ctx=DummyContext())
+
+    assert out == "No bibliography entries produced for collection COLL1234."
+
+
+# ---------------------------------------------------------------------------
+# export_bibliography: a collection/library larger than one page
+# ---------------------------------------------------------------------------
+
+
+class _BigCollectionZotero(_BibZotero):
+    """191 top-level items, each with one child attachment, like a real library.
+
+    ``/items`` returns children interleaved with their parents (so the first
+    100 rows hold ~50 references); ``/items/top`` returns parents only. Both
+    honour ``start`` and ``limit``.
+    """
+
+    N = 191
+
+    def __init__(self):
+        super().__init__()
+        self.all_rows = []
+        self.top_rows = []
+        for i in range(self.N):
+            parent = {"key": f"P{i:07d}", "bib": f"<div>Ref {i}.</div>", "citation": f"<span>(Ref {i})</span>"}
+            child = {"key": f"C{i:07d}", "bib": "", "citation": ""}
+            self.all_rows += [parent, child]
+            self.top_rows.append(parent)
+
+    def _slice(self, rows, kwargs):
+        start = kwargs.get("start", 0)
+        limit = kwargs.get("limit", 25)
+        self.links = {"next": "..."} if start + limit < len(rows) else {}
+        rows = rows[start : start + limit]
+        if kwargs.get("format") == "bibtex":
+            return "\n".join(
+                f"@article{{{r['key']},\n  title = {{T}}\n}}" for r in rows
+            ).encode()
+        include = kwargs.get("include")
+        return [{"key": r["key"], include: r[include]} for r in rows]
+
+    def collection_items(self, key, **kwargs):
+        return self._slice(self.all_rows, kwargs)
+
+    def collection_items_top(self, key, **kwargs):
+        return self._slice(self.top_rows, kwargs)
+
+    def top(self, **kwargs):
+        return self._slice(self.top_rows, kwargs)
+
+
+@pytest.mark.parametrize("export_format", ["bib", "citation"])
+@pytest.mark.parametrize("collection_key", ["COLL1234", None])
+def test_export_bibliography_pages_through_whole_collection(
+    monkeypatch, export_format, collection_key
+):
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: _BigCollectionZotero())
+
+    out = synthesis.export_bibliography(
+        collection_key=collection_key, export_format=export_format, ctx=DummyContext()
+    )
+
+    numbered = [ln for ln in out.splitlines() if ln[:1].isdigit()]
+    assert len(numbered) == _BigCollectionZotero.N
+
+
+@pytest.mark.parametrize("collection_key", ["COLL1234", None])
+def test_export_bibliography_bibtex_pages_through_whole_collection(
+    monkeypatch, collection_key
+):
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: _BigCollectionZotero())
+
+    out = synthesis.export_bibliography(
+        collection_key=collection_key, export_format="bibtex", ctx=DummyContext()
+    )
+
+    assert out.count("@article{") == _BigCollectionZotero.N
+
+
+def test_export_bibliography_large_export_carries_size_warning(monkeypatch):
+    """A whole-library export is uncapped now, so a big one says how big."""
+    monkeypatch.setattr(zotero_client, "get_zotero_client", lambda: _BigCollectionZotero())
+    monkeypatch.setattr(_BigCollectionZotero, "N", 600)
+
+    out = synthesis.export_bibliography(
+        collection_key="COLL1234", export_format="bibtex", ctx=DummyContext()
+    )
+
+    assert out.startswith("*Response size:")
+    assert "item_keys or collection_key" in out.splitlines()[0]

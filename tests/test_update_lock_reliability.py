@@ -32,6 +32,36 @@ def test_read_lock_holder_live_pid(tmp_path):
     assert alive is True
 
 
+def test_pid_is_alive_never_calls_os_kill_on_windows(monkeypatch):
+    """``os.kill(pid, 0)`` is a Ctrl+C broadcast on Windows, not a probe.
+
+    ``signal.CTRL_C_EVENT`` is 0, so the POSIX idiom hands
+    ``GenerateConsoleCtrlEvent`` a real console control event, which lands on
+    every process sharing the console. It interrupted this suite at 97% and
+    took down whatever shell launched it. Nothing on this path may reach
+    ``os.kill`` while the platform is Windows.
+    """
+    if sys.platform != "win32":
+        pytest.skip("the os.kill routing under test is Windows-only")
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("os.kill must never run on Windows")
+
+    monkeypatch.setattr(os, "kill", _forbidden)
+    assert semantic_search._pid_is_alive(os.getpid()) is True
+
+
+@skip_on_ci
+def test_pid_is_alive_agrees_with_reality():
+    """Own pid is alive; a pid that cannot exist is not.
+
+    Shares ``test_read_lock_holder_dead_pid``'s 999999 and so shares its
+    skip: the value is only *essentially* certain to be free.
+    """
+    assert semantic_search._pid_is_alive(os.getpid()) is True
+    assert semantic_search._pid_is_alive(999999) is False
+
+
 @skip_on_ci
 def test_read_lock_holder_dead_pid(tmp_path):
     lock = tmp_path / "update.lock"
@@ -76,3 +106,40 @@ def test_rerank_with_scores_orders_and_scores(monkeypatch):
     assert len(ranked) == 2
     # rerank() delegates to rerank_with_scores and returns indices only.
     assert rr.rerank("q", ["no", "the match here", "no"], top_k=1) == [1]
+
+
+@skip_on_ci
+def test_update_lock_excludes_a_second_holder_without_fcntl(tmp_path, monkeypatch):
+    """Windows has no fcntl; the lock must still keep two updaters apart (#267).
+
+    Two server processes started within seconds of each other on Windows both
+    ran a full-text index of the same library, because the lock degraded to a
+    no-op. ``msvcrt.locking`` is a mandatory byte-range lock, so it must sit
+    past the pid text or the second process could not read who holds it.
+    """
+    import types
+
+    fcntl = pytest.importorskip("fcntl")  # stands in for the OS lock below
+    locked_at = []
+
+    def _locking(fd, mode, nbytes):
+        locked_at.append(os.lseek(fd, 0, os.SEEK_CUR))
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise OSError(13, "Permission denied") from None
+
+    fake = types.SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0, locking=_locking)
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+    monkeypatch.setitem(sys.modules, "fcntl", None)  # `import fcntl` -> ImportError
+    monkeypatch.delenv("ZOTERO_MCP_FORCE_UPDATE", raising=False)
+
+    lock = tmp_path / "update.lock"
+    with semantic_search._acquire_update_lock(lock) as first:
+        assert first is True
+        assert lock.read_text() == str(os.getpid())
+        with semantic_search._acquire_update_lock(lock) as second:
+            assert second is False
+    assert locked_at and all(pos > len(str(os.getpid())) for pos in locked_at)
+    with semantic_search._acquire_update_lock(lock) as again:
+        assert again is True

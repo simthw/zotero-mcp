@@ -17,6 +17,7 @@ if sys.version_info >= (3, 14):
     )
 
 from zotero_mcp import semantic_search
+from zotero_mcp.extract import DEFAULT_ATTACHMENT_PRIORITY
 
 DATE_MODIFIED = "2026-07-02 01:01:48"
 
@@ -53,7 +54,9 @@ class FakeReader:
         self._mineru_available = mineru_available
         self._extracted_source = extracted_source
         self.extract_calls = 0
-        self.attachment_priority = ("pdf", "html", "file")
+        # The scan stamps this onto every document so a later run can detect
+        # an attachment_priority change (#378).
+        self.attachment_priority = DEFAULT_ATTACHMENT_PRIORITY
 
     def __enter__(self):
         return self
@@ -86,6 +89,13 @@ class FakeReader:
 class FakeChromaClient:
     def __init__(self, stored_metadata):
         self.embedding_max_tokens = 8000
+        # Stored docs here model the post-migration steady state (attributed
+        # to the personal library) unless a test says otherwise: a doc with
+        # NO group_id is deliberately re-upserted by the scan regardless of
+        # the failed marker, which would defeat these skip/retry assertions.
+        if stored_metadata is not None:
+            stored_metadata = dict(stored_metadata)
+            stored_metadata.setdefault("group_id", 0)
         self._stored = stored_metadata
 
     def get_document_metadata(self, key):
@@ -141,7 +151,6 @@ def test_failed_item_skipped_when_nothing_changed(monkeypatch):
     stored = {
         "has_fulltext": "failed",
         "date_modified": DATE_MODIFIED,
-        "group_id": 0,
         "attachment_keys": "",
     }
     items, reader = _run_scan(monkeypatch, stored, attachments=[])
@@ -149,12 +158,39 @@ def test_failed_item_skipped_when_nothing_changed(monkeypatch):
     assert reader.extract_calls == 0
 
 
+def test_untagged_doc_is_reupserted_despite_failed_marker(monkeypatch):
+    """A doc with no group_id predates multi-library attribution and was not
+    covered by the backfill; the scan must re-upsert it so it gains its
+    attribution — otherwise it is skipped as 'up to date' forever and stays
+    excluded from library-filtered search and deletion cleanup."""
+    stored = {
+        "has_fulltext": "failed",
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "",
+    }
+
+    class _UntaggedChroma(FakeChromaClient):
+        def __init__(self, stored_metadata):
+            super().__init__(stored_metadata)
+            self._stored.pop("group_id", None)
+
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
+    reader = FakeReader(attachments=[])
+    monkeypatch.setattr(semantic_search, "LocalZoteroReader", lambda **kw: reader)
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=_UntaggedChroma(stored))
+    search.db_path = "unused"
+
+    items = search._get_items_from_local_db(extract_fulltext=True)
+
+    assert [it["key"] for it in items] == ["ITEMKEY1"]
+
+
 def test_failed_item_retried_when_attachment_added(monkeypatch):
     """failed marker + same date, but a PDF was attached since -> retry."""
     stored = {
         "has_fulltext": "failed",
         "date_modified": DATE_MODIFIED,
-        "group_id": 0,
         "attachment_keys": "",
     }
     attachments = [("ATTKEY1", "storage:paper.pdf", "application/pdf")]
@@ -181,7 +217,6 @@ def test_failed_item_retried_when_date_modified_changed(monkeypatch):
     stored = {
         "has_fulltext": "failed",
         "date_modified": "2026-06-30 12:00:00",  # differs from the item's
-        "group_id": 0,
         "attachment_keys": "",
     }
     items, reader = _run_scan(monkeypatch, stored, attachments=[])
@@ -194,7 +229,6 @@ def test_legacy_failed_record_without_attachment_keys_retries_once(monkeypatch):
     stored = {
         "has_fulltext": "failed",
         "date_modified": DATE_MODIFIED,
-        "group_id": 0,
         # no attachment_keys field (legacy)
     }
     attachments = [("ATTKEY1", "storage:paper.pdf", "application/pdf")]
@@ -202,6 +236,162 @@ def test_legacy_failed_record_without_attachment_keys_retries_once(monkeypatch):
     assert len(items) == 1
     assert reader.extract_calls == 1
 
+
+# ---------------------------------------------------------------------------
+# #446: "failed" must mean an extraction actually failed
+# ---------------------------------------------------------------------------
+
+class NoTextReader(FakeReader):
+    """Reader whose extraction never yields text."""
+
+    def extract_fulltext_for_item(self, item_id):
+        self.extract_calls += 1
+        return None
+
+
+def _run_scan_no_text(monkeypatch, stored_metadata, attachments):
+    monkeypatch.setattr(semantic_search, "get_zotero_client", lambda: object())
+    monkeypatch.setattr(semantic_search, "is_local_mode", lambda: True)
+    reader = NoTextReader(attachments=attachments)
+    monkeypatch.setattr(
+        semantic_search, "LocalZoteroReader", lambda *a, **kw: reader
+    )
+    chroma = FakeChromaClient(stored_metadata)
+    search = semantic_search.ZoteroSemanticSearch(chroma_client=chroma)
+    monkeypatch.setattr(
+        search,
+        "_get_items_from_api",
+        lambda *a, **kw: pytest.fail("unexpected fallback to API path"),
+    )
+    items = search._get_items_from_source(
+        extract_fulltext=True, chroma_client=chroma, force_rebuild=False
+    )
+    return items, reader, search
+
+
+def test_item_without_attachments_is_not_marked_failed(monkeypatch):
+    """No attachments -> nothing was tried -> no 'failed' marker (#446).
+
+    Marking these "failed" put every attachment-less item (notes-only
+    entries, webpage stubs, books without files) into the scary
+    "PDF extraction previously failed" report, where a force-rebuild
+    could never fix them because there was never anything to extract.
+    """
+    items, reader, search = _run_scan_no_text(monkeypatch, None, attachments=[])
+    assert len(items) == 1
+    data = items[0]["data"]
+    assert data["fulltext_attempted"] is False
+    metadata = search._create_metadata(items[0])
+    assert "has_fulltext" not in metadata
+
+
+def test_item_with_unreadable_attachment_is_marked_failed(monkeypatch):
+    """An attachment that produced no text is a real failure -> marker stays."""
+    attachments = [("ATTKEY1", "storage:paper.pdf", "application/pdf")]
+    items, reader, search = _run_scan_no_text(monkeypatch, None, attachments=attachments)
+    assert len(items) == 1
+    data = items[0]["data"]
+    assert data["fulltext_attempted"] is True
+    metadata = search._create_metadata(items[0])
+    assert metadata["has_fulltext"] == "failed"
+
+
+def test_attachmentless_item_never_reported_as_failed_extraction(
+    monkeypatch, capsys
+):
+    """Legacy 'failed' markers on attachment-less items leave the report.
+
+    Records written before #446 carry has_fulltext="failed" with an empty
+    attachment_keys set; they are still skipped (nothing to do), but the
+    summary must not present them as PDF extraction failures.
+    """
+    stored = {
+        "has_fulltext": "failed",
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "",
+    }
+    items, reader, _search = _run_scan_no_text(monkeypatch, stored, attachments=[])
+    assert items == []
+    assert reader.extract_calls == 0
+    err = capsys.readouterr().err
+    assert "PDF extraction previously failed" not in err
+    assert "remain metadata-only" in err
+
+
+def test_real_failed_extraction_still_reported(monkeypatch, capsys):
+    """Items whose attachments failed to parse still show in the report."""
+    stored = {
+        "has_fulltext": "failed",
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "ATTKEY1",
+    }
+    attachments = [("ATTKEY1", "storage:paper.pdf", "application/pdf")]
+    items, reader, _search = _run_scan_no_text(monkeypatch, stored, attachments=attachments)
+    assert items == []
+    err = capsys.readouterr().err
+    assert "PDF extraction previously failed" in err
+
+
+def test_extraction_summary_counts_failures_in_the_same_run(monkeypatch, capsys):
+    """The run that fails an extraction says so itself, not just the next one."""
+    attachments = [("ATTKEY1", "storage:paper.pdf", "application/pdf")]
+    _run_scan_no_text(monkeypatch, None, attachments=attachments)
+    err = capsys.readouterr().err
+    assert "1 item(s) had attachments that produced no text" in err
+
+
+# ---------------------------------------------------------------------------
+# #428: indexed fulltext must follow the item's attachments
+# ---------------------------------------------------------------------------
+
+def test_item_whose_attachments_were_removed_is_reindexed_metadata_only(monkeypatch):
+    """Text indexed from a PDF the user has since deleted must stop matching."""
+    stored = {
+        "has_fulltext": True,
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "ATTKEY1",
+    }
+    items, reader, search = _run_scan_no_text(monkeypatch, stored, attachments=[])
+    assert [it["key"] for it in items] == ["ITEMKEY1"]
+    assert "has_fulltext" not in search._create_metadata(items[0])
+
+
+def test_replaced_attachment_is_reextracted(monkeypatch):
+    stored = {
+        "has_fulltext": True,
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "OLDATT01",
+    }
+    attachments = [("NEWATT01", "storage:new.pdf", "application/pdf")]
+    items, reader = _run_scan(monkeypatch, stored, attachments=attachments)
+    assert len(items) == 1
+    assert reader.extract_calls == 1
+
+
+def test_unchanged_indexed_item_is_still_skipped(monkeypatch):
+    stored = {
+        "has_fulltext": True,
+        "date_modified": DATE_MODIFIED,
+        "attachment_keys": "ATTKEY1",
+    }
+    attachments = [("ATTKEY1", "storage:paper.pdf", "application/pdf")]
+    items, reader = _run_scan(monkeypatch, stored, attachments=attachments)
+    assert items == []
+    assert reader.extract_calls == 0
+
+
+def test_legacy_record_without_attachment_keys_is_not_reextracted(monkeypatch):
+    """Upgrading must not re-extract every document indexed before
+    attachment_keys was stored."""
+    stored = {"has_fulltext": True, "date_modified": DATE_MODIFIED}
+    attachments = [("ATTKEY1", "storage:paper.pdf", "application/pdf")]
+    items, reader = _run_scan(monkeypatch, stored, attachments=attachments)
+    assert items == []
+
+
+# ---------------------------------------------------------------------------
+# MinerU content_list.json (local fork): a new sidecar must trigger a re-index
+# ---------------------------------------------------------------------------
 
 def test_failed_item_retried_when_mineru_output_appears(monkeypatch):
     """A new MinerU sidecar clears a failed marker without Zotero metadata changes."""
@@ -246,3 +436,4 @@ def test_existing_pdf_fulltext_is_upgraded_to_mineru(monkeypatch):
     assert len(items) == 1
     assert reader.extract_calls == 1
     assert items[0]["data"]["fulltextSource"] == "content_list_json"
+

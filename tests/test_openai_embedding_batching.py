@@ -6,6 +6,8 @@ __new__ so the tests don't require the optional `openai` package (CI does not
 install it).
 """
 
+import base64
+import struct
 import threading
 
 from zotero_mcp.chroma_client import OpenAIEmbeddingFunction
@@ -30,8 +32,14 @@ def _make(batch_size=64, rps=None):
 
     class _Embeddings:
         @staticmethod
-        def create(model, input, encoding_format):
-            calls.append({"input": list(input), "encoding_format": encoding_format})
+        def create(model, input, encoding_format, extra_body=None):
+            calls.append(
+                {
+                    "input": list(input),
+                    "encoding_format": encoding_format,
+                    "extra_body": extra_body,
+                }
+            )
             return _Resp(input)
 
     class _Client:
@@ -82,3 +90,64 @@ def test_get_config_roundtrips_new_fields():
     assert cfg["request_batch_size"] == 128
     assert cfg["rate_limit_rps"] == 5.0
     assert cfg["model_name"] == "text-embedding-3-small"
+
+
+def test_voyage_base_url_gets_base64_encoding_format():
+    # Voyage AI (api.voyageai.com via base_url) rejects encoding_format="float"
+    # with a 400; it only accepts "base64". Everything else keeps "float" (#348).
+    ef, calls = _make(batch_size=2)
+    ef.base_url = "https://api.voyageai.com/v1"
+    ef([0, 1])
+    assert calls and all(c["encoding_format"] == "base64" for c in calls)
+
+
+def test_non_voyage_base_url_keeps_float_encoding_format():
+    ef, calls = _make(batch_size=2)
+    ef.base_url = "https://openrouter.ai/api/v1"
+    ef([0, 1])
+    assert calls and all(c["encoding_format"] == "float" for c in calls)
+
+
+def test_voyage_base64_response_is_decoded():
+    # Voyage returns each embedding as a base64 str; the provider decodes it to floats.
+    ef, calls = _make()
+    ef.base_url = "https://api.voyageai.com/v1"
+    plain_create = ef.client.embeddings.create
+
+    def create(model, input, encoding_format, extra_body=None):
+        resp = plain_create(model, input, encoding_format)
+        for d in resp.data:
+            d.embedding = base64.b64encode(struct.pack(f"<{len(d.embedding)}f", *d.embedding)).decode()
+        return resp
+
+    ef.client.embeddings.create = create
+    assert ef([0.5, 2.0]) == [[0.5], [2.0]]
+    assert [c["encoding_format"] for c in calls] == ["base64"]
+
+
+def test_voyage_document_call_sends_input_type_document():
+    # Voyage optimizes the doc/query pair when input_type labels the role;
+    # corpus ingestion (the __call__ path) must send "document" (#667 follow-up).
+    ef, calls = _make(batch_size=2)
+    ef.base_url = "https://api.voyageai.com/v1"
+    ef([0, 1])
+    assert calls and all(c["extra_body"] == {"input_type": "document"} for c in calls)
+
+
+def test_voyage_query_call_sends_input_type_query():
+    # The query path (embed_query -> _prepare_query -> is_query=True) must
+    # label the request "query" so Voyage optimizes the retrieval direction.
+    ef, calls = _make(batch_size=2)
+    ef.base_url = "https://api.voyageai.com/v1"
+    ef.embed_query([0.5, 2.0])
+    assert calls and all(c["extra_body"] == {"input_type": "query"} for c in calls)
+
+
+def test_non_voyage_requests_omit_input_type():
+    # extra_body/input_type is Voyage-only; OpenAI and other OpenAI-compatible
+    # backends must not receive unknown parameters.
+    ef, calls = _make(batch_size=2)
+    ef.base_url = "https://openrouter.ai/api/v1"
+    ef([0, 1])
+    ef.embed_query([0.5])
+    assert calls and all(c["extra_body"] is None for c in calls)

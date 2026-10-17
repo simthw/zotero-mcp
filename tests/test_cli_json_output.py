@@ -10,8 +10,10 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from conftest import DummyContext, FakeZotero
 
 from zotero_mcp import cli_json
+from zotero_mcp.library import ApiBackend
 from zotero_mcp.cli_standalone import (
     _fetch_projected,
     _keys_from_markdown,
@@ -19,6 +21,7 @@ from zotero_mcp.cli_standalone import (
     cmd_get,
     cmd_search,
 )
+from zotero_mcp.tools.retrieval import _format_children_detailed
 
 
 def _raw(key, item_type="journalArticle", title="A Paper", **fields):
@@ -151,37 +154,125 @@ class TestKeyExtraction:
         assert _keys_from_markdown("No items found matching the criteria.") == []
         assert _keys_from_markdown("") == []
 
+    def test_reads_keys_from_a_detailed_children_listing(self):
+        zot = FakeZotero()
+        zot._items = [{"key": "PAR00001", "data": {"title": "Parent"}}]
+        zot._children = {
+            "PAR00001": [
+                {"key": "NOTE0001", "data": {"itemType": "note", "note": "hi"}},
+                {"key": "ATT00001", "data": {
+                    "itemType": "attachment", "contentType": "application/pdf",
+                }},
+            ],
+        }
+        md = _format_children_detailed(ApiBackend(zot), "PAR00001", DummyContext())
+        assert _keys_from_markdown(md) == ["ATT00001", "NOTE0001"]
+
+
+    def test_reads_keys_from_a_grouped_children_listing(self):
+        """Several parent keys render through _format_children_grouped, whose
+        `  - [KEY] Attachment: ...` lines no other alternative matched, so
+        `get children --json K1 K2` reported count 0 (#505)."""
+        from zotero_mcp.tools.retrieval import _format_children_grouped
+
+        class _Zot:
+            def items(self, itemKey=None, start=0, limit=100, **kwargs):
+                if start:
+                    return []
+                return [{"key": k, "data": {"title": f"Parent {k}"}}
+                        for k in itemKey.split(",")]
+
+            def children(self, key, start=0, limit=100, **kwargs):
+                if start:
+                    return []
+                return [
+                    {"key": f"ATT{key[-5:]}", "data": {
+                        "itemType": "attachment", "contentType": "application/pdf",
+                        "filename": f"{key}.pdf", "linkMode": "imported_file"}},
+                    {"key": f"NOT{key[-5:]}", "data": {
+                        "itemType": "note", "note": "<p>hi</p>"}},
+                ]
+
+        md = _format_children_grouped(ApiBackend(_Zot()), ["PAR00001", "PAR00002"], DummyContext())
+        keys = _keys_from_markdown(md)
+        for child in ("ATT00001", "NOT00001", "ATT00002", "NOT00002"):
+            assert child in keys, (child, md)
+
 
 class TestFetchProjected:
+    """_fetch_projected takes the read backend, so these wrap a fake client
+    in ApiBackend — which is also where the itemKey chunking moved to."""
+
     def test_result_order_follows_the_requested_order(self):
         """Rank order carries the answer for a search; the API returns
         whatever order it likes."""
         zot = MagicMock()
         zot.items.return_value = [_raw("BBBB2222"), _raw("AAAA1111")]
-        got = _fetch_projected(zot, ["AAAA1111", "BBBB2222"], "keys_only")
+        got = _fetch_projected(ApiBackend(zot), ["AAAA1111", "BBBB2222"], "keys_only")
         assert [i["key"] for i in got] == ["AAAA1111", "BBBB2222"]
 
     def test_keys_the_fetch_cannot_resolve_are_dropped_not_faked(self):
         zot = MagicMock()
         zot.items.return_value = [_raw("AAAA1111")]
-        got = _fetch_projected(zot, ["AAAA1111", "GONE0000"], "keys_only")
+        zot.item.side_effect = Exception("no such item")
+        got = _fetch_projected(ApiBackend(zot), ["AAAA1111", "GONE0000"], "keys_only")
         assert [i["key"] for i in got] == ["AAAA1111"]
 
     def test_no_keys_makes_no_request(self):
         zot = MagicMock()
-        assert _fetch_projected(zot, []) == []
+        assert _fetch_projected(ApiBackend(zot), []) == []
         zot.items.assert_not_called()
 
     def test_more_than_fifty_keys_are_chunked(self):
         """itemKey takes at most 50 per request."""
         keys = [f"K{i:07d}" for i in range(120)]
         zot = MagicMock()
-        zot.items.side_effect = lambda itemKey, limit: [
+        zot.items.side_effect = lambda itemKey, start=0, limit=100, **kw: [
             _raw(k) for k in itemKey.split(",")
         ]
-        got = _fetch_projected(zot, keys, "keys_only")
+        got = _fetch_projected(ApiBackend(zot), keys, "keys_only")
         assert len(got) == 120
         assert zot.items.call_count == 3
+
+    def test_local_api_children_do_not_crowd_out_the_parents(self):
+        """The local API answers an itemKey filter with the requested items
+        *plus* their children, and lists the children first. Sizing the request
+        to the number of keys asked for therefore truncated the response before
+        any parent appeared: `found` came back holding only child keys, and a
+        search markdown mode answers with eight items rendered as
+        `count: 0` (#499).
+
+        The fake honours `start`/`limit` so the pre-fix call -- one request
+        capped at len(keys) -- is expressible against it, and fails.
+        """
+        keys = ["AAAA1111", "BBBB2222"]
+        expanded = [
+            _raw("CHILD001", item_type="attachment"),
+            _raw("CHILD002", item_type="attachment"),
+            _raw("AAAA1111"),
+            _raw("CHILD003", item_type="note"),
+            _raw("BBBB2222"),
+        ]
+        zot = MagicMock()
+        zot.items.side_effect = (
+            lambda itemKey, start=0, limit=100: expanded[start:start + limit]
+        )
+        got = _fetch_projected(ApiBackend(zot), keys, "keys_only")
+        assert [i["key"] for i in got] == keys
+
+    def test_a_web_api_selection_still_costs_one_request(self):
+        """The web API filters itemKey correctly and returns at most one record
+        per key, so the first page comes back short of a full page and paging
+        stops there. Fixing the local API's behaviour must not buy a second
+        round trip for everyone else."""
+        keys = ["AAAA1111", "BBBB2222"]
+        zot = MagicMock()
+        zot.items.side_effect = lambda itemKey, start=0, limit=100: (
+            [_raw(k) for k in itemKey.split(",")] if start == 0 else []
+        )
+        got = _fetch_projected(ApiBackend(zot), keys, "keys_only")
+        assert [i["key"] for i in got] == keys
+        assert zot.items.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -204,9 +295,11 @@ class TestSearchCommand:
         search_mod = MagicMock()
         search_mod.search_items.return_value = "## 1. A Paper\n**Item Key:** ABCD1234\n"
         client = MagicMock()
-        client.get_zotero_client.return_value.items.return_value = [_raw("ABCD1234")]
+        backend = MagicMock()
+        backend.get_items.return_value = {"ABCD1234": _raw("ABCD1234")}
 
         with patch("zotero_mcp.cli_standalone.setup_zotero_environment"), \
+             patch("zotero_mcp.cli_standalone._read_backend", return_value=backend), \
              patch("zotero_mcp.cli_standalone._import_tools",
                    return_value=(search_mod, MagicMock(), MagicMock(), MagicMock(), client)):
             cmd_search(args)
@@ -242,6 +335,7 @@ class TestSearchCommand:
         search_mod.search_items.return_value = "No items found."
 
         with patch("zotero_mcp.cli_standalone.setup_zotero_environment"), \
+             patch("zotero_mcp.cli_standalone._read_backend", return_value=MagicMock()), \
              patch("zotero_mcp.cli_standalone._import_tools",
                    return_value=(search_mod, MagicMock(), MagicMock(), MagicMock(), MagicMock())):
             cmd_search(args)
@@ -249,6 +343,35 @@ class TestSearchCommand:
         payload = json.loads(capsys.readouterr().out)
         assert payload["ok"] is True
         assert payload["data"]["items"] == []
+
+
+    def _failed_search(self, message, json_out):
+        args = _args(mode="items", query="x", qmode="titleCreatorYear", limit=10,
+                     collection=None, detail="summary", json_out=json_out)
+        search_mod = MagicMock()
+        search_mod.search_items.return_value = message
+
+        with patch("zotero_mcp.cli_standalone.setup_zotero_environment"),              patch("zotero_mcp.cli_standalone._read_backend", return_value=MagicMock()),              patch("zotero_mcp.cli_standalone._import_tools",
+                   return_value=(search_mod, MagicMock(), MagicMock(), MagicMock(), MagicMock())):
+            with pytest.raises(SystemExit) as exc:
+                cmd_search(args)
+        return exc.value.code
+
+    def test_a_failed_search_is_an_error_not_an_empty_result(self, capsys):
+        code = self._failed_search("Error: this query could not be served", json_out=True)
+
+        assert code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "tool_error"
+
+    def test_a_failed_search_exits_nonzero_in_markdown_mode_too(self, capsys):
+        code = self._failed_search("Error: this query could not be served", json_out=False)
+
+        assert code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "could not be served" in captured.err
 
 
 class TestGetCommand:
@@ -295,6 +418,21 @@ class TestGetCommand:
         data = json.loads(capsys.readouterr().out)["data"]
         assert data["chars"] == 11
         assert data["text"] == "hello world"
+        assert data["truncated"] is False
+
+    def test_fulltext_reports_truncation_as_fields(self, capsys):
+        args = _args(subcommand="fulltext", item_key="ABCD1234")
+        retrieval = MagicMock()
+        retrieval.get_item_fulltext.return_value = (
+            "# Paper\n\n## Full Text (pages 1-10 of 22 — TRUNCATED)\n\ntext")
+
+        with patch("zotero_mcp.cli_standalone.setup_zotero_environment"), \
+             patch("zotero_mcp.cli_standalone._import_tools",
+                   return_value=(MagicMock(), retrieval, MagicMock(), MagicMock(), MagicMock())):
+            cmd_get(args)
+
+        data = json.loads(capsys.readouterr().out)["data"]
+        assert (data["truncated"], data["pages_read"], data["page_count"]) == (True, 10, 22)
 
     def test_unknown_subcommand_is_a_json_error(self, capsys):
         args = _args(subcommand="nonsense")
@@ -308,6 +446,60 @@ class TestGetCommand:
         payload = json.loads(capsys.readouterr().out)
         assert payload["ok"] is False
         assert payload["error"]["code"] == "unknown_subcommand"
+
+    def _collection_items(self, result, **kwargs):
+        args = _args(subcommand="collection-items", collection_key="GRPCOLL1",
+                     detail="summary", limit=50, offset=0, **kwargs)
+        retrieval = MagicMock()
+        retrieval.get_collection_items.return_value = result
+        with patch("zotero_mcp.cli_standalone.setup_zotero_environment"), \
+             patch("zotero_mcp.cli_standalone._read_backend", return_value=MagicMock()), \
+             patch("zotero_mcp.cli_standalone._import_tools",
+                   return_value=(MagicMock(), retrieval, MagicMock(), MagicMock(), MagicMock())):
+            cmd_get(args)
+
+    def test_unknown_collection_is_an_error_not_an_empty_collection(self, capsys):
+        """A key from another library used to come back as `ok: true` with
+        zero items, indistinguishable from an empty collection (#606)."""
+        with pytest.raises(SystemExit) as exc:
+            self._collection_items(
+                "Collection not found or not yet accessible: `GRPCOLL1`. "
+                "If you just created this collection, wait a moment and try again."
+            )
+
+        assert exc.value.code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "not_found"
+        assert "GRPCOLL1" in payload["error"]["message"]
+
+    def test_a_failed_collection_lookup_is_an_error(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            self._collection_items("Error fetching collection items: disk I/O error")
+
+        assert exc.value.code == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "tool_error"
+
+    def test_unknown_collection_fails_in_markdown_mode_too(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            self._collection_items(
+                "Collection not found or not yet accessible: `GRPCOLL1`.",
+                json_out=False,
+            )
+
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "GRPCOLL1" in captured.err
+
+    def test_an_empty_collection_is_still_a_success(self, capsys):
+        self._collection_items("No items found in collection: Inbox (Key: GRPCOLL1)")
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is True
+        assert payload["data"]["count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -333,3 +525,70 @@ class TestFlagPlacement:
         assert parser.parse_args(["-v", "search", "x"]).verbose is True
         assert parser.parse_args(["search", "-v", "x"]).verbose is True
         assert parser.parse_args(["search", "x"]).verbose is False
+
+
+# ---------------------------------------------------------------------------
+# Library scope
+# ---------------------------------------------------------------------------
+
+class TestLibraryScope:
+    """`get collections`, `get collection-items` and `get recent` read the
+    library ZOTERO_LIBRARY_ID/ZOTERO_LIBRARY_TYPE or an active switch names,
+    exactly as `collections search` does (#606)."""
+
+    COMMANDS = [
+        ["get", "collections"],
+        ["get", "collection-items", "GRPCOLL1"],
+        ["get", "recent"],
+        ["collections", "search", "Inbox"],
+    ]
+
+    @pytest.fixture
+    def opened(self, monkeypatch):
+        from zotero_mcp import client as _client
+
+        monkeypatch.setenv("ZOTERO_LOCAL", "true")
+        monkeypatch.setenv("ZOTERO_BACKEND", "api")
+        monkeypatch.delenv("ZOTERO_LIBRARY_ID", raising=False)
+        monkeypatch.delenv("ZOTERO_LIBRARY_TYPE", raising=False)
+        monkeypatch.setattr(_client, "_active_library_override", {})
+        opened = []
+
+        def fake_zotero(**kwargs):
+            opened.append((kwargs["library_id"], kwargs["library_type"]))
+            zot = MagicMock()
+            zot.collections.return_value = []
+            zot.items.return_value = []
+            zot.collection_items.return_value = []
+            zot.collection.return_value = {"key": "GRPCOLL1", "data": {"name": "Inbox"}}
+            return zot
+
+        monkeypatch.setattr(_client.zotero, "Zotero", fake_zotero)
+        return opened
+
+    def _run(self, argv):
+        from zotero_mcp.cli_standalone import _CMD_MAP
+
+        args = build_parser().parse_args(["--json", *argv])
+        with patch("zotero_mcp.cli_standalone.setup_zotero_environment"):
+            _CMD_MAP[args.command](args)
+
+    @pytest.mark.parametrize("argv", COMMANDS, ids=" ".join)
+    def test_env_vars_choose_the_library(self, opened, monkeypatch, argv):
+        monkeypatch.setenv("ZOTERO_LIBRARY_ID", "6626192")
+        monkeypatch.setenv("ZOTERO_LIBRARY_TYPE", "group")
+
+        self._run(argv)
+
+        assert opened and set(opened) == {("6626192", "group")}
+
+    @pytest.mark.parametrize("argv", COMMANDS, ids=" ".join)
+    def test_an_active_switch_wins_over_env_vars(self, opened, monkeypatch, argv):
+        from zotero_mcp import client as _client
+
+        monkeypatch.setenv("ZOTERO_LIBRARY_ID", "0")
+        _client.set_active_library("6626192", "group")
+
+        self._run(argv)
+
+        assert opened and set(opened) == {("6626192", "group")}

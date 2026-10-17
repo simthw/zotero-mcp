@@ -9,6 +9,7 @@ Covers:
 
 import importlib.util
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -119,8 +120,8 @@ class TestCombineStructuredAndFulltext:
 # ---------------------------------------------------------------------------
 
 class TestGeminiQueryEmbedding:
-    def test_gemini_embed_query_uses_retrieval_query(self):
-        """Verify GeminiEmbeddingFunction.embed_query passes retrieval_query task type."""
+    def test_gemini_embed_query_text_uses_retrieval_query(self):
+        """Verify GeminiEmbeddingFunction.embed_query_text passes retrieval_query task type."""
         from zotero_mcp.chroma_client import GeminiEmbeddingFunction
 
         mock_client = MagicMock()
@@ -137,7 +138,7 @@ class TestGeminiQueryEmbedding:
         ef.client = mock_client
         ef.types = mock_types
 
-        result = ef.embed_query("test query")
+        result = ef.embed_query_text("test query")
 
         # Verify embed_content was called
         mock_client.models.embed_content.assert_called_once()
@@ -201,6 +202,10 @@ class TestGeminiV2Support:
         ef.client = mock_client
         ef.types = mock_types
         ef.max_input_tokens = 8000 - GeminiEmbeddingFunction.V2_PREFIX_TOKEN_BUDGET
+        # Content/Part with the SDK's attribute shape, so a test can read back
+        # what each request carried without google-genai installed.
+        mock_types.Content.side_effect = lambda parts: SimpleNamespace(parts=parts)
+        mock_types.Part.side_effect = lambda text: SimpleNamespace(text=text)
         return ef
 
     def test_v2_call_prepends_doc_prefix_no_config(self):
@@ -223,13 +228,13 @@ class TestGeminiV2Support:
         call_kwargs = mock_client.models.embed_content.call_args.kwargs
         # v2 uses no EmbedContentConfig — task instruction goes in the prompt
         assert "config" not in call_kwargs
-        assert call_kwargs["contents"] == [
+        assert [c.parts[0].text for c in call_kwargs["contents"]] == [
             f"{GeminiEmbeddingFunction.V2_DOC_PREFIX}doc text"
         ]
         mock_types.EmbedContentConfig.assert_not_called()
 
-    def test_v2_embed_query_prepends_query_prefix_no_config(self):
-        """v2 embed_query must prepend V2_QUERY_PREFIX and pass no EmbedContentConfig."""
+    def test_v2_embed_query_text_prepends_query_prefix_no_config(self):
+        """v2 embed_query_text must prepend V2_QUERY_PREFIX and pass no EmbedContentConfig."""
         from zotero_mcp.chroma_client import GeminiEmbeddingFunction
 
         mock_client = MagicMock()
@@ -242,19 +247,19 @@ class TestGeminiV2Support:
         mock_types = MagicMock()
         ef = self._v2_ef(mock_client, mock_types)
 
-        result = ef.embed_query("query text")
+        result = ef.embed_query_text("query text")
 
         mock_client.models.embed_content.assert_called_once()
         call_kwargs = mock_client.models.embed_content.call_args.kwargs
         assert "config" not in call_kwargs
-        assert call_kwargs["contents"] == [
+        assert [c.parts[0].text for c in call_kwargs["contents"]] == [
             f"{GeminiEmbeddingFunction.V2_QUERY_PREFIX}query text"
         ]
         mock_types.EmbedContentConfig.assert_not_called()
         assert result == [0.4, 0.5, 0.6]
 
     def test_v2_truncates_long_query_before_prefix(self):
-        """embed_query must truncate text before prepending the prefix.
+        """embed_query_text must truncate text before prepending the prefix.
 
         Otherwise pathological queries crash the API and the
         V2_PREFIX_TOKEN_BUDGET reservation in __init__ is meaningless.
@@ -274,9 +279,9 @@ class TestGeminiV2Support:
         # Build a query well past the 7980-token budget. truncate() uses
         # 4 chars/token estimation, so 7980 tokens ≈ 31_920 chars.
         long_query = "a" * 50_000
-        ef.embed_query(long_query)
+        ef.embed_query_text(long_query)
 
-        sent = mock_client.models.embed_content.call_args.kwargs["contents"][0]
+        sent = mock_client.models.embed_content.call_args.kwargs["contents"][0].parts[0].text
         # Must start with the v2 query prefix
         assert sent.startswith(GeminiEmbeddingFunction.V2_QUERY_PREFIX)
         # Body after the prefix must be truncated (not the full 50_000 chars)
@@ -295,7 +300,7 @@ class TestGeminiV2Support:
         def fake_embed_content(model, contents, **kwargs):
             response = MagicMock()
             response.embeddings = [
-                MagicMock(values=[float(ord(c[len(GeminiEmbeddingFunction.V2_DOC_PREFIX)]))])
+                MagicMock(values=[float(ord(c.parts[0].text[len(GeminiEmbeddingFunction.V2_DOC_PREFIX)]))])
                 for c in contents
             ]
             return response
@@ -313,6 +318,21 @@ class TestGeminiV2Support:
         # Verify order: each output vector encodes the first char of its input
         for i, vec in enumerate(result):
             assert vec[0] == float(ord(inputs[i][0]))
+
+    def test_v2_sends_one_content_per_text(self):
+        """google-genai >= 1.72 folds a list of plain strings into one Content
+        for gemini-embedding-2, and the model answers it with one aggregated
+        vector (#697). Each text has to go out as its own Content."""
+        def folding_embed_content(model, contents, **kwargs):
+            if all(isinstance(c, str) for c in contents):
+                contents = [" ".join(contents)]
+            return MagicMock(embeddings=[MagicMock(values=[0.0]) for _ in contents])
+
+        mock_client = MagicMock()
+        mock_client.models.embed_content.side_effect = folding_embed_content
+        ef = self._v2_ef(mock_client, MagicMock())
+
+        assert len(ef(["a", "b", "c"])) == 3
 
     def test_v2_init_logic_max_input_tokens(self):
         """v2 instances reserve V2_PREFIX_TOKEN_BUDGET from max_input_tokens.
@@ -352,9 +372,10 @@ class TestSearchUsesEmbedQuery:
             "metadatas": [[{}]],
         }
 
-        # Must be an instance of one of our custom classes for embed_query path
+        # Must be an instance of one of our custom classes for the
+        # embed_query_text path
         mock_ef = MagicMock(spec=HuggingFaceEmbeddingFunction)
-        mock_ef.embed_query.return_value = [0.1, 0.2, 0.3]
+        mock_ef.embed_query_text.return_value = [0.1, 0.2, 0.3]
 
         client = ChromaClient.__new__(ChromaClient)
         client.collection = mock_collection
@@ -362,14 +383,14 @@ class TestSearchUsesEmbedQuery:
 
         client.search(query_texts=["hello"])
 
-        # Should have called embed_query, not passed query_texts
-        mock_ef.embed_query.assert_called_once_with("hello")
+        # Should have called embed_query_text, not passed query_texts
+        mock_ef.embed_query_text.assert_called_once_with("hello")
         call_kwargs = mock_collection.query.call_args.kwargs
         assert "query_embeddings" in call_kwargs
         assert "query_texts" not in call_kwargs
 
     def test_search_falls_back_to_query_texts(self):
-        """ChromaClient.search should use query_texts when embed_query is absent."""
+        """ChromaClient.search should use query_texts for a non-custom EF."""
         from zotero_mcp.chroma_client import ChromaClient
 
         mock_collection = MagicMock()
@@ -380,7 +401,7 @@ class TestSearchUsesEmbedQuery:
             "metadatas": [[{}]],
         }
 
-        # Embedding function WITHOUT embed_query
+        # Embedding function that is not one of our custom classes
         mock_ef = MagicMock(spec=[])  # empty spec = no attributes
 
         client = ChromaClient.__new__(ChromaClient)
@@ -395,9 +416,11 @@ class TestSearchUsesEmbedQuery:
 
 
 class TestDefaultEFUsesQueryTexts:
-    """Verify that DefaultEmbeddingFunction (or any non-custom EF) uses query_texts,
-    not embed_query.  This confirms the _is_custom_ef guard prevents calling the
-    broken embed_query on ChromaDB's built-in DefaultEmbeddingFunction."""
+    """Verify that DefaultEmbeddingFunction (or any non-custom EF) uses
+    query_texts and is never asked to embed a query itself. This confirms the
+    _is_custom_ef guard: only our classes have embed_query_text, and calling
+    ChromaDB's own batch embed_query with a single string would return one
+    vector per character."""
 
     def test_default_ef_uses_query_texts_not_embed_query(self):
         from zotero_mcp.chroma_client import ChromaClient
@@ -411,9 +434,10 @@ class TestDefaultEFUsesQueryTexts:
         }
 
         # A plain MagicMock is NOT an instance of any custom embedding class,
-        # mimicking DefaultEmbeddingFunction which also has an embed_query attr.
+        # mimicking DefaultEmbeddingFunction, which answers to both names.
         mock_ef = MagicMock()
-        mock_ef.embed_query = MagicMock(return_value=[0.1, 0.2, 0.3])
+        mock_ef.embed_query = MagicMock(return_value=[[0.1, 0.2, 0.3]])
+        mock_ef.embed_query_text = MagicMock(return_value=[0.1, 0.2, 0.3])
 
         client = ChromaClient.__new__(ChromaClient)
         client.collection = mock_collection
@@ -421,7 +445,9 @@ class TestDefaultEFUsesQueryTexts:
 
         client.search(query_texts=["hello"])
 
-        # embed_query must NOT have been called — default EF path uses query_texts
+        # Neither may be called — the default EF path passes query_texts and
+        # lets ChromaDB embed them.
+        mock_ef.embed_query_text.assert_not_called()
         mock_ef.embed_query.assert_not_called()
 
         call_kwargs = mock_collection.query.call_args.kwargs

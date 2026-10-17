@@ -1,6 +1,8 @@
 import sqlite3
 from pathlib import Path
 
+from conftest import extracted_doc
+
 from zotero_mcp.extract import DEFAULT_ATTACHMENT_PRIORITY
 from zotero_mcp.local_db import PERSONAL_LIBRARY_GROUP_ID, LocalZoteroReader, ZoteroItem
 
@@ -25,9 +27,9 @@ class FakeLocalZoteroReader(LocalZoteroReader):
         """Return the injected fake path."""
         return self._fake_pdf_path
 
-    def _extract_text_from_file(self, file_path):
-        """Return the injected fake text instead of reading a real file."""
-        return self._fake_text
+    def _extract_doc_from_file(self, file_path):
+        """Return the injected fake document instead of reading a real file."""
+        return extracted_doc(self._fake_text)
 
 
 def test_extract_fulltext_preserves_long_text(tmp_path):
@@ -236,6 +238,14 @@ def _create_feed_db(db_path: Path) -> None:
             creatorID INTEGER PRIMARY KEY,
             firstName TEXT,
             lastName TEXT
+        );
+        -- Real Zotero schema table. get_feed_items resolves its title through
+        -- baseFieldMappingsCombined now (#570), so the fixture needs it even
+        -- though no feed item type remaps a title. Empty is the correct
+        -- "nothing remapped here", not a stub.
+        CREATE TABLE baseFieldMappingsCombined (
+            itemTypeID INT, baseFieldID INT, fieldID INT,
+            PRIMARY KEY (itemTypeID, baseFieldID, fieldID)
         );
         """
     )

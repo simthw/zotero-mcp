@@ -8,17 +8,21 @@ dynamic = ["version"]
 authors = [
   { name = "54yyyu", email = "54yyyu@github.com" },
 ]
-description = "A Model Context Protocol server for Zotero"
-keywords = ["zotero", "mcp", "model-context-protocol", "cli", "research", "citations", "bibliography"]
-license = {text = "MIT"}
+description = "Zotero MCP server and CLI: chat with your Zotero research library in Claude, ChatGPT, Cursor, Codex and other AI agents"
+keywords = ["zotero", "mcp", "model-context-protocol", "cli", "research", "citations", "bibliography", "mcp-server", "claude", "chatgpt", "ai-agent", "semantic-search", "pdf", "zotero-plugin"]
+license = "MIT AND AGPL-3.0-or-later"
+license-files = ["LICENSE", "plugin/LICENSE"]
 readme = "README.md"
 requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 dependencies = [
+    # 1.14.0 for local API write support: authorize_local(), the
+    # server_id/local_api_key constructor args, and the Zotero._write()
+    # dispatcher that attaches the headers a local write requires.
+    #
     # 1.13.5 retries a rate-limited read internally and raises
     # TooManyRetriesError once the backoff is exhausted (upstream
     # urschrei/pyzotero#352). Below it, every read method hands the HTTP 429
@@ -28,7 +32,7 @@ dependencies = [
     # load-bearing, not just preferred. (1.13.3 is also required, for sending
     # Path(filename).name as the stored-file filename — upstream #341, without
     # which every attach pays for the two-step fallback in _attach_and_verify.)
-    "pyzotero>=1.13.5",
+    "pyzotero>=1.14.0",
     "python-dotenv>=1.0.0",
     # PDF text extraction. Rust with prebuilt abi3 wheels for every platform
     # we support and no Python dependencies of its own. Pinned exactly while
@@ -36,17 +40,27 @@ dependencies = [
     "pdf-inspector==0.2.6",
     # HTML snapshots only.
     "markdownify>=1.2",
+    # Markdown note text to Zotero note HTML (note_html.py). Already installed
+    # with fastmcp (through rich); declared because we import it.
+    "markdown-it-py>=2.2",
     "pydantic>=2.0.0",
     "requests>=2.28.0",
     # <4 until the FastMCP 4 migration: FastMCP 4 targets the stateless
     # 2026-07-28 MCP revision, drops ctx.sample/list_roots/elicit, and swaps
     # httpx for httpx2. It is still a beta (4.0.0b1) as of this pin.
-    "fastmcp>=2.14.0,<4",
-    # client.py imports httpx directly rather than relying on it arriving
-    # transitively through fastmcp (which replaces it with httpx2 in v4).
+    "fastmcp>=2.14.0,<5",
+    # The client we hand the local Zotero API is built from whichever HTTP
+    # library the installed pyzotero is built against — httpx2 on >=1.15,
+    # httpx below it — because pyzotero only recognises errors from its own
+    # (#512). client.py still imports httpx directly, as the fallback for a
+    # pyzotero whose HTTP library can't be identified, and so that the
+    # dependency is declared rather than arriving transitively through
+    # fastmcp (which itself replaces it with httpx2 in v4).
     "httpx>=0.27",
     "unidecode>=1.3.0",
     "bibtexparser>=1.4,<2",
+    # updater.py reads the uv tool receipt (TOML); tomllib is stdlib from 3.11.
+    "tomli>=2.0.1; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -95,6 +109,16 @@ zotero-mcp-server = "zotero_mcp.cli:main"
 
 [tool.hatch.version]
 path = "src/zotero_mcp/_version.py"
+
+# The Zotero Agent plugin is built from plugin/ at release time and not committed, so
+# it is gitignored; artifacts overrides that. At the top level so the sdist carries it
+# too, since `python -m build` makes the wheel from the sdist.
+[tool.hatch.build]
+artifacts = ["src/zotero_mcp/chat_plugin/zotero-agent.xpi"]
+
+# hatchling reads only the top-level .gitignore, so the ignores in plugin/ (and plugin/preview/) are repeated here.
+[tool.hatch.build.targets.sdist]
+exclude = ["plugin/node_modules", "plugin/dist", "plugin/.dev*", "plugin/preview/shots", "plugin/**/*.xpi"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zotero_mcp"]

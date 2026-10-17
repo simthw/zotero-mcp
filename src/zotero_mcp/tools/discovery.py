@@ -5,11 +5,11 @@ from typing import Literal
 
 import requests
 
-from zotero_mcp import client as _client
+from zotero_mcp import library as _library
 from zotero_mcp import utils as _utils  # noqa: F401  (kept for module-level conventions)
 from zotero_mcp._app import mcp
 from zotero_mcp._context import Context
-from zotero_mcp.client import with_zotero_api_lock
+from zotero_mcp.client import with_zotero_api_lock, zotero_api_lock
 from zotero_mcp.tools import _helpers
 
 _OPENALEX_BASE = "https://api.openalex.org"
@@ -18,24 +18,26 @@ _ITEM_KEY_RE = re.compile(r"^[A-Z0-9]{8}$")
 _HTTP_TIMEOUT = 30
 
 
-def _doi_in_library(zot, doi: str) -> bool:
+def _doi_in_library(backend, doi: str) -> bool:
     """Best-effort membership check: is a paper with this DOI already in Zotero?
 
-    Tolerates any pyzotero error by returning False (treat as "not in library").
+    Tolerates any backend error by returning False (treat as "not in library").
     """
     if not doi:
         return False
     try:
-        zot.add_parameters(q=doi, qmode="everything", itemType="-attachment", limit=5)
-        results = zot.items()
+        results = backend.search_items(doi, qmode="everything", limit=5)
     except Exception:
         try:
-            results = zot.items(q=doi, qmode="everything", itemType="-attachment", limit=5)
+            results = backend.search_items(doi, qmode="everything", limit=5)
         except Exception:
             return False
     norm = doi.strip().lower()
     for item in results or []:
-        item_doi = str(item.get("data", {}).get("DOI", "")).strip().lower()
+        raw_doi = str(item.get("data", {}).get("DOI", ""))
+        # Zotero often stores the DOI as a doi.org URL (that is what the connector
+        # writes), while the OpenAlex side is already bare, so normalise both.
+        item_doi = (_helpers._normalize_doi(raw_doi) or raw_doi).strip().lower()
         if item_doi and item_doi == norm:
             return True
     return False
@@ -90,14 +92,14 @@ def _openalex_get(url: str, params: dict | None = None) -> dict | None:
         return None
 
 
-def _resolve_doi(identifier: str, zot) -> str | None:
+def _resolve_doi(identifier: str, backend) -> str | None:
     """Resolve an identifier (Zotero item key or DOI/URL) to a normalized DOI."""
     ident = (identifier or "").strip()
     if not ident:
         return None
     if _ITEM_KEY_RE.match(ident):
         try:
-            item = zot.item(ident)
+            item = backend.get_item(ident)
         except Exception:
             return None
         raw_doi = (item or {}).get("data", {}).get("DOI")
@@ -148,7 +150,6 @@ def _render_related(papers: list[dict], heading: str) -> list[str]:
         "direction='citations', limit=10)."
     ),
 )
-@with_zotero_api_lock
 def find_related_papers(
     identifier: str,
     direction: Literal["references", "citations", "both"] = "both",
@@ -156,16 +157,21 @@ def find_related_papers(
     *,
     ctx: Context,
 ) -> str:
-    """Find references and/or citing works for a paper via OpenAlex."""
+    """Find references and/or citing works for a paper via OpenAlex.
+
+    The Zotero API lock is held only while reading from the Zotero backend,
+    never across an OpenAlex request (#431): each of those can take seconds,
+    and every other tool would wait behind it.
+    """
     try:
         if direction not in {"references", "citations", "both"}:
             return "Error: direction must be 'references', 'citations', or 'both'."
 
         limit = _helpers._normalize_limit(limit, default=20, max_val=50)
-        zot = _client.get_zotero_client()
-
         ctx.info(f"Resolving identifier to DOI: {identifier}")
-        doi = _resolve_doi(identifier, zot)
+        with zotero_api_lock():
+            backend = _library.get_library_backend()
+            doi = _resolve_doi(identifier, backend)
         if not doi:
             return (
                 f"Could not resolve a DOI for '{identifier}'. Provide a valid "
@@ -183,35 +189,52 @@ def find_related_papers(
 
         references: list[dict] = []
         citations: list[dict] = []
+        # A failed lookup must not read as "none found" (#458).
+        refs_incomplete = cites_failed = False
 
         if want_refs:
             ref_ids = [_short_id(r) for r in (work.get("referenced_works") or [])]
-            ref_ids = [r for r in ref_ids if r][:limit]
-            if ref_ids:
-                filter_val = "openalex_id:" + "|".join(ref_ids)
+            ref_ids = [r for r in ref_ids if r]
+            # A referenced work can be missing from OpenAlex; keep taking the
+            # next ones until `limit` resolve, in referenced_works order.
+            start = 0
+            while start < len(ref_ids) and len(references) < limit:
+                chunk = ref_ids[start:start + limit]
+                start += len(chunk)
                 data = _openalex_get(
                     f"{_OPENALEX_BASE}/works",
-                    {"filter": filter_val, "per-page": min(len(ref_ids), 50)},
+                    {"filter": "openalex_id:" + "|".join(chunk), "per-page": len(chunk)},
                 )
-                results = (data or {}).get("results", []) or []
-                # Preserve referenced_works order.
-                by_id = {_short_id(w.get("id")): w for w in results}
-                for rid in ref_ids:
-                    if rid in by_id:
-                        references.append(_work_summary(by_id[rid]))
+                if data is None:
+                    refs_incomplete = True
+                    break
+                by_id = {_short_id(w.get("id")): w for w in data.get("results") or []}
+                references.extend(_work_summary(by_id[rid]) for rid in chunk if rid in by_id)
+            references = references[:limit]
 
         if want_cites:
             cited_by_url = work.get("cited_by_api_url")
-            if cited_by_url:
-                data = _openalex_get(cited_by_url, {"per-page": min(limit, 50)})
-                results = (data or {}).get("results", []) or []
-                citations = [_work_summary(w) for w in results]
+            # Sort server-side: sorting one unsorted page misses the most-cited works.
+            cite_params: dict = {"per-page": min(limit, 50), "sort": "cited_by_count:desc"}
+            if not cited_by_url:
+                # OpenAlex no longer returns `cited_by_api_url` on work records, so the
+                # citing works have to be queried through the `cites:` filter instead.
+                work_id = _short_id(work.get("id"))
+                if work_id:
+                    cited_by_url = f"{_OPENALEX_BASE}/works"
+                    cite_params["filter"] = f"cites:{work_id}"
+            data = _openalex_get(cited_by_url, cite_params) if cited_by_url else None
+            if data is None:
+                cites_failed = True
+            else:
+                citations = [_work_summary(w) for w in data.get("results") or []]
                 citations.sort(key=lambda p: p["cited_by"], reverse=True)
                 citations = citations[:limit]
 
         # Flag library membership for every related paper.
-        for p in references + citations:
-            p["in_library"] = _doi_in_library(zot, p["doi"]) if p["doi"] else False
+        with zotero_api_lock():
+            for p in references + citations:
+                p["in_library"] = _doi_in_library(backend, p["doi"]) if p["doi"] else False
 
         src_title = work.get("title") or work.get("display_name") or doi
         output = [
@@ -221,9 +244,11 @@ def find_related_papers(
         ]
         summary_bits = []
         if want_refs:
-            summary_bits.append(f"{len(references)} references")
+            summary_bits.append(f"{len(references)} references" + (
+                " (INCOMPLETE: an OpenAlex lookup failed)" if refs_incomplete else ""))
         if want_cites:
-            summary_bits.append(f"{len(citations)} citations")
+            summary_bits.append("citations lookup FAILED (this is not a zero)"
+                                if cites_failed else f"{len(citations)} citations")
         in_lib = sum(1 for p in references + citations if p.get("in_library"))
         summary_bits.append(f"{in_lib} already in library")
         output.append("Found " + ", ".join(summary_bits) + ".")
@@ -241,11 +266,14 @@ def find_related_papers(
         return f"Error finding related papers: {e}"
 
 
-def _item_has_pdf(zot, item: dict) -> bool:
+def _item_has_pdf(children_by_key: dict[str, list[dict]], item: dict) -> bool:
     """Return True if the item is/has a PDF attachment.
 
-    A standalone PDF attachment counts directly; otherwise we inspect the
-    item's children for any PDF attachment. Tolerant of children() errors.
+    A standalone PDF attachment counts directly; otherwise the item's
+    children are inspected. Children arrive pre-fetched for the whole scan,
+    so this makes no request of its own. A key whose lookup failed is absent
+    from the mapping and reads as "no PDF", matching the previous
+    error-tolerant behaviour.
     """
     data = item.get("data", {})
     if data.get("itemType") == "attachment" and data.get("contentType") == "application/pdf":
@@ -253,11 +281,7 @@ def _item_has_pdf(zot, item: dict) -> bool:
     key = item.get("key") or data.get("key")
     if not key:
         return False
-    try:
-        children = _helpers._paginate(zot.children, key)
-    except Exception:
-        return False
-    for child in children or []:
+    for child in children_by_key.get(key) or []:
         cdata = child.get("data", {})
         if cdata.get("itemType") == "attachment" and cdata.get("contentType") == "application/pdf":
             return True
@@ -294,24 +318,27 @@ def library_coverage(
     """Report PDF-attachment coverage across the library or a collection."""
     try:
         limit = _helpers._normalize_limit(limit, default=200, max_val=2000)
-        zot = _client.get_zotero_client()
+        backend = _library.get_library_backend()
 
         skip_types = {"attachment", "note", "annotation"}
 
         ctx.info("Scanning library for PDF coverage...")
         if collection_key:
-            items = _helpers._paginate(
-                zot.collection_items,
-                collection_key,
-                max_items=limit,
-                itemType="-attachment",
-            )
+            items = [
+                item for item in (backend.collection_items(collection_key) or [])
+                if item.get("data", {}).get("itemType") != "attachment"
+            ][:limit]
         else:
-            items = _helpers._paginate(
-                zot.items,
-                max_items=limit,
-                itemType="-attachment",
-            )
+            items = backend.list_items("-attachment", limit=limit)
+
+        # One children lookup for the whole scan. This used to be a call per
+        # item inside the loop below — up to 2000 round trips for a single
+        # coverage report.
+        scan_keys = [
+            key for item in (items or [])
+            if (key := item.get("key") or item.get("data", {}).get("key"))
+        ]
+        children_by_key = backend.get_children(scan_keys) if scan_keys else {}
 
         scanned = 0
         with_pdf = 0
@@ -327,7 +354,7 @@ def library_coverage(
                 continue
 
             scanned += 1
-            if _item_has_pdf(zot, item):
+            if _item_has_pdf(children_by_key, item):
                 with_pdf += 1
             else:
                 title = data.get("title") or data.get("filename") or "Untitled"

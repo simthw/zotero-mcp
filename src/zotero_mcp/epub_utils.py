@@ -669,7 +669,6 @@ def parse_epub_for_cfi(epub_path: str) -> tuple[Any, list[dict]]:
 
     # Build manifest map
     manifest = {}
-    ns_opf = {'opf': 'http://www.idpf.org/2007/opf'}
 
     for item in opf_root.findall('.//{*}item'):
         item_id = item.get('id')
@@ -721,7 +720,6 @@ def generate_cfi_python(
 
     try:
         # Track cumulative character count for pseudo-page calculation
-        cumulative_chars = 0
         spine_char_counts: list[int] = []
 
         # First pass: count characters in each spine item
@@ -856,14 +854,21 @@ def build_epub_annotation_position(cfi: str) -> str:
 
 def verify_epub_attachment(file_path: str) -> bool:
     """
-    Verify that a file is a valid EPUB.
+    Whether a file is an EPUB: a zip with an OCF container and, if present,
+    the EPUB mimetype entry.
+
+    A structural check only. Parsing the whole book here, as this used to,
+    repeated the parse that searching it does anyway.
     """
+    import zipfile
+
     try:
-        import ebooklib
-        from ebooklib import epub
-        book = epub.read_epub(file_path)
-        return book is not None and len(list(book.spine)) > 0
-    except Exception:
+        with zipfile.ZipFile(file_path) as archive:
+            names = set(archive.namelist())
+            if "META-INF/container.xml" not in names:
+                return False
+            return "mimetype" not in names or archive.read("mimetype").strip() == b"application/epub+zip"
+    except (OSError, zipfile.BadZipFile):
         return False
 
 

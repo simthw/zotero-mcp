@@ -4,6 +4,8 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 from zotero_mcp import server
+from zotero_mcp import utils as _utils
+from zotero_mcp.tools import _helpers
 from zotero_mcp.utils import clean_html
 from conftest import DummyContext, FakeZotero
 
@@ -120,6 +122,40 @@ class TestNormalizeArxivId:
     def test_old_format(self):
         assert server._normalize_arxiv_id("hep-ph/9901234") == "hep-ph/9901234"
 
+    def test_old_format_dotted_archive(self):
+        """Archive names carrying a period are the legacy norm, not an edge.
+
+        math.*, cs.*, q-bio.* and friends spell their subcategory after a dot
+        (arXiv's own taxonomy keys), so ``math.GT/0309136`` is as valid as
+        ``hep-ph/9901234``. A dotted name that fails to normalize is not
+        merely rejected here: it also drops the item out of arXiv dedup
+        (``_arxiv_identity``), so re-adding it duplicates the library entry.
+        """
+        assert server._normalize_arxiv_id("math.GT/0309136") == "math.GT/0309136"
+        assert server._normalize_arxiv_id("cs.LG/0105021") == "cs.LG/0105021"
+        assert server._normalize_arxiv_id("q-bio.BM/0301001") == "q-bio.BM/0301001"
+
+    def test_old_format_dotted_archive_with_dash_subcategory(self):
+        # cond-mat's own subcategories combine both separators.
+        assert server._normalize_arxiv_id("cond-mat.mtrl-sci/9901001") == (
+            "cond-mat.mtrl-sci/9901001"
+        )
+
+    def test_old_format_dotted_versioned(self):
+        assert server._normalize_arxiv_id("math.GT/0309136v1") == "math.GT/0309136v1"
+
+    def test_arxiv_prefix_on_dotted_id(self):
+        assert server._normalize_arxiv_id("arXiv:math.GT/0309136") == "math.GT/0309136"
+
+    def test_abs_url_dotted_id(self):
+        assert server._normalize_arxiv_id("https://arxiv.org/abs/math.GT/0309136") == (
+            "math.GT/0309136"
+        )
+
+    def test_legacy_archive_name_cannot_start_a_match_without_slash(self):
+        assert server._normalize_arxiv_id("math.GT.0309136") is None
+        assert server._normalize_arxiv_id("math.GT/03091") is None
+
     def test_arxiv_prefix(self):
         assert server._normalize_arxiv_id("arXiv:2401.00001") == "2401.00001"
 
@@ -133,6 +169,130 @@ class TestNormalizeArxivId:
         assert server._normalize_arxiv_id("not-an-id") is None
         assert server._normalize_arxiv_id("") is None
         assert server._normalize_arxiv_id(None) is None
+
+
+# ---------------------------------------------------------------------------
+# _arxiv_identity
+# ---------------------------------------------------------------------------
+
+class TestArxivIdentity:
+    """The version-independent identity used for deduplication.
+
+    Distinct from _normalize_arxiv_id, which keeps the version because its
+    callers use the result to fetch a specific version from arXiv.
+    """
+
+    def test_strips_the_version(self):
+        assert _helpers._arxiv_identity("2401.00001v2") == "2401.00001"
+        assert _helpers._arxiv_identity("https://arxiv.org/abs/2401.00001v11") == "2401.00001"
+        assert _helpers._arxiv_identity("hep-ph/9901234v2") == "hep-ph/9901234"
+
+    def test_accepts_the_datacite_doi(self):
+        assert _helpers._arxiv_identity("10.48550/arXiv.2401.00001") == "2401.00001"
+        assert _helpers._arxiv_identity(
+            "https://doi.org/10.48550/arXiv.2401.00001v3"
+        ) == "2401.00001"
+
+    def test_every_spelling_of_one_paper_agrees(self):
+        spellings = [
+            "2401.00001",
+            "2401.00001v1",
+            "arXiv:2401.00001",
+            "http://arxiv.org/abs/2401.00001",
+            "https://arxiv.org/abs/2401.00001v2",
+            "https://arxiv.org/pdf/2401.00001v3.pdf",
+            "10.48550/arXiv.2401.00001",
+        ]
+        assert {_helpers._arxiv_identity(s) for s in spellings} == {"2401.00001"}
+
+    def test_distinct_papers_stay_distinct(self):
+        assert _helpers._arxiv_identity("2401.00001") != _helpers._arxiv_identity("2401.00002")
+
+    def test_non_arxiv_returns_none(self):
+        assert _helpers._arxiv_identity("10.1038/nature12373") is None
+        assert _helpers._arxiv_identity("https://example.com/foo") is None
+        assert _helpers._arxiv_identity("not-an-id") is None
+        assert _helpers._arxiv_identity("") is None
+        assert _helpers._arxiv_identity(None) is None
+
+
+# ---------------------------------------------------------------------------
+# _title_search_query
+# ---------------------------------------------------------------------------
+
+class TestTitleSearchQuery:
+    """Normalization of a fetched title into a quick-search query.
+
+    Zotero's quick search ANDs whitespace-separated tokens, so anything the
+    source added that the stored title lacks — JATS tags, XML entities — is
+    a token that matches nothing and zeroes the whole lookup.
+    """
+
+    def test_strips_jats_markup(self):
+        assert _helpers._title_search_query(
+            "Growth of <i>Escherichia coli</i> at <sub>4</sub>C"
+        ) == "Growth of Escherichia coli at 4 C"
+
+    def test_markup_inside_a_word_splits_it(self):
+        """Every token must occur in the stored title, marked up or not.
+
+        Measured on the Web API: an item stored as 'DREAM<sub>(D)</sub>: …'
+        was not found by 'DREAM(D): …', because deleting the tags glues a
+        token the stored spelling does not contain. A space keeps each piece
+        a substring of both spellings.
+        """
+        query = _helpers._title_search_query("DREAM<sub>(D)</sub>: adaptive MCMC")
+        for stored in ("DREAM<sub>(D)</sub>: adaptive MCMC", "DREAM(D): adaptive MCMC"):
+            assert all(t.lower() in stored.lower() for t in query.split()), (
+                stored, query)
+
+    def test_resolves_xml_entities(self):
+        assert _helpers._title_search_query("Ethics &amp; Society") == "Ethics & Society"
+        assert _helpers._title_search_query("A &lt; B") == "A < B"
+
+    def test_escaped_tags_survive_as_literal_text(self):
+        """'&lt;i&gt;' is text in a title, not markup — stripping order matters."""
+        assert _helpers._title_search_query("The &lt;i&gt; Element") == "The <i> Element"
+
+    def test_strips_the_markup_the_crossref_mapping_keeps(self):
+        """The DOI path's title has been through the CrossRef repairs already.
+
+        strip_unsupported_markup keeps the markup Zotero renders, and spells
+        small caps as a styled span, so those tags still reach the query.
+        """
+        mapped = _utils.repair_crossref_string(_utils.strip_unsupported_markup(
+            "<scp>DNA</scp> repair in <i>E. coli</i> &amp; CO<sub>2</sub>"
+        ))
+        assert "<i>" in mapped and "<span" in mapped
+        assert _helpers._title_search_query(mapped) == "DNA repair in E. coli & CO 2"
+
+    def test_a_decoded_angle_bracket_is_not_a_tag(self):
+        """By the time the DOI path's title gets here, '&lt;' is already '<'.
+
+        A '<' not followed by a letter is text, so the words between it and
+        a later '>' stay in the query rather than being read as one tag.
+        """
+        mapped = _utils.repair_crossref_string(
+            "Effects of &lt;10 Hz stimulation on theta &gt; baseline"
+        )
+        assert _helpers._title_search_query(mapped) == (
+            "Effects of <10 Hz stimulation on theta > baseline"
+        )
+
+    def test_collapses_arxiv_wrap_whitespace(self):
+        assert _helpers._title_search_query(
+            "Chain-of-Thought Prompting Elicits Reasoning   in Large Language Models"
+        ) == "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models"
+        assert _helpers._title_search_query("  padded  title \n here ") == "padded title here"
+
+    def test_a_clean_title_is_returned_unchanged(self):
+        assert _helpers._title_search_query("RL's Razor") == "RL's Razor"
+
+    def test_nothing_usable_returns_none(self):
+        assert _helpers._title_search_query("") is None
+        assert _helpers._title_search_query(None) is None
+        assert _helpers._title_search_query("   ") is None
+        assert _helpers._title_search_query("<i></i>") is None
 
 
 # ---------------------------------------------------------------------------
@@ -349,3 +509,105 @@ class TestStripUnwritableFields:
         from zotero_mcp.tools import _helpers
         # Should not raise on a malformed item with no data dict.
         _helpers._strip_unwritable_fields({"key": "ABC"})
+
+
+class TestCapitalizeName:
+    """Port of Zotero.Utilities.capitalizeName, including its restraint.
+
+    The cases below are the ones documented in Zotero's own source, so a
+    divergence here is a divergence from what the browser connector would
+    have produced for the same record.
+    """
+
+    @pytest.mark.parametrize("shouted,expected", [
+        ("O'NEAL", "O'Neal"),
+        ("o'neal", "O'Neal"),
+        # Mixed case is assumed deliberate and never second-guessed.
+        ("O'neal", "O'neal"),
+        ("John MacGregor O'NEILL", "John MacGregor O'Neill"),
+        ("martha McMiddlename WASHINGTON", "Martha McMiddlename Washington"),
+        ("R SOLE", "R Sole"),
+    ])
+    def test_matches_zoteros_documented_cases(self, shouted, expected):
+        assert _utils.capitalize_name(shouted) == expected
+
+    def test_empty_and_non_string_pass_through(self):
+        assert _utils.capitalize_name("") == ""
+        assert _utils.capitalize_name(None) is None
+
+    def test_runs_of_spaces_are_preserved(self):
+        """The original splits on a single space, not on whitespace runs.
+        Collapsing them is the classic way to break this port."""
+        assert _utils.capitalize_name("A  B") == "A  B"
+
+    def test_hyphenated_and_accented_names(self):
+        assert _utils.capitalize_name("JEAN-LUC") == "Jean-Luc"
+        assert _utils.capitalize_name("SOLÉ") == "Solé"
+
+
+class TestStripUnsupportedMarkup:
+    def test_inline_emphasis_survives(self):
+        assert _utils.strip_unsupported_markup(
+            "Growth of <i>E. coli</i>"
+        ) == "Growth of <i>E. coli</i>"
+
+    def test_mathml_tags_are_dropped_but_their_text_is_kept(self):
+        assert _utils.strip_unsupported_markup(
+            "<mml:math><mml:mi>T</mml:mi></mml:math>"
+        ) == "T"
+
+    def test_cdata_is_unwrapped(self):
+        assert _utils.strip_unsupported_markup(
+            "<jats:p><![CDATA[Raw & wild]]></jats:p>"
+        ) == "Raw & wild"
+
+    def test_small_caps_becomes_a_styled_span(self):
+        assert _utils.strip_unsupported_markup("<scp>Abc</scp>") == (
+            '<span style="font-variant:small-caps;">Abc</span>'
+        )
+
+    def test_attributes_are_stripped_from_kept_tags(self):
+        assert _utils.strip_unsupported_markup(
+            '<i class="species">E. coli</i>'
+        ) == "<i>E. coli</i>"
+
+    def test_empty_input(self):
+        assert _utils.strip_unsupported_markup("") == ""
+
+
+class TestRepairCrossrefString:
+    """CrossRef deposits carry two kinds of damage Zotero repairs on the way in."""
+
+    def test_xml_entities_are_decoded(self):
+        assert _utils.repair_crossref_string("College A&amp;P Courses") == (
+            "College A&P Courses"
+        )
+
+    def test_escaped_markup_survives_as_markup(self):
+        """Real record 10.35537/10915/59006 deposits its italics escaped."""
+        assert _utils.repair_crossref_string(
+            "subtribu &lt;i&gt;Oxylobinae&lt;/i&gt; King &amp; Rob"
+        ) == "subtribu <i>Oxylobinae</i> King & Rob"
+
+    def test_newlines_are_dropped(self):
+        """Real record 10.1021/acssynbio.9b00027 has one mid-title. A raw
+        newline in a title also breaks this package's markdown headings."""
+        assert _utils.repair_crossref_string("Yeast\nPromoters") == (
+            "YeastPromoters"
+        )
+
+    def test_mojibake_is_repaired(self):
+        """UTF-8 bytes decoded as Latin-1 and re-served as UTF-8: an en dash
+        arrives as three characters (10.1057/9780230391116.0016)."""
+        mangled = "pages 10\u00e2\u0080\u009320"
+        assert _utils.repair_crossref_string(mangled) == "pages 10\u201320"
+
+    def test_undecodable_control_characters_are_stripped_not_raised(self):
+        assert "\u009f" not in _utils.repair_crossref_string("a\u009fb\u00ff")
+
+    def test_clean_text_is_untouched(self):
+        assert _utils.repair_crossref_string("Ordinary title") == "Ordinary title"
+
+    def test_non_strings_pass_through(self):
+        assert _utils.repair_crossref_string(None) is None
+        assert _utils.repair_crossref_string(["a"]) == ["a"]

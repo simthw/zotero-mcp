@@ -4,7 +4,10 @@ Generated from the CLI's own argument parser by
 `scripts/gen_skill_reference.py` -- do not edit by hand.
 
 Every command also accepts `--json` (machine-readable envelope on stdout) and
-`-v` (diagnostics on stderr), before or after the command name. Run
+`-v` (diagnostics on stderr). Both are defined on the top-level parser and on
+each first-level command, so they may precede the command name or follow it,
+but not follow a sub-command: `get --json metadata KEY` parses and
+`get metadata --json KEY` does not. Run
 `zotero-cli --json-schema` for the output contract.
 
 
@@ -24,7 +27,7 @@ Every command also accepts `--json` (machine-readable envelope on stdout) and
  - `--sort-by`
  - `--sort-direction` -- one of `asc`, `desc` -- default `asc`
  - `--filters` -- JSON filters for semantic mode
- - `--all-libraries` -- Search every accessible library at once instead of the active one, labelling each result with its library (items, advanced and semantic modes). Requires ZOTERO_SEARCH_BACKEND=sqlite.
+ - `--all-libraries` -- Search every accessible library at once instead of the active one, labelling each result with its library (items, advanced and semantic modes). Requires the SQLite backend (the default in local mode).
  - `--detail` -- one of `keys_only`, `summary`, `full` -- default `summary` -- How much of each item --json returns (no effect on markdown output)
 
 ## `get (alias: g)`
@@ -103,9 +106,24 @@ Every command also accepts `--json` (machine-readable envelope on stdout) and
 
  - `--attachment-key` -- **required**
  - `--page` -- **required**
- - `--text` -- **required**
+ - `--text` -- Exact text to highlight
+ - `--rect` -- Area box x,y,width,height, normalized 0-1; `zotero-cli layout` prints boxes for figures and tables
+ - `--note` -- Sticky note centered at x,y, normalized 0-1; its text is --comment
  - `--comment`
- - `--color` -- default `#ffd400`
+ - `--color` -- default `#ffd400` -- Hex, or a Zotero color name: yellow, red, green, blue, purple, magenta, orange, gray
+ - `--tags` -- Comma-separated tags
+ - `--open` -- Then show the new annotation in the Zotero reader
+
+### `annotations batch`
+
+ - `--attachment-key` -- **required** -- Attachment for lines that do not name their own
+ - `--file` -- default `-` -- JSON Lines (or a JSON array) of {page, text|rect|note, comment, color, tags}; - reads stdin
+ - `--dry-run` -- Locate every highlight and report what it would cover, without writing
+
+## `layout`
+
+ - `<attachment_key>`
+ - `--pages` -- default `all` -- Pages to scan: all (default), 3, 3-6, or 1,4,6-9
 
 ## `notes (alias: n)`
 
@@ -120,13 +138,14 @@ Every command also accepts `--json` (machine-readable envelope on stdout) and
 
  - `--item-key` -- **required**
  - `--title`
- - `--text` -- Note text (use - to read from stdin)
+ - `--text` -- Markdown ($math$, tables, zotero:// links, plus <u> <s> <sub> <sup> <mark> <span style="color:red">) or note HTML; - reads stdin
  - `--tags`
 
 ### `notes update`
 
  - `--item-key` -- **required**
- - `--text` -- New text (use - for stdin)
+ - `--text` -- Markdown ($math$, tables, zotero:// links, plus <u> <s> <sub> <sup> <mark> <span style="color:red">) or note HTML; - reads stdin
+ - `--append` -- Add the text at the end instead of replacing the note
 
 ### `notes delete`
 
@@ -203,6 +222,13 @@ Every command also accepts `--json` (machine-readable envelope on stdout) and
  - `<name>`
  - `--parent`
 
+### `collections update`
+
+ - `<collection_key>`
+ - `--name` -- New name
+ - `--parent` -- Key or name of the new parent collection
+ - `--top-level` -- Move out of any parent collection
+
 ### `collections search`
 
  - `<query>`
@@ -232,8 +258,8 @@ Every command also accepts `--json` (machine-readable envelope on stdout) and
  - `--tags` -- Replace all tags (comma-separated)
  - `--add-tags`
  - `--remove-tags`
- - `--collections` -- Add to collections (comma-separated keys)
- - `--collection-names` -- Add to collections (comma-separated names)
+ - `--collections` -- Replace the item's collections (comma-separated keys); use `collections manage --add-to` to add without removing
+ - `--collection-names` -- Replace the item's collections (comma-separated names)
  - `--doi`
  - `--url`
  - `--extra`
@@ -272,8 +298,7 @@ Every command also accepts `--json` (machine-readable envelope on stdout) and
  - `--allow-mass-deletion`
  - `--config-path`
  - `--db-path`
- - `--openai-batch`
- - `--no-openai-batch`
+ - `--openai-batch` / `--no-openai-batch` -- mutually exclusive
 
 ### `db batch-status`
 
@@ -310,8 +335,13 @@ Every command also accepts `--json` (machine-readable envelope on stdout) and
 ## `read`
 
  - `<item_key>`
- - `--start-page` -- **required**
- - `--end-page` -- Defaults to --start-page (a single page)
+ - `--start-page` -- First page (required unless --find is given)
+ - `--end-page` -- Defaults to --start-page (a single page); with --find, the last page
+ - `--find` -- Locate TEXT instead of reading: ranked pages with short snippets (ignores case, punctuation and hyphenation); --start-page/--end-page narrow the search
+ - `--context` -- default `12` -- With --find: words of context on each side of a match (1-60, default 12)
+ - `--format` -- one of `text`, `image` -- default `text` -- image writes PNG page images (up to 10 pages) for math, figures and tables
+ - `--rect` -- With --format image: crop the start page to x,y,width,height (normalized 0-1), e.g. from `zotero-cli layout`
+ - `--out` -- With --format image: directory for the PNG files (default: a new temporary directory)
 
 ## `attach`
 
@@ -363,6 +393,12 @@ Every command also accepts `--json` (machine-readable envelope on stdout) and
 ## `path`
 
  - `<item_key>`
+
+## `open`
+
+ - `<item_key>` -- Item or attachment key (not needed with --annotation)
+ - `--page` -- 1-based page position, as `read` counts pages
+ - `--annotation` -- Annotation key to jump to and select
 
 ## `batch`
 

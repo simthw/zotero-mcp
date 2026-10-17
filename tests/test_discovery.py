@@ -152,6 +152,98 @@ def test_citations_direction_sorted_by_citation_count(monkeypatch):
     assert out.index("Citer High") < out.index("Citer Low")
 
 
+def test_citations_fall_back_to_cites_filter_without_api_url(monkeypatch):
+    """OpenAlex no longer returns `cited_by_api_url`, so the citing works have to be
+    looked up through the `cites:` filter built from the work's own id."""
+    _make_zot(monkeypatch)
+
+    source = {
+        "id": "https://openalex.org/W1",
+        "title": "Source Paper",
+        "referenced_works": [],
+    }
+    citing_results = {
+        "results": [
+            _work("https://openalex.org/W20", "Citer Low", 2020, "10.1234/low", 3, ["X"]),
+            _work("https://openalex.org/W21", "Citer High", 2021, "10.1234/high", 99, ["Y"]),
+        ]
+    }
+    seen: list[tuple[str, dict]] = []
+
+    def handler(url, params):
+        if url.endswith("/works/https://doi.org/10.1234/x"):
+            return FakeResponse(200, source)
+        seen.append((url, params))
+        if url.endswith("/works") and params.get("filter") == "cites:W1":
+            return FakeResponse(200, citing_results)
+        return FakeResponse(404, {})
+
+    _patch_requests(monkeypatch, handler)
+
+    out = discovery.find_related_papers("10.1234/x", direction="citations", ctx=DummyContext())
+    assert seen, "no citations lookup was attempted"
+    assert "2 citations" in out
+    assert "Citer High" in out and "Citer Low" in out
+    assert out.index("Citer High") < out.index("Citer Low")
+
+    assert all(p.get("sort") == "cited_by_count:desc" for _u, p in seen)
+
+    # Nothing to name the work with: no query is invented, and it is not reported as zero.
+    seen.clear()
+    source.pop("id")
+    out = discovery.find_related_papers("10.1234/x", direction="citations", ctx=DummyContext())
+    assert not seen
+    assert "citations lookup FAILED" in out
+
+
+def _refs_source(n):
+    return {
+        "id": "https://openalex.org/W1",
+        "title": "Source Paper",
+        "referenced_works": [f"https://openalex.org/W{100 + i}" for i in range(n)],
+    }
+
+
+def test_dead_references_are_backfilled_up_to_limit(monkeypatch):
+    """A referenced work missing from OpenAlex must not shrink the answer (#458 item 3)."""
+    _make_zot(monkeypatch)
+    source = _refs_source(5)
+    calls = []
+
+    def handler(url, params):
+        if url.endswith("/works/https://doi.org/10.1234/x"):
+            return FakeResponse(200, source)
+        ids = params["filter"].removeprefix("openalex_id:").split("|")
+        calls.append(ids)
+        live = [i for i in ids if i != "W101"]  # W101 is dead
+        return FakeResponse(200, {"results": [
+            _work(f"https://openalex.org/{i}", f"Ref {i}", 2010, f"10.1/{i}", 1, ["A"]) for i in live
+        ]})
+
+    _patch_requests(monkeypatch, handler)
+    out = discovery.find_related_papers("10.1234/x", direction="references", limit=3,
+                                        ctx=DummyContext())
+    assert "Found 3 references" in out
+    assert out.index("Ref W100") < out.index("Ref W102") < out.index("Ref W103")
+    assert calls == [["W100", "W101", "W102"], ["W103", "W104"]]
+
+
+def test_failed_lookups_are_not_reported_as_empty(monkeypatch):
+    """A failed OpenAlex request must be distinguishable from zero results (#458 item 4)."""
+    _make_zot(monkeypatch)
+    source = _refs_source(2)
+
+    def handler(url, params):
+        if url.endswith("/works/https://doi.org/10.1234/x"):
+            return FakeResponse(200, source)
+        return FakeResponse(503, {})
+
+    _patch_requests(monkeypatch, handler)
+    out = discovery.find_related_papers("10.1234/x", direction="both", ctx=DummyContext())
+    assert "0 references (INCOMPLETE: an OpenAlex lookup failed)" in out
+    assert "citations lookup FAILED (this is not a zero)" in out
+
+
 # --- find_related_papers: library membership flagging ---------------------
 
 
@@ -185,6 +277,40 @@ def test_library_membership_flagging(monkeypatch):
     out = discovery.find_related_papers("10.1234/x", direction="references", ctx=DummyContext())
     assert "in library ✓" in out
     assert "not in library" in out
+    assert "1 already in library" in out
+
+
+def test_library_membership_matches_url_form_doi_stored_in_zotero(monkeypatch):
+    """Zotero often stores the DOI as a doi.org URL, which is what the connector
+    writes; the OpenAlex side is always normalised, so both sides must be."""
+    zot = _make_zot(monkeypatch)
+    zot._by_doi["10.1234/refa"] = [
+        {"key": "URLDOI01", "data": {"itemType": "journalArticle", "DOI": "https://doi.org/10.1234/refa"}}
+    ]
+
+    source = {
+        "id": "https://openalex.org/W1",
+        "title": "Source Paper",
+        "referenced_works": ["https://openalex.org/W10", "https://openalex.org/W11"],
+        "cited_by_api_url": "https://api.openalex.org/works?filter=cites:W1",
+    }
+    ref_results = {
+        "results": [
+            _work("https://openalex.org/W10", "Ref A", 2010, "10.1234/refa", 5, ["Alice"]),
+            _work("https://openalex.org/W11", "Ref B", 2012, "10.1234/refb", 9, ["Bob"]),
+        ]
+    }
+
+    def handler(url, params):
+        if url.endswith("/works/https://doi.org/10.1234/x"):
+            return FakeResponse(200, source)
+        if url.endswith("/works") and "openalex_id" in params.get("filter", ""):
+            return FakeResponse(200, ref_results)
+        return FakeResponse(404, {})
+
+    _patch_requests(monkeypatch, handler)
+
+    out = discovery.find_related_papers("10.1234/x", direction="references", ctx=DummyContext())
     assert "1 already in library" in out
 
 
@@ -236,6 +362,11 @@ def test_item_key_with_doi_resolves(monkeypatch):
 class FakeZoteroCoverage(FakeZoteroDiscovery):
     def collection_items(self, key, start=0, limit=100, **kwargs):
         return self._items[start : start + limit]
+
+    def collection(self, key, **kwargs):
+        # Real pyzotero has this; the coverage scan now confirms a
+        # collection exists before listing it, so the fake needs it too.
+        return {"key": key, "data": {"name": f"Collection {key}"}}
 
     def items(self, start=None, limit=None, **kwargs):
         if start is not None:

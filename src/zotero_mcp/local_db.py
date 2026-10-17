@@ -5,12 +5,17 @@ Provides direct SQLite access to Zotero's local database for faster semantic sea
 when running in local mode.
 """
 
+import atexit
 import json
 import logging
 import os
 import platform
 import re
+import shutil
 import sqlite3
+import tempfile
+import threading
+import time
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
@@ -22,6 +27,7 @@ from . import fulltext_cache
 from . import search_semantics as _semantics
 from .config import load_config
 from .extract import (
+    ExtractedDoc,
     categorize_attachment,
     extract_file,
     normalize_attachment_priority,
@@ -47,39 +53,11 @@ logger = logging.getLogger(__name__)
 # 10 or 50.
 DEFAULT_PDF_MAX_PAGES = 50
 
-# Sentinel returned by PDF extraction when the worker process exceeded its
-# timeout. Never persisted to ChromaDB: callers must treat it as "no text".
-_EXTRACTION_TIMEOUT = "__EXTRACTION_TIMEOUT__"
-
 # Library identity used throughout zotero-mcp (ChromaDB metadata, the
 # `zotero_switch_library` tool, etc.): 0 for the personal ("user") library,
 # else the Zotero server-assigned groupID. This matches Zotero's own
 # sentinel for the account-less personal library.
 PERSONAL_LIBRARY_GROUP_ID = 0
-
-
-def _extract_pdf_worker(file_path: str, maxpages: int, result_queue=None):
-    """Worker: extract text from a PDF in a separate process.
-
-    When called via ProcessPoolExecutor (result_queue is None) the text is
-    returned directly.  The legacy Queue path is kept for compatibility.
-    """
-    try:
-        # Suppress pdfminer warnings about malformed PDF color spaces, fonts, etc.
-        import logging as _logging
-
-        _logging.getLogger("pdfminer").setLevel(_logging.ERROR)
-
-        from pdfminer.high_level import extract_text
-
-        text = extract_text(file_path, maxpages=maxpages) or ""
-        if result_queue is not None:
-            result_queue.put(text)
-        return text
-    except Exception:
-        if result_queue is not None:
-            result_queue.put("")
-        return ""
 
 
 class KeyGroupMap(NamedTuple):
@@ -93,6 +71,23 @@ class KeyGroupMap(NamedTuple):
 
     groups: dict[str, int]
     excluded_keys: set[str]
+
+
+@dataclass
+class FulltextExtraction:
+    """Extracted attachment text, plus how much of the document it covers.
+
+    ``page_count`` is the document's real length and ``truncated`` says the
+    page cap dropped pages from the tail — both straight from
+    :class:`~zotero_mcp.extract.ExtractedDoc`. They carry their defaults on
+    the cache paths, which are not page-capped and keep no page bookkeeping
+    (#448).
+    """
+
+    text: str
+    source: str
+    page_count: int | None = None
+    truncated: bool = False
 
 
 def _read_string_pref(prefs_path: Path, pref: str) -> str | None:
@@ -117,6 +112,25 @@ def _read_string_pref(prefs_path: Path, pref: str) -> str | None:
         return json.loads(f'"{raw}"')
     except ValueError:
         return raw
+
+
+def _read_bool_pref(prefs_path: Path, pref: str) -> bool | None:
+    """Read a boolean preference from a Zotero prefs.js file.
+
+    Returns None if the file cannot be read or the preference is absent,
+    which for Zotero means the preference is still at its default.
+    """
+    try:
+        text = prefs_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(
+        r'user_pref\("' + re.escape(pref) + r'",\s*(true|false)\)',
+        text,
+    )
+    if not m:
+        return None
+    return m.group(1) == "true"
 
 
 def _zotero_profiles_dirs() -> list[Path]:
@@ -272,29 +286,117 @@ _CONDITION_FIELD_ALIASES = {
     "doi": "DOI",
 }
 
+# Field resolution, the way the Zotero client does it (#570): never a literal
+# fieldID. A field is looked up by name, and a *base* field (title, date,
+# publicationTitle) resolves per item type through baseFieldMappingsCombined —
+# a case's title is `caseName`, a webpage's publicationTitle `websiteTitle` —
+# falling back to the base field's own ID: `override || baseFieldID`, as
+# Zotero.ItemFields.getFieldIDFromTypeAndBase plus Item.getField have it.
+# The ...Combined table is the one that also sees plugin-defined types.
+#
+# abstractNote, DOI, extra and url have no mappings and take the plain forms.
+# Every name passed here is a core Zotero field, hence `fields` rather than
+# `fieldsCombined`. A caller-supplied name (advanced search on any field) never
+# reaches the interpolating form: it is checked against the `fields` table and
+# bound as a parameter (``bound=True``, see `_resolved_field_subquery`).
+_BOUND_FIELD_ID = "(SELECT fieldID FROM fields WHERE fieldName = ?)"
+
+
+def _field_id(field_name: str, bound: bool = False) -> str:
+    """The fieldID as an uncorrelated scalar subquery, which SQLite evaluates
+    once per statement. Joining `fields` instead scans it for every outer row
+    (it has no index on fieldName): 3x slower on the keyword search.
+
+    ``bound=True`` emits a ``?`` placeholder in place of the name, for a name
+    that did not come from this module's own constants."""
+    if bound:
+        return _BOUND_FIELD_ID
+    return f"(SELECT fieldID FROM fields WHERE fieldName = '{field_name}')"
+
+
+def _base_field_resolved_join(
+    alias: str, base_field_name: str, item_alias: str = "i"
+) -> str:
+    """LEFT JOIN chain projecting `{alias}_val.value` for a base field,
+    resolved against the type of ``item_alias`` — the outer ``items`` alias,
+    which the note and annotation searches point at a parent (``pi``/``gpi``).
+    """
+    field_id = _field_id(base_field_name)
+    return f"""
+    LEFT JOIN baseFieldMappingsCombined {alias}_map
+        ON {alias}_map.itemTypeID = {item_alias}.itemTypeID
+        AND {alias}_map.baseFieldID = {field_id}
+    LEFT JOIN itemData {alias}_data ON {item_alias}.itemID = {alias}_data.itemID
+        AND {alias}_data.fieldID = COALESCE({alias}_map.fieldID, {field_id})
+    LEFT JOIN itemDataValues {alias}_val ON {alias}_data.valueID = {alias}_val.valueID
+    """
+
+
+def _plain_field_join(alias: str, field_name: str, item_alias: str = "i") -> str:
+    """The same projection for a field with no base-field mapping."""
+    return f"""
+    LEFT JOIN itemData {alias}_data ON {item_alias}.itemID = {alias}_data.itemID
+        AND {alias}_data.fieldID = {_field_id(field_name)}
+    LEFT JOIN itemDataValues {alias}_val ON {alias}_data.valueID = {alias}_val.valueID
+    """
+
+
+def _base_field_resolved_subquery(
+    base_field_name: str,
+    item_alias: str = "i",
+    value_expr: str = "v.value",
+    extra_where: str = "",
+    bound: bool = False,
+) -> str:
+    """`_base_field_resolved_join` as a correlated scalar subquery, the shape
+    a WHERE condition needs. ``value_expr`` lets the date variants (display
+    half, ISO prefix, year) share it. ``bound`` leaves the field name as two
+    ``?`` placeholders (the caller binds the name twice, ahead of its other
+    parameters).
+    """
+    field_id = _field_id(base_field_name, bound)
+    return (
+        f"(SELECT {value_expr} FROM itemData d "
+        f"JOIN itemDataValues v ON d.valueID = v.valueID "
+        f"LEFT JOIN baseFieldMappingsCombined m "
+        f"ON m.itemTypeID = {item_alias}.itemTypeID AND m.baseFieldID = {field_id} "
+        f"WHERE d.itemID = {item_alias}.itemID "
+        f"AND d.fieldID = COALESCE(m.fieldID, {field_id}){extra_where})"
+    )
+
+
+def _plain_field_subquery(field_name: str, item_alias: str = "i") -> str:
+    """Scalar-subquery counterpart to `_plain_field_join`."""
+    return (
+        f"(SELECT v.value FROM itemData d "
+        f"JOIN itemDataValues v ON d.valueID = v.valueID "
+        f"WHERE d.itemID = {item_alias}.itemID AND d.fieldID = {_field_id(field_name)})"
+    )
+
+
 # Single-valued fields resolvable to one scalar SQL expression correlated on
 # the outer query's `i` (items) / `it` (itemTypes) aliases.
+def _resolved_field_subquery() -> str:
+    """Scalar subquery for any validated Zotero field, the field name bound
+    twice. A base field resolves per item type (publisher of a thesis is
+    `university`); any other field has no mapping and falls back to its own
+    ID, so one form serves both."""
+    return _base_field_resolved_subquery("", bound=True)
+
+
 _SIMPLE_FIELD_SQL = {
-    "title": (
-        "(SELECT v.value FROM itemData d JOIN itemDataValues v ON d.valueID = v.valueID "
-        "WHERE d.itemID = i.itemID AND d.fieldID = 1)"
-    ),
-    "abstractNote": (
-        "(SELECT v.value FROM itemData d JOIN itemDataValues v ON d.valueID = v.valueID "
-        "WHERE d.itemID = i.itemID AND d.fieldID = 2)"
-    ),
+    # `title` and `publicationTitle` are base fields — a case's title lives in
+    # caseName, a webpage's publicationTitle in websiteTitle (#570). Matching
+    # them unresolved is what let advanced_search_sql contradict itself: a
+    # base-resolved SELECT over a non-resolved WHERE, so `title contains X`
+    # missed items whose *returned* title plainly matched.
+    "title": _base_field_resolved_subquery("title"),
+    "abstractNote": _plain_field_subquery("abstractNote"),
     # "date" is handled separately below (_DATE_DISPLAY_SQL / _DATE_RANGE_SQL)
     # — it needs an operator-aware expression, unlike every other field here.
-    "DOI": (
-        "(SELECT v.value FROM itemData d JOIN itemDataValues v ON d.valueID = v.valueID "
-        "JOIN fields f ON d.fieldID = f.fieldID "
-        "WHERE d.itemID = i.itemID AND f.fieldName = 'DOI')"
-    ),
-    "publicationTitle": (
-        "(SELECT v.value FROM itemData d JOIN itemDataValues v ON d.valueID = v.valueID "
-        "JOIN fields f ON d.fieldID = f.fieldID "
-        "WHERE d.itemID = i.itemID AND f.fieldName = 'publicationTitle')"
-    ),
+    "DOI": _plain_field_subquery("DOI"),
+    "url": _plain_field_subquery("url"),
+    "publicationTitle": _base_field_resolved_subquery("publicationTitle"),
     "dateAdded": "i.dateAdded",
     "dateModified": "i.dateModified",
     "itemType": "it.typeName",
@@ -325,19 +427,20 @@ _SIMPLE_FIELD_SQL = {
 # replicate; see the plan's Phase D bug list.
 _RANGE_OPERATIONS = frozenset({"isGreaterThan", "isLessThan", "isBefore", "isAfter"})
 
-_DATE_DISPLAY_SQL = (
-    "(SELECT SUBSTR(v.value, INSTR(v.value, ' ') + 1) FROM itemData d "
-    "JOIN itemDataValues v ON d.valueID = v.valueID JOIN fields f ON d.fieldID = f.fieldID "
-    "WHERE d.itemID = i.itemID AND f.fieldName = 'date')"
+# `date` is a base field too: a case's is dateDecided, a statute's
+# dateEnacted, a patent's issueDate (#570). All three variants resolve it, so
+# a date/year condition can reach those items at all — and so that the same
+# item is not displayed with a date it cannot be filtered by.
+_DATE_DISPLAY_SQL = _base_field_resolved_subquery(
+    "date", value_expr="SUBSTR(v.value, INSTR(v.value, ' ') + 1)"
 )
-_DATE_RANGE_SQL = (
-    "(SELECT SUBSTR(v.value, 1, 10) FROM itemData d JOIN itemDataValues v ON d.valueID = v.valueID "
-    "JOIN fields f ON d.fieldID = f.fieldID WHERE d.itemID = i.itemID AND f.fieldName = 'date')"
+_DATE_RANGE_SQL = _base_field_resolved_subquery(
+    "date", value_expr="SUBSTR(v.value, 1, 10)"
 )
-_YEAR_FIELD_SQL = (
-    "(SELECT SUBSTR(v.value, 1, 4) FROM itemData d JOIN itemDataValues v ON d.valueID = v.valueID "
-    "JOIN fields f ON d.fieldID = f.fieldID "
-    "WHERE d.itemID = i.itemID AND f.fieldName = 'date' AND LENGTH(v.value) >= 4)"
+_YEAR_FIELD_SQL = _base_field_resolved_subquery(
+    "date",
+    value_expr="SUBSTR(v.value, 1, 4)",
+    extra_where=" AND LENGTH(v.value) >= 4",
 )
 
 # The display half of the multipart date, for the hydration projections
@@ -355,28 +458,24 @@ _CREATOR_NAME_EXPR = "TRIM(COALESCE(c.firstName, '') || ' ' || COALESCE(c.lastNa
 # `WHERE i.libraryID IN (...)`. Built by `_item_hydration_select`, which
 # sizes that IN list; a global search (#163) passes every accessible
 # library rather than one.
-_ITEM_HYDRATION_SELECT_TEMPLATE = """
+_ITEM_HYDRATION_SELECT_TEMPLATE = (
+    """
     SELECT i.itemID, i.key, i.libraryID, it.typeName as itemType, i.dateAdded, i.dateModified,
            title_val.value as title, abstract_val.value as abstractNote,
            SUBSTR(date_val.value, INSTR(date_val.value, ' ') + 1) as date, doi_val.value as DOI, pub_val.value as publicationTitle
     FROM items i
     JOIN itemTypes it ON i.itemTypeID = it.itemTypeID
-    LEFT JOIN itemData title_data ON i.itemID = title_data.itemID AND title_data.fieldID = 1
-    LEFT JOIN itemDataValues title_val ON title_data.valueID = title_val.valueID
-    LEFT JOIN itemData abstract_data ON i.itemID = abstract_data.itemID AND abstract_data.fieldID = 2
-    LEFT JOIN itemDataValues abstract_val ON abstract_data.valueID = abstract_val.valueID
-    LEFT JOIN fields date_f ON date_f.fieldName = 'date'
-    LEFT JOIN itemData date_data ON i.itemID = date_data.itemID AND date_data.fieldID = date_f.fieldID
-    LEFT JOIN itemDataValues date_val ON date_data.valueID = date_val.valueID
-    LEFT JOIN fields doi_f ON doi_f.fieldName = 'DOI'
-    LEFT JOIN itemData doi_data ON i.itemID = doi_data.itemID AND doi_data.fieldID = doi_f.fieldID
-    LEFT JOIN itemDataValues doi_val ON doi_data.valueID = doi_val.valueID
-    LEFT JOIN fields pub_f ON pub_f.fieldName = 'publicationTitle'
-    LEFT JOIN itemData pub_data ON i.itemID = pub_data.itemID AND pub_data.fieldID = pub_f.fieldID
-    LEFT JOIN itemDataValues pub_val ON pub_data.valueID = pub_val.valueID
+    """
+    + _base_field_resolved_join("title", "title")
+    + _plain_field_join("abstract", "abstractNote")
+    + _base_field_resolved_join("date", "date")
+    + _plain_field_join("doi", "DOI")
+    + _base_field_resolved_join("pub", "publicationTitle")
+    + """
     WHERE i.libraryID IN ({library_placeholders})
     AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
 """
+)
 
 
 def _item_hydration_select(library_count: int) -> str:
@@ -584,6 +683,366 @@ def row_to_api_item(
     return item
 
 
+#: Set to "0" to always read zotero.sqlite in place with ``immutable=1``, never
+#: from a WAL-inclusive copy. An escape hatch for very large databases, where
+#: each copy costs as much as the file is big.
+DB_SNAPSHOT_ENV_VAR = "ZOTERO_MCP_DB_SNAPSHOT"
+
+#: Minimum seconds between two copies of the same database. A changed WAL
+#: inside this window keeps serving the current copy, so a burst of writes
+#: from Zotero costs one copy, not one per write. Matters for multi-GB
+#: databases read through the SQLite backend; "0" refreshes on every change.
+DB_SNAPSHOT_MIN_INTERVAL_ENV_VAR = "ZOTERO_MCP_DB_SNAPSHOT_MIN_INTERVAL"
+_DEFAULT_SNAPSHOT_MIN_INTERVAL = 5.0
+
+
+def _snapshot_min_interval() -> float:
+    raw = os.environ.get(DB_SNAPSHOT_MIN_INTERVAL_ENV_VAR, "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else _DEFAULT_SNAPSHOT_MIN_INTERVAL
+    except ValueError:
+        return _DEFAULT_SNAPSHOT_MIN_INTERVAL
+
+
+# Bumped each time this process is about to write to Zotero. A snapshot copied
+# under an older value is stale: the next read takes one fresh copy regardless of
+# the throttle, then the throttle applies again. Kept apart from _snapshot_lock
+# so a write never waits for a copy in progress.
+_write_gen = 0
+_write_gen_lock = threading.Lock()
+
+
+def note_local_write() -> None:
+    """Mark the current database copy stale; see _wal_snapshot_path."""
+    global _write_gen
+    with _write_gen_lock:
+        _write_gen += 1
+
+
+# One snapshot per database for the whole process, because readers are opened
+# per tool call: a copy per reader would copy the database on every call.
+_snapshot_lock = threading.Lock()
+_snapshots: dict[str, tuple[tuple, str, float, int]] = {}
+
+#: Snapshot directories are named ``zotero_mcp_db_<pid>_<random>`` so a later
+#: process can tell whose they are. Copies from before the pid was recorded
+#: are only removed once they are this old.
+_SNAPSHOT_PREFIX = "zotero_mcp_db_"
+_LEGACY_SNAPSHOT_MAX_AGE = 7 * 24 * 3600
+_swept_stale_snapshots = False
+
+
+_IS_WINDOWS = os.name == "nt"
+
+
+def _pid_alive(pid: int) -> bool:
+    if _IS_WINDOWS:
+        # os.kill(pid, 0) is not a liveness probe on Windows: signal 0 equals
+        # CTRL_C_EVENT there, so it can send Ctrl+C to processes on the
+        # console, and a failure is a generic OSError. Say "alive" and let the
+        # sweep fall back to the age rule.
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # Exists but belongs to someone else (EPERM), or the platform
+        # cannot tell: keep the directory.
+        return True
+    return True
+
+
+def _sweep_stale_snapshots() -> None:
+    """Remove snapshot directories left behind by processes that are gone.
+
+    ``_remove_snapshots`` runs at exit, but not when the process is stopped
+    by a signal: SIGTERM from launchd, systemd or Docker, or SIGKILL. Each
+    such stop used to leave a full copy of the user's library in the temp
+    directory, one per restart. Runs once per process, before its first copy.
+    """
+    global _swept_stale_snapshots
+    if _swept_stale_snapshots:
+        return
+    _swept_stale_snapshots = True
+    tmp = tempfile.gettempdir()
+    try:
+        names = os.listdir(tmp)
+    except OSError:
+        return
+    now = time.time()
+    for name in names:
+        if not name.startswith(_SNAPSHOT_PREFIX):
+            continue
+        path = os.path.join(tmp, name)
+        owner = name[len(_SNAPSHOT_PREFIX):].split("_", 1)[0]
+        try:
+            if owner.isdigit() and "_" in name[len(_SNAPSHOT_PREFIX):]:
+                pid = int(owner)
+                if pid == os.getpid():
+                    continue
+                # Where liveness cannot be probed (Windows) only old copies go.
+                if _pid_alive(pid) and not (
+                    _IS_WINDOWS and now - os.path.getmtime(path) >= _LEGACY_SNAPSHOT_MAX_AGE
+                ):
+                    continue
+            elif now - os.path.getmtime(path) < _LEGACY_SNAPSHOT_MAX_AGE:
+                continue
+            if not os.path.isdir(path) or os.path.islink(path):
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+
+
+@atexit.register
+def _remove_snapshots() -> None:
+    """Delete this process's database copies; they hold the whole library."""
+    for _sig, snap, _made_at, _gen in list(_snapshots.values()):
+        shutil.rmtree(os.path.dirname(snap), ignore_errors=True)
+    _snapshots.clear()
+
+
+def _file_signature(path: str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
+def _wal_snapshot_path(db_path: str) -> str | None:
+    """Path to a private copy of ``db_path`` that includes its WAL, or None.
+
+    Zotero keeps its database in WAL mode under an exclusive lock. A normal
+    read-only connection is refused while Zotero runs ("database is locked"),
+    and ``immutable=1`` gets past the lock by not reading the ``-wal`` file at
+    all, so every change since the last checkpoint is invisible: items added
+    today, their attachments, edits (#536). Copying the database together
+    with its WAL and opening the copy normally lets SQLite apply those frames.
+
+    Returns None when there is nothing in the WAL to apply (the in-place read
+    is already current), when snapshots are disabled, or when a copy could not
+    be made consistently; callers then read in place as before.
+
+    The copy is reused until either file's size or mtime changes (and, within
+    ``ZOTERO_MCP_DB_SNAPSHOT_MIN_INTERVAL`` of the last copy, even then). A write
+    made by this process (``note_local_write``) marks the copy stale, so the
+    next read copies once whatever the interval says. A file that
+    changes while it is being copied is retried, since a checkpoint running
+    mid-copy could pair a new main file with an old WAL. SQLite checks WAL
+    frame checksums on open, so a WAL copied while Zotero appended to it
+    yields the last complete transaction, never a torn one.
+    """
+    if os.environ.get(DB_SNAPSHOT_ENV_VAR, "").strip() == "0":
+        return None
+    source = os.path.realpath(db_path)
+    wal = source + "-wal"
+    wal_sig = _file_signature(wal)
+    if wal_sig is None or wal_sig[0] == 0:
+        return None
+
+    with _snapshot_lock:
+        for _attempt in range(3):
+            gen = _write_gen
+            before = (_file_signature(source), _file_signature(wal))
+            cached = _snapshots.get(source)
+            if cached and os.path.exists(cached[1]):
+                if cached[0] == before:
+                    return cached[1]
+                if cached[3] == gen and time.monotonic() - cached[2] < _snapshot_min_interval():
+                    # Changed, but copied too recently to copy again; the
+                    # next read after the interval picks the change up. A copy
+                    # made before our own latest write skips this, once.
+                    return cached[1]
+            _sweep_stale_snapshots()
+            snap_dir = tempfile.mkdtemp(prefix=f"{_SNAPSHOT_PREFIX}{os.getpid()}_")
+            snap = os.path.join(snap_dir, "zotero.sqlite")
+            try:
+                shutil.copyfile(source, snap)
+                shutil.copyfile(wal, snap + "-wal")
+            except OSError as e:
+                shutil.rmtree(snap_dir, ignore_errors=True)
+                logger.warning(
+                    "Could not copy %s with its WAL (%s); reading it in place, "
+                    "which misses changes since Zotero's last checkpoint.", source, e,
+                )
+                return None
+            if (_file_signature(source), _file_signature(wal)) != before:
+                shutil.rmtree(snap_dir, ignore_errors=True)
+                continue
+            if cached:
+                # Best effort: an open connection elsewhere keeps its files
+                # alive on POSIX, and on Windows the directory is left behind.
+                shutil.rmtree(os.path.dirname(cached[1]), ignore_errors=True)
+            _snapshots[source] = (before, snap, time.monotonic(), gen)
+            return snap
+    logger.warning(
+        "%s kept changing while it was being copied; reading it in place.", source
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Full-fidelity readers backing the SQLite library backend (see library.py)
+# ---------------------------------------------------------------------------
+#
+# `row_to_api_item` above hydrates the eleven fields the two search tools
+# consume. The readers below hydrate whatever Zotero actually holds, because
+# the tools ported onto `LibraryBackend` promise more than search does:
+# `zotero_get_item_metadata` advertises "the complete raw Zotero item record",
+# `generate_bibtex` reads type-specific fields, and `format_item_metadata`
+# renders a trash status out of `data["deleted"]`.
+#
+# Every reader here answers in a fixed, small number of queries no matter how
+# many keys it is handed — the plural signatures are the whole point. Asking
+# for N items' children one key at a time costs ~3300x what a single JOIN
+# costs on a real-sized library, and paging a 17k-tag library at 100 rows per
+# OFFSET query costs ~67x a single SELECT. Both of those shapes exist only
+# because the Zotero API is remote; over a local file they are pure waste.
+
+#: Zotero's numeric attachment link modes, spelled as the API spells them.
+_LINK_MODES = {
+    0: "imported_file",
+    1: "imported_url",
+    2: "linked_file",
+    3: "linked_url",
+    4: "embedded_image",
+}
+
+#: Zotero's numeric annotation types, spelled as the API spells them. Same
+#: mapping `search_annotations_local` already uses.
+# Zotero.Annotations.ANNOTATION_TYPE_* (chrome/content/zotero/xpcom/
+# annotations.js:31-36), spelled as data/items.js:526-548 names them. Type 6
+# ("text") arrived after this map was written, so it resolved to "" — which
+# reaches the user as `[KEY] : ...` in tools/retrieval.py and as an empty
+# "type" in cli_json.py, and would defeat any display title keyed on the type.
+_ANNOTATION_TYPES = {
+    1: "highlight", 2: "note", 3: "image", 4: "ink", 5: "underline", 6: "text",
+}
+
+
+def _api_timestamp(value: str | None) -> str:
+    """Zotero stores 'YYYY-MM-DD HH:MM:SS'; the API returns ISO 8601 UTC."""
+    if not value:
+        return ""
+    if " " in value and not value.endswith("Z"):
+        return value.replace(" ", "T") + "Z"
+    return value
+
+
+def _api_date_field(value: str | None) -> str:
+    """Strip Zotero's sort prefix off a stored ``date`` value.
+
+    Dates are stored multipart — ``"2011-03-00 March 2011"`` — with the
+    user's own spelling after the first space, which is the only part the
+    API returns. Mirrors the SUBSTR in `_ITEM_HYDRATION_SELECT_TEMPLATE`.
+    """
+    if not value:
+        return ""
+    return value.split(" ", 1)[1] if " " in value else value
+
+
+def _api_filename(zotero_path: str | None) -> str:
+    """The bare filename the API reports for an attachment.
+
+    Stored paths are prefixed (``storage:foo.pdf``, ``attachments:a/b.pdf``)
+    or absolute; the API's ``filename`` is just the basename either way.
+    """
+    if not zotero_path:
+        return ""
+    tail = zotero_path.split(":", 1)[1] if ":" in zotero_path[:12] else zotero_path
+    return tail.rsplit("/", 1)[-1]
+
+
+def _row_to_full_api_item(
+    row,
+    fields: dict[str, str],
+    creators: list[dict],
+    tags: list[dict],
+    collections: list[str],
+    relations: dict[str, object],
+    library: tuple[int, str] | None,
+) -> dict:
+    """Build a complete pyzotero-shaped item record from one hydrated row.
+
+    The counterpart to `row_to_api_item` for callers that need the whole
+    record rather than the search projection: every ``itemData`` field under
+    its own name, the side-table fields for notes/attachments/annotations,
+    plus ``version``, ``collections``, ``relations``, ``parentItem`` and the
+    ``deleted`` flag the API sets on trashed items.
+    """
+    item_type = row["itemType"]
+    data: dict = {
+        "key": row["key"],
+        "version": row["version"],
+        "itemType": item_type,
+        "dateAdded": _api_timestamp(row["dateAdded"]),
+        "dateModified": _api_timestamp(row["dateModified"]),
+        "tags": tags,
+        "collections": collections,
+        "relations": relations,
+    }
+
+    for name, value in fields.items():
+        data[name] = _api_date_field(value) if name == "date" else value
+
+    if item_type not in ("attachment", "note", "annotation"):
+        data["creators"] = creators
+
+    if row["parentKey"]:
+        data["parentItem"] = row["parentKey"]
+
+    if item_type == "note":
+        data["note"] = row["noteBody"] or ""
+        # Zotero derives a note's title from its first line and stores it;
+        # `item_display_title` recomputes the same thing from the body, so
+        # only surface it when Zotero actually has one.
+        if row["noteTitle"]:
+            data["title"] = row["noteTitle"]
+    elif item_type == "attachment":
+        data["linkMode"] = _LINK_MODES.get(row["linkMode"], "")
+        data["contentType"] = row["contentType"] or ""
+        data["filename"] = _api_filename(row["path"])
+    elif item_type == "annotation":
+        data["annotationType"] = _ANNOTATION_TYPES.get(row["annType"], "")
+        data["annotationText"] = row["annText"] or ""
+        data["annotationComment"] = row["annComment"] or ""
+        data["annotationColor"] = row["annColor"] or ""
+        data["annotationPageLabel"] = row["annPageLabel"] or ""
+        data["annotationSortIndex"] = row["annSortIndex"] or ""
+        data["annotationPosition"] = row["annPosition"] or ""
+
+    if row["deleted"]:
+        data["deleted"] = 1
+
+    item = {"key": row["key"], "version": row["version"], "data": data}
+    if library is not None:
+        group_id, name = library
+        item["library"] = {
+            "id": group_id,
+            "type": "user" if group_id == PERSONAL_LIBRARY_GROUP_ID else "group",
+            "name": name,
+        }
+    return item
+
+
+def _row_to_api_collection(row) -> dict:
+    """Build a pyzotero-shaped collection record from a hydrated row."""
+    return {
+        "key": row["key"],
+        "version": row["version"],
+        "data": {
+            "key": row["key"],
+            "version": row["version"],
+            "name": row["collectionName"] or "",
+            "parentCollection": row["parentKey"] or False,
+            "relations": {},
+            **({"deleted": 1} if row["deleted"] else {}),
+        },
+    }
+
+
 class LocalZoteroReader:
     """
     Direct SQLite reader for Zotero's local database.
@@ -597,18 +1056,20 @@ class LocalZoteroReader:
     # never write into the user's real cache directory.
     extraction_workers: int = 1
     fulltext_cache_enabled: bool = False
+    reuse_pdf_parse: bool = False
     config_path: str | None = None
     _library_labels: dict[int, tuple[int, str]] | None = None
+    _field_names: frozenset[str] | None = None
 
     def __init__(
         self,
         db_path: str | None = None,
         pdf_max_pages: int | None = None,
         attachment_priority=None,
-        pdf_timeout: int = 30,
         extraction_workers: int = 1,
         fulltext_cache_enabled: bool = False,
         config_path: str | None = None,
+        reuse_pdf_parse: bool = False,
     ):
         """
         Initialize the local database reader.
@@ -619,7 +1080,6 @@ class LocalZoteroReader:
             attachment_priority: Order in which attachment kinds are tried
                 for an item with several readable files. None means the
                 default (PDF > HTML > rest).
-            pdf_timeout: Seconds before a single PDF extraction is aborted.
             extraction_workers: How many PDFs :meth:`extract_fulltext_for_items`
                 may parse at once. 1 (the default) keeps the historical fully
                 sequential behaviour. Higher values fan out over a process
@@ -633,19 +1093,25 @@ class LocalZoteroReader:
                 would otherwise poison the cache with truncated text.
             config_path: Semantic-search config path, used only to locate the
                 fulltext cache directory next to it.
+            reuse_pdf_parse: Serve repeat reads of an unchanged PDF from the
+                in-process parse memo (``extract_pdf(reuse=True)``). For
+                interactive tools; indexing leaves it off.
         """
         self.db_path = db_path or self._find_zotero_db()
         self._connection: sqlite3.Connection | None = None
+        # (library ids) -> whether a full scan beats the (libraryID, key)
+        # index for them; valid for the lifetime of one connection.
+        self._scan_choice: dict[tuple[int, ...], bool] = {}
         self._library_labels: dict[int, tuple[int, str]] | None = None
+        self._field_names: frozenset[str] | None = None
         self.pdf_max_pages: int | None = pdf_max_pages
-        self.pdf_timeout: int = pdf_timeout
         self.attachment_priority: tuple[str, ...] = normalize_attachment_priority(
             attachment_priority
         )
-        self._pdf_pool = None  # Lazy-initialized ProcessPoolExecutor
         self.extraction_workers: int = max(1, int(extraction_workers or 1))
         self.fulltext_cache_enabled: bool = fulltext_cache_enabled
         self.config_path: str | None = config_path
+        self.reuse_pdf_parse: bool = reuse_pdf_parse
 
     def _find_zotero_db(self) -> str:
         """
@@ -705,15 +1171,49 @@ class LocalZoteroReader:
             "or configure the path by running `zotero-mcp setup`."
         )
 
+    def _read_target(self) -> tuple:
+        """What a new connection would read: a WAL snapshot, or the file in place.
+
+        The in-place form carries the file's signature because an
+        ``immutable=1`` connection may keep serving pages it cached before
+        Zotero checkpointed into the file.
+        """
+        snapshot = _wal_snapshot_path(self.db_path)
+        if snapshot:
+            return ("snapshot", snapshot)
+        return ("inplace", _file_signature(os.path.realpath(self.db_path)))
+
+    def refresh_if_stale(self) -> bool:
+        """Drop the open connection if the database has changed under it.
+
+        A reader kept across tool calls (the SQLite library backend keeps one
+        per thread) otherwise answers from whatever it opened first, for the
+        life of the process: items added later never appear. Returns True
+        when the connection was dropped; the next query reopens it.
+        """
+        if self._connection is None:
+            return False
+        if self._read_target() == getattr(self, "_connection_target", None):
+            return False
+        self.close()
+        self._library_labels = None
+        self._field_names = None
+        return True
+
     def _get_connection(self) -> sqlite3.Connection:
         """Get database connection, creating if needed."""
         if self._connection is None:
-            # Use immutable=1 to bypass locking entirely. Zotero uses rollback
-            # journal mode and holds a write lock while running, which blocks
-            # even read-only connections. immutable=1 skips all lock checks —
-            # safe here since we only read and tolerate slightly stale data.
-            uri = f"file:{self.db_path}?immutable=1"
-            self._connection = sqlite3.connect(uri, uri=True)
+            # Zotero runs the database in WAL mode and holds an exclusive lock
+            # while it is open, which refuses even read-only connections.
+            # immutable=1 skips the lock but also skips the -wal file, so when
+            # the WAL holds changes, read a copy that includes it (#536).
+            target = self._read_target()
+            self._connection_target = target
+            if target[0] == "snapshot":
+                self._connection = sqlite3.connect(target[1], check_same_thread=True)
+            else:
+                uri = f"file:{self.db_path}?immutable=1"
+                self._connection = sqlite3.connect(uri, uri=True)
             self._connection.row_factory = sqlite3.Row
             # Lets the search backend compare the same folded form of a string
             # that search_semantics.compare() produces in Python.
@@ -732,10 +1232,20 @@ class LocalZoteroReader:
         Returns the configured ``extensions.zotero.baseAttachmentPath`` or
         ``None`` if the preference is not set or cannot be read. The
         preference lives in the profile directory's prefs.js; a prefs.js
-        next to the database is also checked for unusual setups.
+        next to the database is also checked for unusual setups. If multiple
+        profiles exist, prefer the profile whose configured data directory
+        contains this reader's database.
         """
-        prefs_files = [Path(self.db_path).parent / "prefs.js"]
-        prefs_files.extend(_profile_prefs_files())
+        db_parent = Path(self.db_path).expanduser().parent
+        profile_prefs = _profile_prefs_files()
+        matching_profile_prefs = []
+        for prefs_path in profile_prefs:
+            data_dir = _read_string_pref(prefs_path, "extensions.zotero.dataDir")
+            if data_dir and Path(data_dir).expanduser().resolve() == db_parent.resolve():
+                matching_profile_prefs.append(prefs_path)
+
+        prefs_files = [db_parent / "prefs.js"]
+        prefs_files.extend(matching_profile_prefs or profile_prefs)
         for prefs_path in prefs_files:
             if not prefs_path.exists():
                 continue
@@ -806,7 +1316,12 @@ class LocalZoteroReader:
             return Path(decoded_path)
 
         # Linked file as absolute path: '/Users/me/papers/file.pdf'
-        if os.path.isabs(zotero_path):
+        #
+        # The leading-slash test is separate from isabs() on purpose: since
+        # Python 3.13 ntpath.isabs() calls "/Users/me/paper.pdf" relative, so a
+        # library synced from macOS or Linux and opened on Windows would
+        # resolve every linked file to None instead of to a path.
+        if zotero_path.startswith("/") or os.path.isabs(zotero_path):
             return Path(zotero_path)
 
         # Zotero 'attachments:' relative path — resolve against the linked
@@ -837,72 +1352,19 @@ class LocalZoteroReader:
         except ValueError:
             return DEFAULT_PDF_MAX_PAGES
 
-    def _get_pdf_pool(self):
-        """Lazily create a single-worker ProcessPoolExecutor for PDF extraction."""
-        if self._pdf_pool is None:
-            from concurrent.futures import ProcessPoolExecutor
+    def _extract_doc_from_file(self, file_path: Path) -> ExtractedDoc | None:
+        """Parse an attachment file, or None if nothing readable came back.
 
-            self._pdf_pool = ProcessPoolExecutor(max_workers=1)
-        return self._pdf_pool
-
-    def _shutdown_pdf_pool(self, kill: bool = False):
-        """Shutdown the PDF worker pool."""
-        if self._pdf_pool is not None:
-            try:
-                if kill:
-                    self._pdf_pool.shutdown(wait=False, cancel_futures=True)
-                else:
-                    self._pdf_pool.shutdown(wait=False)
-            except Exception:
-                pass
-            self._pdf_pool = None
-
-    def _extract_text_from_pdf(self, file_path: Path) -> str:
-        """Extract text from a PDF using pdfminer in a persistent worker process.
-
-        Uses a single reusable worker process to avoid the per-PDF spawn
-        overhead and multiprocessing Queue deadlocks on Windows. Returns the
-        extracted text, empty string on failure, or _EXTRACTION_TIMEOUT
-        sentinel on timeout.
+        Returns the whole document rather than its text: how long the source
+        is and whether the page cap cut it short are the parser's to report,
+        and a caller that has to re-derive them gets a second source of truth
+        (#448).
         """
-        from concurrent.futures import TimeoutError as FuturesTimeout
-
-        # Page limit (preserve existing fallback chain)
-        if isinstance(self.pdf_max_pages, int) and self.pdf_max_pages > 0:
-            maxpages = self.pdf_max_pages
-        else:
-            try:
-                maxpages = int(os.getenv("ZOTERO_PDF_MAXPAGES") or DEFAULT_PDF_MAX_PAGES)
-            except ValueError:
-                maxpages = DEFAULT_PDF_MAX_PAGES
-
-        timeout = self.pdf_timeout or 30
-
-        try:
-            pool = self._get_pdf_pool()
-            future = pool.submit(_extract_pdf_worker, str(file_path), maxpages)
-            text = future.result(timeout=timeout)
-            return text or ""
-        except FuturesTimeout:
-            logger.warning(f"PDF extraction timed out after {timeout}s: {file_path.name}")
-            # The worker is stuck; kill the pool so the next call gets a fresh one.
-            self._shutdown_pdf_pool(kill=True)
-            return _EXTRACTION_TIMEOUT
-        except Exception as e:
-            logger.warning(f"PDF extraction failed: {file_path.name}: {e}")
-            return ""
-
-    def _extract_text_from_file(self, file_path: Path) -> str:
-        """Extract text from an attachment file, or "" if nothing readable.
-
-        PDFs go through a timeout-protected worker process (see
-        :meth:`_extract_text_from_pdf`); other formats use the in-process
-        ``extract_file`` dispatcher.
-        """
-        if file_path.suffix.lower() == ".pdf":
-            return self._extract_text_from_pdf(file_path)
-        doc = extract_file(file_path, max_pages=self._resolve_pdf_max_pages())
-        return doc.text if doc else ""
+        return extract_file(
+            file_path,
+            max_pages=self._resolve_pdf_max_pages(),
+            reuse=self.reuse_pdf_parse,
+        )
 
     def _get_fulltext_meta_for_item(self, item_id: int):
         meta = []
@@ -978,30 +1440,22 @@ class LocalZoteroReader:
         return max(candidates, key=lambda p: p.stat().st_size)
 
     def _find_content_list_json(self, resolved_path: Path) -> Path | None:
-        """Find MinerU content_list.json file in the attachment folder.
+        """Find a MinerU ``content_list.json`` beside an attachment file.
 
-        Looks for files matching patterns:
-        - content_list.json
-        - *_content_list.json (MinerU standard naming)
-
-        Args:
-            resolved_path: The resolved attachment file path
-
-        Returns:
-            Path to content_list.json if found, None otherwise
+        Looks for MinerU's document-specific ``*_content_list.json`` first, then
+        the generic ``content_list.json`` fallback.
         """
         if not resolved_path.exists():
             return None
 
         parent_dir = resolved_path.parent
         try:
-            # Prefer MinerU's document-specific standard name over the generic
-            # fallback, and sort so multiple outputs resolve deterministically.
             named_outputs = sorted(
                 (
                     candidate
                     for candidate in parent_dir.iterdir()
-                    if candidate.is_file() and candidate.name.endswith("_content_list.json")
+                    if candidate.is_file()
+                    and candidate.name.endswith("_content_list.json")
                 ),
                 key=lambda candidate: candidate.name.casefold(),
             )
@@ -1032,29 +1486,24 @@ class LocalZoteroReader:
     def _extract_text_from_mineru_block(self, block) -> str:
         """Extract text from a single MinerU content_list.json block.
 
-        A block has 'type' (paragraph, title, equation_interline, etc.) and
-        'content' which is a dict like:
-            {"paragraph_content": [{"type": "text", "content": "..."}]}
-
-        Also handles the flat format where text is directly in block['text'].
+        A block has ``type`` (paragraph, title, equation_interline, ...) and
+        ``content``, a dict such as
+        ``{"paragraph_content": [{"type": "text", "content": "..."}]}``. The
+        flat format with text directly under ``block['text']`` is also handled.
         """
         if not isinstance(block, dict):
             return ""
 
-        # Skip non-text block types (headers, footers, page numbers)
         block_type = block.get("type", "")
         if block_type in ("page_header", "page_footer", "page_number"):
             return ""
 
-        # Format 1: nested content dict (MinerU pages format)
         content = block.get("content")
         if isinstance(content, dict):
-            # Equation blocks: {"math_content": "LaTeX", "math_type": "latex"}
             math = content.get("math_content")
             if isinstance(math, str) and math.strip():
                 return f"$$ {math.strip()} $$"
 
-            # Text blocks: {"paragraph_content": [{"type": "text", "content": "..."}]}
             for key, spans in content.items():
                 if key in ("level", "math_type", "image_source"):
                     continue
@@ -1068,7 +1517,6 @@ class LocalZoteroReader:
                     if parts:
                         return " ".join(parts)
 
-        # Format 2: flat format with 'text' key
         text = block.get("text", "")
         if isinstance(text, str) and text.strip():
             return text.strip()
@@ -1076,63 +1524,40 @@ class LocalZoteroReader:
         return ""
 
     def _extract_text_from_content_list_json(self, json_path: Path) -> str:
-        """Extract text content from MinerU content_list.json format.
+        """Extract text from a MinerU ``content_list.json`` file.
 
-        Supports multiple MinerU output formats:
-
-        1. Nested pages format (list of lists):
-           Each top-level item is a page (list of blocks). Each block is a dict
-           with 'type' (e.g. 'paragraph', 'title'), 'content' (a dict whose
-           single key like 'paragraph_content' maps to a list of text spans),
-           and 'bbox'.
-
-        2. Flat list of dicts with 'text' key:
-           [{"text": "...", "type": "text", ...}, ...]
-
-        3. Dict wrapper with 'content' or 'data' key containing a list.
-
-        Args:
-            json_path: Path to the content_list.json file
-
-        Returns:
-            Extracted text content, or empty string on failure
+        Supports the nested pages format (list of lists), the flat list of
+        blocks, and a dict wrapper with ``content``/``data``.
         """
         try:
             with open(json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            # Handle root-level list format (MinerU standard)
             if isinstance(data, list):
                 content_list = data
             else:
-                # Handle dict format with 'content' or 'data' key
                 content_list = data.get("content") or data.get("data") or []
 
             if isinstance(content_list, list):
                 text_parts = []
                 for item in content_list:
                     if isinstance(item, list):
-                        # Nested pages format: each item is a page (list of blocks)
                         for block in item:
                             text = self._extract_text_from_mineru_block(block)
                             if text:
                                 text_parts.append(text)
                     elif isinstance(item, dict):
-                        # Could be a block directly (single-page) or flat format
                         text = self._extract_text_from_mineru_block(item)
                         if text:
                             text_parts.append(text)
                     elif isinstance(item, str):
-                        # Simple list format
                         if item.strip():
                             text_parts.append(item.strip())
 
                 if text_parts:
                     return "\n\n".join(text_parts)
 
-            # Fallback: try to extract any text-like content from dict
             if isinstance(data, dict):
-                # Look for any text content in the dict
                 for key in ["text", "content", "fulltext", "body"]:
                     if key in data and isinstance(data[key], str):
                         return data[key]
@@ -1141,6 +1566,14 @@ class LocalZoteroReader:
         except Exception as e:
             logger.warning(f"Failed to extract text from content_list.json: {e}")
             return ""
+
+    def has_content_list_json(self, item_id: int) -> bool:
+        """True if the item has a MinerU ``content_list.json`` sidecar."""
+        return self._get_content_list_json_path(item_id) is not None
+
+    def get_content_list_json_path(self, item_id: int) -> Path | None:
+        """Path to the item's MinerU ``content_list.json``, or None."""
+        return self._get_content_list_json_path(item_id)
 
     def _resolve_extraction_target(self, item_id: int) -> tuple[Path, str] | None:
         """Pick the attachment to extract for an item, by configured priority.
@@ -1256,73 +1689,90 @@ class LocalZoteroReader:
                 return result
         return None
 
-    def _extract_fulltext_for_item(
+    def extract_fulltext_detailed(
         self, item_id: int, item_key: str | None = None
-    ) -> tuple[str, str] | None:
-        """Attempt to extract fulltext and source from the item's best attachment.
+    ) -> FulltextExtraction | None:
+        """Extract fulltext from the item's best attachment, with page limits.
 
-        Preference order:
+        Preference order (this fork prefers fast / structured sources first):
         1. MinerU ``content_list.json`` alongside the attachment — source
-           ``"content_list_json"`` (highest quality structured text).
-        2. ``.zotero-ft-cache`` — source ``"zotero-cache"`` (Zotero's
-           pre-built pdftotext index; fast, avoids slow PDF extraction).
+           ``"content_list_json"`` (highest-quality structured text).
+        2. The transient fulltext cache, then ``.zotero-ft-cache`` — source
+           ``"zotero-cache"`` (Zotero's pre-built pdftotext index; fast, and
+           avoids slow PDF extraction).
         3. Our own extraction of the best attachment on disk, chosen by
            ``attachment_priority`` — source ``"pdf"``, ``"html"`` or
-           ``"file"``. A PDF that exceeds ``pdf_timeout`` yields no text
-           rather than a sentinel.
+           ``"file"``.
 
-        Our parser goes last because it is the slowest path and is only
-        needed when the cache cannot serve the item: attachments whose
-        file won't resolve, formats we don't read (EPUB), and files that fail
-        to parse.
+        Upstream parses first because that is the only path that yields heading
+        structure and the page separators chunk provenance needs; this fork
+        prefers the caches above it for speed, and falls back to the parser when
+        neither can serve the item (attachments whose file won't resolve,
+        formats we don't read (EPUB), and files that fail to parse).
 
         If the sqlite-recorded filename doesn't resolve on disk, scan the
         attachment's storage folder for a content-type-matching file before
         giving up (#291, #265).
-        """
-        chosen = self._resolve_extraction_target(item_id)
 
+        ``page_count`` and ``truncated`` are whatever the parser reported, so
+        they are set on that path alone: both caches store flat text with no
+        page bookkeeping, and neither is page-capped to begin with (#448).
+        """
         # 0. MinerU content_list.json, when present, is the highest-quality source.
         best_content_list_json = self._get_content_list_json_path(item_id)
         if best_content_list_json:
             text = self._extract_text_from_content_list_json(best_content_list_json)
             if text:
-                logger.info(f"Using content_list.json for item {item_id}: {best_content_list_json}")
-                return (text, "content_list_json")
+                logger.info(
+                    f"Using content_list.json for item {item_id}: {best_content_list_json}"
+                )
+                return FulltextExtraction(text, "content_list_json")
 
+        chosen = self._resolve_extraction_target(item_id)
+
+        # 1. Best attachment by the configured priority.
         if chosen:
             target, attachment_key = chosen
 
-            # 1. Transient cache lookup.
+            # 1a. Transient cache lookup.
             hit = self._cache_lookup(target, attachment_key)
             if hit:
-                return hit
+                return FulltextExtraction(*hit)
 
-            # 2. Zotero's own .zotero-ft-cache for the chosen attachment
-            #    (fast, pre-built by Zotero's pdftotext; avoids slow PDF extraction).
+            # 1b. Zotero's own .zotero-ft-cache for the chosen attachment
+            #     (fast, pre-built by Zotero's pdftotext; avoids slow PDF extraction).
             cached = self._read_zotero_ft_cache(attachment_key)
             if cached:
                 self._cache_store(target, attachment_key, item_key, cached, "zotero-cache")
-                return (cached, "zotero-cache")
+                return FulltextExtraction(cached, "zotero-cache")
 
-            # 3. PDF/HTML extraction from the chosen attachment (slowest path).
-            text = self._extract_text_from_file(target)
-            if text and text != _EXTRACTION_TIMEOUT:
+            # 1c. Our own extraction of the chosen attachment (slowest path).
+            doc = self._extract_doc_from_file(target)
+            if doc:
                 source = _source_for_path(target)
-                self._cache_store(target, attachment_key, item_key, text, source)
-                return (text, source)
+                self._cache_store(target, attachment_key, item_key, doc.text, source)
+                return FulltextExtraction(
+                    doc.text, source, doc.page_count, doc.truncated
+                )
 
-        # 4. Zotero's own .zotero-ft-cache for any other attachment (fallback).
-        return self._zotero_ft_cache_fallback(item_id, chosen, item_key)
+        # 2. Zotero's own cache, for whatever the above could not read.
+        cached = self._zotero_ft_cache_fallback(item_id, chosen, item_key)
+        return FulltextExtraction(*cached) if cached else None
 
-        return None
+    def _extract_fulltext_for_item(
+        self, item_id: int, item_key: str | None = None
+    ) -> tuple[str, str] | None:
+        """``extract_fulltext_detailed`` as the ``(text, source)`` pair that the
+        indexing paths consume."""
+        extraction = self.extract_fulltext_detailed(item_id, item_key)
+        return (extraction.text, extraction.source) if extraction else None
 
     def close(self):
-        """Close database connection and worker pool."""
-        self._shutdown_pdf_pool()
+        """Close database connection."""
         if self._connection:
             self._connection.close()
             self._connection = None
+        self._scan_choice = {}
 
     def __enter__(self):
         return self
@@ -1410,19 +1860,13 @@ class LocalZoteroReader:
             FROM feedItems fi
             JOIN items i ON fi.itemID = i.itemID
             JOIN itemTypes it ON i.itemTypeID = it.itemTypeID
-            LEFT JOIN itemData title_data ON i.itemID = title_data.itemID AND title_data.fieldID = 1
-            LEFT JOIN itemDataValues title_val ON title_data.valueID = title_val.valueID
-            LEFT JOIN itemData abstract_data ON i.itemID = abstract_data.itemID AND abstract_data.fieldID = 2
-            LEFT JOIN itemDataValues abstract_val ON abstract_data.valueID = abstract_val.valueID
-            LEFT JOIN fields date_f ON date_f.fieldName = 'date'
-            LEFT JOIN itemData date_data ON i.itemID = date_data.itemID AND date_data.fieldID = date_f.fieldID
-            LEFT JOIN itemDataValues date_val ON date_data.valueID = date_val.valueID
-            LEFT JOIN fields doi_f ON doi_f.fieldName = 'DOI'
-            LEFT JOIN itemData doi_data ON i.itemID = doi_data.itemID AND doi_data.fieldID = doi_f.fieldID
-            LEFT JOIN itemDataValues doi_val ON doi_data.valueID = doi_val.valueID
-            LEFT JOIN fields url_f ON url_f.fieldName = 'url'
-            LEFT JOIN itemData url_data ON i.itemID = url_data.itemID AND url_data.fieldID = url_f.fieldID
-            LEFT JOIN itemDataValues url_val ON url_data.valueID = url_val.valueID
+            """
+            + _base_field_resolved_join("title", "title")
+            + _plain_field_join("abstract", "abstractNote")
+            + _base_field_resolved_join("date", "date")
+            + _plain_field_join("doi", "DOI")
+            + _plain_field_join("url", "url")
+            + """
             LEFT JOIN itemCreators ic ON i.itemID = ic.itemID
             LEFT JOIN creators c ON ic.creatorID = c.creatorID
             WHERE i.libraryID = ?
@@ -1458,8 +1902,9 @@ class LocalZoteroReader:
         Get the keys of every item in the database, regardless of type.
 
         Used to verify that the sqlite snapshot is not lagging behind the
-        Zotero API (an `immutable=1` read cannot see rows that are still
-        in an un-checkpointed WAL file).
+        Zotero API. Reads normally include the WAL (see
+        ``_wal_snapshot_path``), but fall back to an in-place ``immutable=1``
+        read that cannot see un-checkpointed rows when a copy is not possible.
         """
         conn = self._get_connection()
         rows = conn.execute("SELECT key FROM items").fetchall()
@@ -1526,7 +1971,8 @@ class LocalZoteroReader:
         conn = self._get_connection()
 
         # Query to get items with their text content (simplified for now)
-        query = """
+        query = (
+            """
         SELECT
             i.itemID,
             i.key,
@@ -1550,24 +1996,15 @@ class LocalZoteroReader:
             ) as creators
         FROM items i
         JOIN itemTypes it ON i.itemTypeID = it.itemTypeID
-
-        -- Get title
-        LEFT JOIN itemData title_data ON i.itemID = title_data.itemID AND title_data.fieldID = 1
-        LEFT JOIN itemDataValues title_val ON title_data.valueID = title_val.valueID
-
-        -- Get abstract
-        LEFT JOIN itemData abstract_data ON i.itemID = abstract_data.itemID AND abstract_data.fieldID = 2
-        LEFT JOIN itemDataValues abstract_val ON abstract_data.valueID = abstract_val.valueID
-
-        -- Get extra field
-        LEFT JOIN itemData extra_data ON i.itemID = extra_data.itemID AND extra_data.fieldID = 16
-        LEFT JOIN itemDataValues extra_val ON extra_data.valueID = extra_val.valueID
-
-        -- Get DOI field via fields table
-        LEFT JOIN fields doi_f ON doi_f.fieldName = 'DOI'
-        LEFT JOIN itemData doi_data ON i.itemID = doi_data.itemID AND doi_data.fieldID = doi_f.fieldID
-        LEFT JOIN itemDataValues doi_val ON doi_data.valueID = doi_val.valueID
-
+        """
+            # Title resolves per item type (#570): a case/statute/email
+            # indexed through a hardcoded fieldID 1 got an empty title AND an
+            # empty abstract, making it invisible to semantic search.
+            + _base_field_resolved_join("title", "title")
+            + _plain_field_join("abstract", "abstractNote")
+            + _plain_field_join("extra", "extra")
+            + _plain_field_join("doi", "DOI")
+            + """
         -- Get notes
         LEFT JOIN itemNotes n ON i.itemID = n.parentItemID OR i.itemID = n.itemID
 
@@ -1578,6 +2015,7 @@ class LocalZoteroReader:
         WHERE it.typeName NOT IN ('attachment', 'note', 'annotation')
         AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
         """
+        )
 
         params = []
         if collection_keys:
@@ -1696,6 +2134,14 @@ class LocalZoteroReader:
             max_workers=self.extraction_workers, initializer=_init_extraction_worker
         ) as pool:
             for item_id, item_key in items:
+                # MinerU content_list.json outranks every parser path; resolve
+                # it here so the pool is never asked to parse such an item.
+                mineru_path = self._get_content_list_json_path(item_id)
+                if mineru_path:
+                    mineru_text = self._extract_text_from_content_list_json(mineru_path)
+                    if mineru_text:
+                        yield item_id, (mineru_text, "content_list_json")
+                        continue
                 chosen = self._resolve_extraction_target(item_id)
                 if not chosen:
                     deferred.append((item_id, item_key, None))
@@ -1759,28 +2205,6 @@ class LocalZoteroReader:
         for item_id, item_key, chosen in deferred:
             yield item_id, self._zotero_ft_cache_fallback(item_id, chosen, item_key)
 
-    def has_content_list_json(self, item_id: int) -> bool:
-        """Check if the item has a MinerU content_list.json file.
-
-        Args:
-            item_id: The Zotero item ID
-
-        Returns:
-            True if content_list.json exists, False otherwise
-        """
-        return self._get_content_list_json_path(item_id) is not None
-
-    def get_content_list_json_path(self, item_id: int) -> Path | None:
-        """Get the path to MinerU content_list.json for an item.
-
-        Args:
-            item_id: The Zotero item ID
-
-        Returns:
-            Path to content_list.json if found, None otherwise
-        """
-        return self._get_content_list_json_path(item_id)
-
     def get_attachment_paths(self, parent_key: str) -> list[dict]:
         """Return resolved filesystem paths for a parent item's attachments.
 
@@ -1802,6 +2226,21 @@ class LocalZoteroReader:
                 "exists": bool(resolved and resolved.exists()),
             })
         return out
+
+    def resolve_attachment_file(self, attachment_key: str) -> Path | None:
+        """The file on disk for an attachment addressed by its own key, or None.
+
+        Resolves the stored path, and scans the attachment's storage folder
+        when the recorded filename no longer matches the file (#291). None
+        when the key is not a live attachment or its file is not on disk.
+        """
+        attachment = self.get_attachment_by_key(attachment_key)
+        if attachment is None:
+            return None
+        resolved = self._resolve_attachment_path(attachment_key, attachment["zotero_path"] or "")
+        if not (resolved and resolved.exists()):
+            resolved = self._scan_storage_for_attachment(attachment_key, attachment["content_type"])
+        return resolved if resolved and resolved.exists() else None
 
     def get_attachment_by_key(self, attachment_key: str) -> dict | None:
         """Return the attachment row addressed by its OWN key.
@@ -1827,10 +2266,12 @@ class LocalZoteroReader:
             FROM itemAttachments ia
             JOIN items att ON att.itemID = ia.itemID
             LEFT JOIN items parent ON parent.itemID = ia.parentItemID
-            LEFT JOIN itemData title_data
-                ON title_data.itemID = att.itemID AND title_data.fieldID = 1
-            LEFT JOIN itemDataValues title_val
-                ON title_data.valueID = title_val.valueID
+            """
+            # An attachment's own title: `attachment` has no base-field
+            # mapping, so this resolves by name rather than through the
+            # mapping lookup — but still never by a literal fieldID.
+            + _plain_field_join("title", "title", item_alias="att")
+            + """
             WHERE att.key = ?
             AND att.itemID NOT IN (SELECT itemID FROM deletedItems)
             """,
@@ -1884,27 +2325,46 @@ class LocalZoteroReader:
 
         return matching_items
 
-    def search_notes_local(self, query: str, limit: int = 20) -> list[dict]:
-        """Search notes in the local Zotero database by text content."""
+    def search_notes_local(
+        self, query: str, limit: int = 20, group_id: int | None = None
+    ) -> list[dict] | None:
+        """Search notes in the local Zotero database by text content.
+
+        Scoped like the other local searches: ``group_id`` 0 is the personal
+        library, a groupID one group, None every user/group library. Returns
+        None when the requested library isn't in this database.
+        """
+        lib_ids = self._resolve_scope_library_ids(group_id)
+        if lib_ids is None:
+            return None
+        lib_placeholders = ",".join("?" * len(lib_ids))
         conn = self._get_connection()
         cursor = conn.cursor()
         pattern = f"%{query}%"
         cursor.execute("""
             SELECT i.key, n.note, n.title,
                    pi.key as parentKey,
-                   pdv.value as parentTitle
+                   ptitle_val.value as parentTitle
             FROM itemNotes n
             JOIN items i ON n.itemID = i.itemID
             LEFT JOIN items pi ON n.parentItemID = pi.itemID
-            LEFT JOIN itemData pd ON pi.itemID = pd.itemID AND pd.fieldID = 1
-            LEFT JOIN itemDataValues pdv ON pd.valueID = pdv.valueID
+            """
+            # The parent is any regular item type, so its title resolves per
+            # type (#570) — a note filed under a case rendered "Unknown".
+            + _base_field_resolved_join("ptitle", "title", item_alias="pi")
+            + """
             WHERE n.note LIKE ?
+            AND i.libraryID IN (""" + lib_placeholders + """)
             AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
-            LIMIT ?
-        """, (pattern, limit))
+        """, (pattern, *lib_ids))
 
+        # The limit applies after the clean-text filter below: an SQL LIMIT
+        # let markup-only hits (e.g. "zotero" inside Zotero 7 citation URIs)
+        # use up the budget and hide real matches.
         results = []
-        for row in cursor.fetchall():
+        for row in cursor:
+            if len(results) >= limit:
+                break
             note_html = row[1] or ""
             # Post-filter: skip if query only matches HTML tags, not content
             from zotero_mcp.utils import clean_html
@@ -1921,8 +2381,17 @@ class LocalZoteroReader:
             })
         return results
 
-    def search_annotations_local(self, query: str, limit: int = 20) -> list[dict]:
-        """Search annotations in the local Zotero database by text or comment."""
+    def search_annotations_local(
+        self, query: str, limit: int = 20, group_id: int | None = None
+    ) -> list[dict] | None:
+        """Search annotations in the local Zotero database by text or comment.
+
+        ``group_id`` scopes the search exactly as in ``search_notes_local``.
+        """
+        lib_ids = self._resolve_scope_library_ids(group_id)
+        if lib_ids is None:
+            return None
+        lib_placeholders = ",".join("?" * len(lib_ids))
         conn = self._get_connection()
         cursor = conn.cursor()
         pattern = f"%{query}%"
@@ -1931,18 +2400,21 @@ class LocalZoteroReader:
             SELECT i.key, ia.text, ia.comment, ia.type, ia.color, ia.pageLabel,
                    att.key as attachmentKey,
                    gpi.key as parentKey,
-                   gpdv.value as parentTitle
+                   gptitle_val.value as parentTitle
             FROM itemAnnotations ia
             JOIN items i ON ia.itemID = i.itemID
             LEFT JOIN items att ON ia.parentItemID = att.itemID
             LEFT JOIN itemAttachments iatt ON ia.parentItemID = iatt.itemID
             LEFT JOIN items gpi ON iatt.parentItemID = gpi.itemID
-            LEFT JOIN itemData gpd ON gpi.itemID = gpd.itemID AND gpd.fieldID = 1
-            LEFT JOIN itemDataValues gpdv ON gpd.valueID = gpdv.valueID
+            """
+            # Same as search_notes_local, one hop further out (#570).
+            + _base_field_resolved_join("gptitle", "title", item_alias="gpi")
+            + """
             WHERE (ia.text LIKE ? OR ia.comment LIKE ?)
+            AND i.libraryID IN (""" + lib_placeholders + """)
             AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
             LIMIT ?
-        """, (pattern, pattern, limit))
+        """, (pattern, pattern, *lib_ids, limit))
 
         # Map integer annotation types to names
         type_map = {1: "highlight", 2: "note", 3: "image", 4: "ink", 5: "underline"}
@@ -2157,7 +2629,30 @@ class LocalZoteroReader:
         resolved = _CONDITION_FIELD_ALIASES.get(field_lower, field)
         if resolved in _SIMPLE_FIELD_SQL:
             return _scalar_condition(_SIMPLE_FIELD_SQL[resolved], operation, value)
+        # Any other real Zotero field (extra, publisher, volume, ISBN, url, ...).
+        # The name must be a row of the `fields` table, matched exactly as the
+        # client-side path matches it; it is bound, never interpolated. A name
+        # the database does not know stays unsupported, so the caller keeps
+        # its existing fallback for it.
+        #
+        # Ordering operators stay on the fallback: `compare` orders numerically
+        # when both sides parse as numbers (volume > 9 holds for "12"), while
+        # SQL would order the stored text ("12" < "9"). Date, year, dateAdded
+        # and dateModified have SQL forms of their own, above.
+        if (
+            resolved in self._known_field_names()
+            and operation not in _semantics.RANGE_OPS
+        ):
+            sql, params = _scalar_condition(_resolved_field_subquery(), operation, value)
+            return sql, [resolved, resolved, *params]
         return None
+
+    def _known_field_names(self) -> frozenset[str]:
+        """Names in the database's `fields` table (cached per reader)."""
+        if self._field_names is None:
+            rows = self._get_connection().execute("SELECT fieldName FROM fields").fetchall()
+            self._field_names = frozenset(r[0] for r in rows)
+        return self._field_names
 
     def _fetch_creators(self, conn: sqlite3.Connection, item_ids: list[int]) -> dict[int, list[dict]]:
         if not item_ids:
@@ -2191,7 +2686,7 @@ class LocalZoteroReader:
         placeholders = ",".join("?" * len(item_ids))
         rows = conn.execute(
             f"""
-            SELECT itg.itemID, t.name
+            SELECT itg.itemID, t.name, itg.type
             FROM itemTags itg
             JOIN tags t ON itg.tagID = t.tagID
             WHERE itg.itemID IN ({placeholders})
@@ -2200,7 +2695,12 @@ class LocalZoteroReader:
         ).fetchall()
         result: dict[int, list[dict]] = {}
         for row in rows:
-            result.setdefault(row["itemID"], []).append({"tag": row["name"]})
+            # As Zotero's API does: "type": 1 marks an automatic tag, and the
+            # key is left out for a manual one.
+            tag = {"tag": row["name"]}
+            if row["type"]:
+                tag["type"] = row["type"]
+            result.setdefault(row["itemID"], []).append(tag)
         return result
 
     def _hydrate_rows(self, conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[dict]:
@@ -2253,6 +2753,8 @@ class LocalZoteroReader:
         tag: list[str] | None = None,
         limit: int = 10,
         group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
+        collection_keys: list[str] | None = None,
+        include_subcollections: bool = False,
     ) -> list[dict] | None:
         """#167 SQLite metadata search backend for zotero_search_items.
 
@@ -2273,6 +2775,36 @@ class LocalZoteroReader:
         lib_ids = self._resolve_scope_library_ids(group_id)
         if lib_ids is None:
             return None
+
+        collection_sql = ""
+        collection_params: list = []
+        if collection_keys:
+            # Scoping in SQL rather than by intersecting a separately-limited
+            # result set: the limit then still means "this many matches in
+            # this collection", which a post-filter cannot promise.
+            collection_ids: list[int] = []
+            seen_ids: set[int] = set()
+            for collection_key in collection_keys:
+                if include_subcollections:
+                    collection_ids.extend(
+                        self._resolve_collection_ids(conn, collection_key, seen_ids)
+                    )
+                else:
+                    # `_resolve_collection_ids` always walks descendants, so
+                    # the singular lookup is the one that means "this
+                    # collection only".
+                    own_id = self._resolve_collection_id(conn, collection_key)
+                    if own_id is not None and own_id not in seen_ids:
+                        seen_ids.add(own_id)
+                        collection_ids.append(own_id)
+            if not collection_ids:
+                return []
+            id_placeholders = ",".join("?" * len(collection_ids))
+            collection_sql = (
+                f" AND i.itemID IN (SELECT itemID FROM collectionItems"
+                f" WHERE collectionID IN ({id_placeholders}))"
+            )
+            collection_params = collection_ids
 
         tag_sql = ""
         tag_params: list = []
@@ -2296,46 +2828,63 @@ class LocalZoteroReader:
                 return None  # boolean itemType expressions ("a || b") unsupported
 
         variants = _generate_search_variants(query)
-        if not variants:
-            return None
         like_clauses: list[str] = []
         like_params: list = []
-        for variant in variants:
-            # Escaped, but deliberately not zsearch_norm-folded: this free-text
-            # path matches by OR-ing _generate_search_variants, which also
-            # covers dash/space and umlaut *expansion* (Müller -> Mueller) that
-            # normalize() does not do. Folding here as well would over-match
-            # relative to the pyzotero path.
+        if not variants:
+            # A blank query is a *filter-only* search — "every item carrying
+            # this tag" — which is exactly what zotero_search_by_tag asks for
+            # and which this backend can answer perfectly well. It is only
+            # unanswerable with nothing else to filter on, since that would
+            # quietly mean "return the whole library".
+            if not (tag or item_type):
+                return None
+        # Both sides are folded through zsearch_norm, as in advanced search:
+        # Zotero's own quick search (the pyzotero path) matches "indice",
+        # "índice" and "Índice" alike, while SQLite's LIKE folds ASCII case
+        # only. The variants still add what normalize() does not do, such as
+        # dash/space swaps and umlaut expansion (Müller -> Mueller).
+        folded = list(dict.fromkeys(_semantics.normalize(v) for v in variants))
+        # A query unidecode drops entirely (an emoji) folds to "", and
+        # LIKE '%%' would match every item.
+        folded = [v for v in folded if v.strip()]
+        if variants and not folded:
+            return []
+        norm = _semantics.SQLITE_NORM_FUNCTION
+        for variant in folded:
             pattern = f"%{_semantics.escape_like(variant)}%"
-            like_clauses.append("title_val.value LIKE ? ESCAPE '\\'")
+            like_clauses.append(f"{norm}(title_val.value) LIKE ? ESCAPE '\\'")
             like_params.append(pattern)
             like_clauses.append("date_val.value LIKE ? ESCAPE '\\'")
             like_params.append(pattern)
             like_clauses.append(
                 f"EXISTS (SELECT 1 FROM itemCreators ic JOIN creators c ON ic.creatorID = c.creatorID "
-                f"WHERE ic.itemID = i.itemID AND {_CREATOR_NAME_EXPR} LIKE ? ESCAPE '\\')"
+                f"WHERE ic.itemID = i.itemID AND {norm}({_CREATOR_NAME_EXPR}) LIKE ? ESCAPE '\\')"
             )
             like_params.append(pattern)
             if qmode == "everything":
-                like_clauses.append("abstract_val.value LIKE ? ESCAPE '\\'")
+                like_clauses.append(f"{norm}(abstract_val.value) LIKE ? ESCAPE '\\'")
                 like_params.append(pattern)
                 like_clauses.append(
                     "EXISTS (SELECT 1 FROM itemTags itg JOIN tags t ON itg.tagID = t.tagID "
-                    "WHERE itg.itemID = i.itemID AND t.name LIKE ? ESCAPE '\\')"
+                    f"WHERE itg.itemID = i.itemID AND {norm}(t.name) LIKE ? ESCAPE '\\')"
                 )
                 like_params.append(pattern)
                 like_clauses.append(
                     "EXISTS (SELECT 1 FROM itemNotes n WHERE "
-                    "(n.parentItemID = i.itemID OR n.itemID = i.itemID) AND n.note LIKE ? ESCAPE '\\')"
+                    f"(n.parentItemID = i.itemID OR n.itemID = i.itemID) AND {norm}(n.note) LIKE ? ESCAPE '\\')"
                 )
                 like_params.append(pattern)
 
+        like_sql = f" AND ({' OR '.join(like_clauses)})" if like_clauses else ""
         query_sql = (
             _item_hydration_select(len(lib_ids))
-            + f" {type_filter_sql} {tag_sql} AND ({' OR '.join(like_clauses)})"
+            + f" {type_filter_sql} {tag_sql}{collection_sql}{like_sql}"
             + " ORDER BY i.dateModified DESC LIMIT ?"
         )
-        params = list(lib_ids) + type_params + tag_params + like_params + [limit]
+        params = (
+            list(lib_ids) + type_params + tag_params + collection_params
+            + like_params + [limit]
+        )
         rows = conn.execute(query_sql, params).fetchall()
         return self._hydrate_rows(conn, rows)
 
@@ -2396,6 +2945,612 @@ class LocalZoteroReader:
         all_params = list(lib_ids) + params
         rows = conn.execute(query_sql, all_params).fetchall()
         return self._hydrate_rows(conn, rows)
+
+
+    # -- full-fidelity readers for the SQLite library backend --------------
+    #
+    # See the module-level note above `_row_to_full_api_item`. Each of these
+    # takes a *collection* of keys and answers in a fixed number of queries;
+    # none of them pages, because there is nothing to page over.
+
+    def _fetch_fields(self, conn: sqlite3.Connection, item_ids: list[int]) -> dict[int, dict[str, str]]:
+        """Every ``itemData`` field of every given item, in one query."""
+        if not item_ids:
+            return {}
+        placeholders = ",".join("?" * len(item_ids))
+        rows = conn.execute(
+            f"""
+            SELECT id.itemID, f.fieldName, idv.value
+            FROM itemData id
+            JOIN itemDataValues idv ON idv.valueID = id.valueID
+            JOIN fields f ON f.fieldID = id.fieldID
+            WHERE id.itemID IN ({placeholders})
+            """,
+            item_ids,
+        ).fetchall()
+        result: dict[int, dict[str, str]] = {}
+        for row in rows:
+            result.setdefault(row["itemID"], {})[row["fieldName"]] = row["value"]
+        return result
+
+    def _fetch_item_collections(self, conn: sqlite3.Connection, item_ids: list[int]) -> dict[int, list[str]]:
+        """Collection keys each given item belongs to, in one query."""
+        if not item_ids:
+            return {}
+        placeholders = ",".join("?" * len(item_ids))
+        rows = conn.execute(
+            f"""
+            SELECT ci.itemID, c.key
+            FROM collectionItems ci
+            JOIN collections c ON c.collectionID = ci.collectionID
+            WHERE ci.itemID IN ({placeholders})
+            """,
+            item_ids,
+        ).fetchall()
+        result: dict[int, list[str]] = {}
+        for row in rows:
+            result.setdefault(row["itemID"], []).append(row["key"])
+        return result
+
+    def _fetch_relations(self, conn: sqlite3.Connection, item_ids: list[int]) -> dict[int, dict[str, object]]:
+        """Relation predicates and objects per item, in one query.
+
+        Shaped exactly as the API shapes them: a lone object is a bare
+        string, several are a list. `zotero_get_item_related` normalises
+        both, but matching the API keeps the two backends comparable.
+        """
+        if not item_ids:
+            return {}
+        placeholders = ",".join("?" * len(item_ids))
+        rows = conn.execute(
+            f"""
+            SELECT ir.itemID, rp.predicate, ir.object
+            FROM itemRelations ir
+            JOIN relationPredicates rp ON rp.predicateID = ir.predicateID
+            WHERE ir.itemID IN ({placeholders})
+            """,
+            item_ids,
+        ).fetchall()
+        gathered: dict[int, dict[str, list[str]]] = {}
+        for row in rows:
+            gathered.setdefault(row["itemID"], {}).setdefault(row["predicate"], []).append(row["object"])
+        return {
+            item_id: {pred: (objs[0] if len(objs) == 1 else objs) for pred, objs in preds.items()}
+            for item_id, preds in gathered.items()
+        }
+
+    _FULL_ITEM_COLUMNS = """
+            SELECT i.itemID, i.key, i.libraryID, i.version, i.dateAdded, i.dateModified,
+                   it.typeName AS itemType,
+                   (del.itemID IS NOT NULL) AS deleted,
+                   parent.key AS parentKey,
+                   ia.linkMode AS linkMode, ia.contentType AS contentType, ia.path AS path,
+                   n.note AS noteBody, n.title AS noteTitle,
+                   ann.type AS annType, ann.text AS annText, ann.comment AS annComment,
+                   ann.color AS annColor, ann.pageLabel AS annPageLabel,
+                   ann.sortIndex AS annSortIndex, ann.position AS annPosition
+            FROM items i
+            JOIN itemTypes it ON it.itemTypeID = i.itemTypeID
+            LEFT JOIN deletedItems del ON del.itemID = i.itemID
+            LEFT JOIN itemAttachments ia ON ia.itemID = i.itemID
+            LEFT JOIN itemNotes n ON n.itemID = i.itemID
+            LEFT JOIN itemAnnotations ann ON ann.itemID = i.itemID
+            LEFT JOIN items parent
+                ON parent.itemID = COALESCE(ia.parentItemID, n.parentItemID, ann.parentItemID)
+    """
+
+    def _build_full_items(self, conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[dict]:
+        """Hydrate `_FULL_ITEM_COLUMNS` rows into complete API-shaped items.
+
+        Five queries total regardless of row count: fields, creators, tags,
+        collection membership, relations.
+        """
+        if not rows:
+            return []
+        item_ids = [row["itemID"] for row in rows]
+        fields = self._fetch_fields(conn, item_ids)
+        creators = self._fetch_creators(conn, item_ids)
+        tags = self._fetch_tags(conn, item_ids)
+        collections = self._fetch_item_collections(conn, item_ids)
+        relations = self._fetch_relations(conn, item_ids)
+        labels = self.get_library_labels()
+        return [
+            _row_to_full_api_item(
+                row,
+                fields.get(row["itemID"], {}),
+                creators.get(row["itemID"], []),
+                tags.get(row["itemID"], []),
+                collections.get(row["itemID"], []),
+                relations.get(row["itemID"], {}),
+                labels.get(row["libraryID"]),
+            )
+            for row in rows
+        ]
+
+    def get_full_items(
+        self,
+        keys: list[str],
+        *,
+        group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
+        include_trashed: bool = True,
+    ) -> dict[str, dict]:
+        """Complete records for `keys`, keyed by item key.
+
+        Trashed items are included by default and carry ``data["deleted"]``:
+        an item lookup by key must still find them — `zotero_get_item_metadata`
+        documents exactly that, and renders a trash status — unlike the list
+        readers below, which exclude them.
+
+        Keys with no matching item in scope are simply absent from the result.
+        """
+        if not keys:
+            return {}
+        conn = self._get_connection()
+        lib_ids = self._resolve_scope_library_ids(group_id)
+        if not lib_ids:
+            return {}
+        lib_ph = ",".join("?" * len(lib_ids))
+        key_ph = ",".join("?" * len(keys))
+        trash_sql = "" if include_trashed else " AND del.itemID IS NULL"
+        rows = conn.execute(
+            self._FULL_ITEM_COLUMNS
+            + f" WHERE i.libraryID IN ({lib_ph}) AND i.key IN ({key_ph}){trash_sql}",
+            list(lib_ids) + list(keys),
+        ).fetchall()
+        return {item["key"]: item for item in self._build_full_items(conn, rows)}
+
+    def get_children_of(
+        self,
+        parent_keys: list[str],
+        *,
+        item_type: str | None = None,
+        group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
+    ) -> dict[str, list[dict]]:
+        """Children of every given parent, keyed by parent key, in one pass.
+
+        The plural signature is the reason this exists: `zot.children()` is
+        one call per parent because each one used to be an HTTP round trip,
+        which over SQLite costs ~3300x a single lookup for a 100-key batch.
+        Parents with no children map to an empty list, so a caller can tell
+        "no children" from "not asked for".
+
+        Child ids come from a UNION over the three side tables rather than
+        from a ``COALESCE(...)`` join on ``items``: the union hits an index
+        on each table's ``parentItemID``, while the COALESCE cannot use one
+        and scans (2.9 ms vs 99.7 ms for 100 parents, measured).
+        """
+        if not parent_keys:
+            return {}
+        conn = self._get_connection()
+        lib_ids = self._resolve_scope_library_ids(group_id)
+        if not lib_ids:
+            return {}
+        lib_ph = ",".join("?" * len(lib_ids))
+        key_ph = ",".join("?" * len(parent_keys))
+
+        parent_ids = {
+            row["itemID"]: row["key"]
+            for row in conn.execute(
+                f"SELECT itemID, key FROM items"
+                f" WHERE libraryID IN ({lib_ph}) AND key IN ({key_ph})",
+                list(lib_ids) + list(parent_keys),
+            ).fetchall()
+        }
+        result: dict[str, list[dict]] = {key: [] for key in parent_keys}
+        if not parent_ids:
+            return result
+
+        pid_ph = ",".join("?" * len(parent_ids))
+        pids = list(parent_ids)
+        links = conn.execute(
+            f"""
+            SELECT itemID, parentItemID FROM itemAttachments WHERE parentItemID IN ({pid_ph})
+            UNION ALL
+            SELECT itemID, parentItemID FROM itemNotes WHERE parentItemID IN ({pid_ph})
+            UNION ALL
+            SELECT itemID, parentItemID FROM itemAnnotations WHERE parentItemID IN ({pid_ph})
+            """,
+            pids * 3,
+        ).fetchall()
+        if not links:
+            return result
+
+        parent_of = {row["itemID"]: row["parentItemID"] for row in links}
+        child_ph = ",".join("?" * len(parent_of))
+        type_sql, type_params = "", []
+        if item_type:
+            type_sql = " AND it.typeName = ?"
+            type_params = [item_type]
+        rows = conn.execute(
+            self._FULL_ITEM_COLUMNS
+            + f""" WHERE i.itemID IN ({child_ph})
+                   AND del.itemID IS NULL{type_sql}
+                   ORDER BY i.itemID""",
+            list(parent_of) + type_params,
+        ).fetchall()
+        for row, item in zip(rows, self._build_full_items(conn, rows)):
+            parent_key = parent_ids.get(parent_of.get(row["itemID"]))
+            if parent_key is not None:
+                result[parent_key].append(item)
+        return result
+
+    def list_items_of_type(
+        self,
+        item_type: str | None = None,
+        *,
+        limit: int = 100,
+        group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
+        tag: list[str] | None = None,
+    ) -> list[dict] | None:
+        """Items of one type across the library, fully hydrated.
+
+        Serves the library-wide listings (`itemType="annotation"`,
+        `"note"`, `"-attachment"`) that several tools walk. Full hydration
+        matters here rather than the search projection: annotation records
+        carry their text and comment in a side table, and a caller
+        digesting them needs those fields.
+
+        Returns None when the tag filter uses a shape this backend cannot
+        express, so the caller can fall back.
+        """
+        conn = self._get_connection()
+        lib_ids = self._resolve_scope_library_ids(group_id)
+        if not lib_ids:
+            return []
+        lib_ph = ",".join("?" * len(lib_ids))
+
+        type_sql, type_params = "", []
+        if item_type:
+            if item_type.startswith("-") and item_type.count("-") == 1 and "||" not in item_type:
+                type_sql = " AND it.typeName != ?"
+                type_params = [item_type[1:]]
+            elif re.fullmatch(r"[A-Za-z]+", item_type):
+                type_sql = " AND it.typeName = ?"
+                type_params = [item_type]
+            else:
+                return None
+
+        tag_sql, tag_params = "", []
+        if tag:
+            built = _tag_dsl_condition(tag)
+            if built is None:
+                return None
+            tag_clause, tag_params = built
+            tag_sql = f" AND {tag_clause}"
+
+        rows = conn.execute(
+            self._FULL_ITEM_COLUMNS
+            + f""" WHERE i.libraryID IN ({lib_ph})
+                   AND del.itemID IS NULL{type_sql}{tag_sql}
+                   ORDER BY i.dateModified DESC LIMIT ?""",
+            list(lib_ids) + type_params + tag_params + [limit],
+        ).fetchall()
+        return self._build_full_items(conn, rows)
+
+    def find_by_citation_key(
+        self,
+        citekey: str,
+        *,
+        group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
+    ) -> dict | None:
+        """The item owning `citekey`, matched exactly.
+
+        Zotero 7 stores the key in a real ``citationKey`` field, so this is
+        an indexed equality match rather than the ranked substring search
+        the API path had to use. Older items keep it as a ``Citation Key:``
+        line inside ``extra``; those are checked second, which is why the
+        pattern match is only reached when the field lookup misses.
+        """
+        conn = self._get_connection()
+        lib_ids = self._resolve_scope_library_ids(group_id)
+        if not lib_ids:
+            return None
+        lib_ph = ",".join("?" * len(lib_ids))
+
+        row = conn.execute(
+            self._FULL_ITEM_COLUMNS
+            + f""" JOIN itemData ck_data ON ck_data.itemID = i.itemID
+                   JOIN fields ck_f
+                       ON ck_f.fieldID = ck_data.fieldID AND ck_f.fieldName = 'citationKey'
+                   JOIN itemDataValues ck_v ON ck_v.valueID = ck_data.valueID
+                   WHERE i.libraryID IN ({lib_ph})
+                   AND del.itemID IS NULL
+                   AND ck_v.value = ?
+                   LIMIT 1""",
+            list(lib_ids) + [citekey],
+        ).fetchone()
+        if row is not None:
+            return self._build_full_items(conn, [row])[0]
+
+        # Legacy placement: a "Citation Key: <key>" line in `extra`. LIKE
+        # narrows to candidates; the exact line match is applied in Python
+        # by the caller's `_extra_has_citekey`, so this only has to avoid
+        # returning the wrong item, not parse the field itself.
+        rows = conn.execute(
+            self._FULL_ITEM_COLUMNS
+            + f""" JOIN itemData ex_data ON ex_data.itemID = i.itemID
+                   JOIN fields ex_f
+                       ON ex_f.fieldID = ex_data.fieldID AND ex_f.fieldName = 'extra'
+                   JOIN itemDataValues ex_v ON ex_v.valueID = ex_data.valueID
+                   WHERE i.libraryID IN ({lib_ph})
+                   AND del.itemID IS NULL
+                   AND ex_v.value LIKE ?
+                   LIMIT 25""",
+            list(lib_ids) + [f"%{_semantics.escape_like(citekey)}%"],
+        ).fetchall()
+        for item in self._build_full_items(conn, rows):
+            if item["data"].get("citationKey") == citekey:
+                return item
+            from zotero_mcp.tools._helpers import _extra_has_citekey
+
+            if _extra_has_citekey(item["data"].get("extra", ""), citekey):
+                return item
+        return None
+
+    #: Share of `items` above which a full scan beats the (libraryID, key)
+    #: index for a library-filtered ranking query. Measured crossover on a
+    #: 90k-row database is around 10-15%; 20% keeps small scopes on the index.
+    _SCAN_SHARE_THRESHOLD = 0.2
+
+    def _scope_prefers_scan(self, conn: sqlite3.Connection, lib_ids) -> bool:
+        """Whether reading `items` in full is cheaper than the libraryID index."""
+        cache_key = tuple(sorted(lib_ids))
+        cached = self._scan_choice.get(cache_key)
+        if cached is not None:
+            return cached
+        lib_ph = ",".join("?" * len(cache_key))
+        in_scope = conn.execute(
+            f"SELECT COUNT(*) FROM items WHERE libraryID IN ({lib_ph})", cache_key
+        ).fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        choice = bool(total) and in_scope / total >= self._SCAN_SHARE_THRESHOLD
+        self._scan_choice[cache_key] = choice
+        return choice
+
+    def get_recent_items(
+        self,
+        *,
+        limit: int = 10,
+        collection_key: str | None = None,
+        group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
+        sort: str = "dateAdded",
+        direction: str = "desc",
+    ) -> list[dict] | None:
+        """Most recently added/modified top-level items.
+
+        Returns None for a sort field this backend cannot order by, so the
+        caller can fall back rather than silently reorder the answer.
+        """
+        sort_column = {
+            "dateAdded": "i.dateAdded",
+            "dateModified": "i.dateModified",
+            "title": "title_val.value",
+        }.get(sort)
+        if sort_column is None or direction.lower() not in ("asc", "desc"):
+            return None
+        conn = self._get_connection()
+        lib_ids = self._resolve_scope_library_ids(group_id)
+        if not lib_ids:
+            return []
+        lib_ph = ",".join("?" * len(lib_ids))
+        collection_sql, collection_params = "", []
+        if collection_key:
+            collection_id = self._resolve_collection_id(conn, collection_key)
+            if collection_id is None:
+                return []
+            collection_sql = (
+                " AND i.itemID IN (SELECT itemID FROM collectionItems WHERE collectionID = ?)"
+            )
+            collection_params = [collection_id]
+        # Choose the page first, then hydrate only it. Sorting the full
+        # hydration join (attachment/note/annotation/parent LEFT JOINs for
+        # every item in the library) and then taking LIMIT made this slower
+        # than the API on a 44k-item library (558 ms vs 269 ms); ranking bare
+        # itemIDs is one pass over `items`.
+        #
+        # How that pass reads `items` matters as much. SQLite picks the
+        # (libraryID, key) index for the libraryID filter, then fetches every
+        # row by rowid to read itemTypeID and dateAdded. For a scope that is
+        # most of the table that is slower than reading the table in order:
+        # profiled by @mronkko on a 52k-of-90k personal library at 94 ms as
+        # written vs 31 ms with NOT INDEXED and an itemTypeID subquery. For a
+        # small scope the index still wins (3 ms vs 4 ms for a 3k group
+        # library in a 90k database), so the scan is chosen per scope.
+        # Same base-field resolution as _base_field_resolved_join (#570) — a
+        # case's or statute's title must sort by its real title (caseName /
+        # nameOfAct), not by a column it never populates. See that
+        # function's docstring for the Zotero source this follows.
+        title_join = _base_field_resolved_join("title", "title") if sort == "title" else ""
+        items_source = (
+            "items i NOT INDEXED"
+            if not collection_key and self._scope_prefers_scan(conn, lib_ids)
+            else "items i"
+        )
+        page = [
+            row[0]
+            for row in conn.execute(
+                f"""SELECT i.itemID FROM {items_source}{title_join}
+                    WHERE i.libraryID IN ({lib_ph})
+                      AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
+                      AND i.itemTypeID NOT IN (
+                          SELECT itemTypeID FROM itemTypes
+                          WHERE typeName IN ('attachment', 'note', 'annotation'))
+                      {collection_sql}
+                    ORDER BY {sort_column} {direction.upper()}, i.itemID {direction.upper()}
+                    LIMIT ?""",
+                list(lib_ids) + collection_params + [limit],
+            ).fetchall()
+        ]
+        if not page:
+            return []
+        id_ph = ",".join("?" * len(page))
+        rows = conn.execute(
+            self._FULL_ITEM_COLUMNS + f" WHERE i.itemID IN ({id_ph})", page
+        ).fetchall()
+        by_id = {row["itemID"]: row for row in rows}
+        ordered = [by_id[item_id] for item_id in page if item_id in by_id]
+        return self._build_full_items(conn, ordered)
+
+    def get_related_items(
+        self,
+        key: str,
+        *,
+        group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
+    ) -> list[dict]:
+        """Items related to `key`, hydrated in one batch.
+
+        Relations are stored as URIs; the related keys are extracted from
+        them here so the caller gets items rather than strings to re-fetch
+        one at a time.
+        """
+        source = self.get_full_items([key], group_id=group_id)
+        item = source.get(key)
+        if item is None:
+            return []
+        related_keys: list[str] = []
+        for objects in item["data"].get("relations", {}).values():
+            for uri in objects if isinstance(objects, list) else [objects]:
+                match = re.search(r"/items/([A-Z0-9]{8})$", uri) if isinstance(uri, str) else None
+                if match and match.group(1) not in related_keys:
+                    related_keys.append(match.group(1))
+        if not related_keys:
+            return []
+        fetched = self.get_full_items(related_keys, group_id=group_id)
+        return [fetched[k] for k in related_keys if k in fetched]
+
+    # -- collections and tags ---------------------------------------------
+
+    def list_collections(
+        self,
+        *,
+        group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
+        include_trashed: bool = False,
+    ) -> list[dict]:
+        """Every collection in scope, API-shaped, in one query.
+
+        Unpaged by design: `_paginate` would turn this into an OFFSET walk,
+        which on a large library is where the 67x tag penalty came from.
+        """
+        conn = self._get_connection()
+        lib_ids = self._resolve_scope_library_ids(group_id)
+        if not lib_ids:
+            return []
+        lib_ph = ",".join("?" * len(lib_ids))
+        trash_sql = "" if include_trashed else " AND dc.collectionID IS NULL"
+        rows = conn.execute(
+            f"""
+            SELECT c.collectionID, c.key, c.collectionName, c.version, c.libraryID,
+                   parent.key AS parentKey,
+                   (dc.collectionID IS NOT NULL) AS deleted
+            FROM collections c
+            LEFT JOIN collections parent ON parent.collectionID = c.parentCollectionID
+            LEFT JOIN deletedCollections dc ON dc.collectionID = c.collectionID
+            WHERE c.libraryID IN ({lib_ph}){trash_sql}
+            ORDER BY c.collectionName
+            """,
+            list(lib_ids),
+        ).fetchall()
+        return [_row_to_api_collection(row) for row in rows]
+
+    def get_collection(
+        self,
+        collection_key: str,
+        *,
+        group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
+    ) -> dict | None:
+        """One collection by key, or None when it is not in scope."""
+        conn = self._get_connection()
+        lib_ids = self._resolve_scope_library_ids(group_id)
+        if not lib_ids:
+            return None
+        lib_ph = ",".join("?" * len(lib_ids))
+        row = conn.execute(
+            f"""
+            SELECT c.collectionID, c.key, c.collectionName, c.version, c.libraryID,
+                   parent.key AS parentKey,
+                   (dc.collectionID IS NOT NULL) AS deleted
+            FROM collections c
+            LEFT JOIN collections parent ON parent.collectionID = c.parentCollectionID
+            LEFT JOIN deletedCollections dc ON dc.collectionID = c.collectionID
+            WHERE c.libraryID IN ({lib_ph}) AND c.key = ?
+            """,
+            list(lib_ids) + [collection_key],
+        ).fetchone()
+        return _row_to_api_collection(row) if row is not None else None
+
+    def get_collection_items(
+        self,
+        collection_key: str,
+        *,
+        include_subcollections: bool = False,
+        group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
+    ) -> list[dict] | None:
+        """Items filed in a collection, optionally including its subtree.
+
+        Returns None when the key names no collection in scope, so callers
+        can distinguish that from an empty collection.
+        """
+        conn = self._get_connection()
+        # `_resolve_collection_ids` always walks descendants; the singular
+        # lookup is the one that means "this collection only".
+        if include_subcollections:
+            collection_ids = self._resolve_collection_ids(conn, collection_key)
+        else:
+            own_id = self._resolve_collection_id(conn, collection_key)
+            collection_ids = [own_id] if own_id is not None else []
+        if not collection_ids:
+            return None
+        lib_ids = self._resolve_scope_library_ids(group_id)
+        if not lib_ids:
+            return []
+        lib_ph = ",".join("?" * len(lib_ids))
+        coll_ph = ",".join("?" * len(collection_ids))
+        rows = conn.execute(
+            self._FULL_ITEM_COLUMNS
+            + f""" WHERE i.libraryID IN ({lib_ph})
+                   AND del.itemID IS NULL
+                   AND i.itemID IN (
+                        SELECT itemID FROM collectionItems WHERE collectionID IN ({coll_ph}))
+                   ORDER BY i.itemID""",
+            list(lib_ids) + list(collection_ids),
+        ).fetchall()
+        return self._build_full_items(conn, rows)
+
+    def list_tags(
+        self,
+        *,
+        group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
+        limit: int | None = None,
+    ) -> list[str]:
+        """Every tag name in scope, sorted, in one query.
+
+        Measured at 221 ms for 17 302 tags against a 2.3 GB database; the
+        same listing walked at 100 rows per OFFSET query took 14.9 s.
+
+        Tags on trashed items are included, because the API's ``/tags``
+        endpoint counts them and this replaced that call; leaving them out made
+        ``zotero_get_tags`` answer differently depending on the backend (#552).
+        """
+        conn = self._get_connection()
+        lib_ids = self._resolve_scope_library_ids(group_id)
+        if not lib_ids:
+            return []
+        lib_ph = ",".join("?" * len(lib_ids))
+        limit_sql, limit_params = "", []
+        if limit is not None:
+            limit_sql, limit_params = " LIMIT ?", [limit]
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT t.name
+            FROM tags t
+            JOIN itemTags itg ON itg.tagID = t.tagID
+            JOIN items i ON i.itemID = itg.itemID
+            WHERE i.libraryID IN ({lib_ph})
+            ORDER BY t.name{limit_sql}
+            """,
+            list(lib_ids) + limit_params,
+        ).fetchall()
+        return [row["name"] for row in rows]
 
 
 def get_local_zotero_reader() -> LocalZoteroReader | None:

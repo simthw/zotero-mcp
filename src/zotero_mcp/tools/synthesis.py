@@ -10,7 +10,7 @@ import json
 from collections import Counter
 from typing import Literal
 
-from zotero_mcp import client as _client
+from zotero_mcp import library as _library
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
 from zotero_mcp._context import Context
@@ -20,7 +20,7 @@ from zotero_mcp.tools.annotations import _annotation_to_record
 
 
 def _resolve_paper_context(
-    zot,
+    backend,
     parent_key: str,
     cache: dict[str, dict[str, str | None]],
 ) -> dict[str, str | None]:
@@ -42,13 +42,13 @@ def _resolve_paper_context(
         "attachment_title": None,
     }
     try:
-        parent = zot.item(parent_key)
+        parent = backend.get_item(parent_key)
         data = parent.get("data", {}) if parent else {}
         if data.get("itemType") == "attachment" and data.get("parentItem"):
             gp_key = data["parentItem"]
             attachment_title = data.get("title") or None
             try:
-                grandparent = zot.item(gp_key)
+                grandparent = backend.get_item(gp_key)
                 gp_data = grandparent.get("data", {}) if grandparent else {}
                 title = gp_data.get("title") or attachment_title or parent_key
             except Exception:
@@ -119,7 +119,7 @@ def synthesize_annotations(
     """
     try:
         ctx.info("Gathering annotations and notes for synthesis")
-        zot = _client.get_zotero_client()
+        backend = _library.get_library_backend()
 
         limit = _helpers._normalize_limit(limit, default=200, max_val=5000)
         tags = _helpers._normalize_tag_filter(tag)
@@ -128,29 +128,23 @@ def synthesize_annotations(
         allowed_keys: set[str] | None = None
         if collection_key:
             try:
-                coll_items = _helpers._paginate(
-                    zot.collection_items,
-                    collection_key,
-                    itemType="-attachment",
-                )
-                allowed_keys = {it.get("key") for it in coll_items if it.get("key")}
+                coll_items = backend.collection_items(collection_key) or []
+                allowed_keys = {
+                    key for it in coll_items
+                    if it.get("data", {}).get("itemType") != "attachment"
+                    and (key := it.get("key"))
+                }
             except Exception as e:
                 ctx.warning(f"Could not load collection items: {e}")
                 allowed_keys = set()
 
-        anno_params = {"itemType": "annotation"}
-        note_params = {"itemType": "note"}
-        if tags:
-            anno_params["tag"] = tags
-            note_params["tag"] = tags
-
         try:
-            annotations = _helpers._paginate(zot.items, max_items=limit, **anno_params)
+            annotations = backend.list_items("annotation", limit=limit, tag=tags)
         except Exception as e:
             ctx.warning(f"Annotation fetch failed: {e}")
             annotations = []
         try:
-            notes = _helpers._paginate(zot.items, max_items=limit, **note_params)
+            notes = backend.list_items("note", limit=limit, tag=tags)
         except Exception as e:
             ctx.warning(f"Note fetch failed: {e}")
             notes = []
@@ -185,15 +179,10 @@ def synthesize_annotations(
             # Member if the immediate parent, or its grandparent paper, is in scope.
             if parent_key in allowed_keys:
                 return True
-            try:
-                parent = zot.item(parent_key)
-                data = parent.get("data", {}) if parent else {}
-                gp = data.get("parentItem")
-                if gp and gp in allowed_keys:
-                    return True
-            except Exception:
-                pass
-            return False
+            parent = backend.get_item(parent_key)
+            data = parent.get("data", {}) if parent else {}
+            gp = data.get("parentItem")
+            return bool(gp and gp in allowed_keys)
 
         highlight_count = 0
         for anno in annotations:
@@ -206,7 +195,7 @@ def synthesize_annotations(
             if parent_key and not _in_scope(parent_key):
                 continue
             context = (
-                _resolve_paper_context(zot, parent_key, context_cache)
+                _resolve_paper_context(backend, parent_key, context_cache)
                 if parent_key
                 else {
                     "item_key": None,
@@ -233,7 +222,7 @@ def synthesize_annotations(
             if parent_key and not _in_scope(parent_key):
                 continue
             context = (
-                _resolve_paper_context(zot, parent_key, context_cache)
+                _resolve_paper_context(backend, parent_key, context_cache)
                 if parent_key
                 else {
                     "item_key": None,
@@ -335,6 +324,9 @@ def _render_entries(rendered) -> list[str]:
     return entries
 
 
+_EXPORT_SIZE_HINT = "Scope with item_keys or collection_key to reduce size."
+
+
 @mcp.tool(
     name="zotero_export_bibliography",
     description=(
@@ -344,7 +336,7 @@ def _render_entries(rendered) -> list[str]:
         "item_keys: optional list of 8-character item keys (also accepts a "
         "JSON list string); takes precedence over collection_key. "
         "collection_key: optional collection to export instead; if neither is "
-        "given, the active library is exported (capped). "
+        "given, the active library is exported. "
         "style: CSL style short name (default 'apa'); e.g. 'modern-language-"
         "association', 'chicago-note-bibliography', 'ieee'. Ignored for "
         "bibtex. "
@@ -355,8 +347,8 @@ def _render_entries(rendered) -> list[str]:
         "(a fenced block for bibtex, a numbered list otherwise). "
         "Rendering uses Zotero's own CSL engine and works in local mode with "
         "no API credentials, as well as over the web API. "
-        "Capped at 100 items per call; scope with item_keys or collection_key "
-        "for anything larger. "
+        "item_keys is capped at 100 items per call; a collection or the whole "
+        "library is exported in full (top-level items only). "
         "Example: zotero_export_bibliography(item_keys=['RTKZQI8E'], "
         "style='apa', export_format='bib')."
     ),
@@ -398,25 +390,65 @@ def export_bibliography(
         # and local-only users no longer need web credentials (#371).
         zot = _helpers._get_bibliography_client(ctx)
 
+        # Requested keys go to /items/top, in batches of 50 (Zotero's cap for
+        # an itemKey filter). /items also answers with each item's notes and
+        # attachments, which filled the 100-row page and silently dropped
+        # requested items.
+        key_batches = [",".join(keys[i:i + 50]) for i in range(0, len(keys or []), 50)]
+
+        def _bibtex_text(raw):
+            if hasattr(raw, "entries"):
+                # pyzotero parses a format=bibtex response into a
+                # bibtexparser BibDatabase; serialise it back to .bib text.
+                import bibtexparser
+
+                raw = bibtexparser.dumps(raw)
+            return raw.decode("utf-8") if isinstance(raw, bytes) else raw
+
+        def _bibtex_pages(method, *args):
+            # A collection or library holds more than one page of references.
+            # Follow the response's rel="next" link rather than counting
+            # entries: standalone notes fill a page without producing any.
+            parts = []
+            start = 0
+            while True:
+                text = _bibtex_text(
+                    method(*args, format="bibtex", start=start, limit=100)
+                )
+                if text and text.strip():
+                    parts.append(text)
+                if not (getattr(zot, "links", None) or {}).get("next"):
+                    break
+                start += 100
+            return "\n".join(parts)
+
         try:
             if export_format == "bibtex":
                 # A whole-file export, not per-item entries: the API returns the
                 # concatenated .bib as raw bytes rather than a list.
                 if keys:
-                    raw = zot.items(itemKey=",".join(keys), format="bibtex", limit=100)
+                    rendered = "\n".join(
+                        _bibtex_text(zot.top(itemKey=batch, format="bibtex", limit=100))
+                        for batch in key_batches
+                    )
                 elif collection_key:
-                    raw = zot.collection_items(collection_key, format="bibtex", limit=100)
+                    # Top-level items only, as below: a collection's child
+                    # attachments and notes use up the page and have no entry.
+                    rendered = _bibtex_pages(zot.collection_items_top, collection_key)
                 else:
                     # Top-level items only. Attachments and notes have no
                     # bibliography entry, so including them would pad the
                     # export with blanks and crowd out real references.
-                    raw = zot.top(format="bibtex", limit=100)
-                rendered = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+                    rendered = _bibtex_pages(zot.top)
             else:
                 include = "bib" if export_format == "bib" else "citation"
                 fetch_kwargs = {"include": include, "style": style}
                 if keys:
-                    rows = zot.items(itemKey=",".join(keys), limit=100, **fetch_kwargs)
+                    rows = [
+                        row
+                        for batch in key_batches
+                        for row in zot.top(itemKey=batch, limit=100, **fetch_kwargs)
+                    ]
                     # The local API answers an itemKey filter on this endpoint
                     # with the requested items *plus* others, so the response
                     # cannot be trusted as the selection. Filter to what was
@@ -427,11 +459,14 @@ def export_bibliography(
                     }
                     rows = [by_key[k] for k in keys if k in by_key]
                 elif collection_key:
+                    # /items/top: child attachments and notes render as empty
+                    # entries, filled the 100-row page, and were then dropped,
+                    # so a 191-reference collection exported 51.
                     rows = _helpers._paginate(
-                        zot.collection_items, collection_key, max_items=100, **fetch_kwargs
+                        zot.collection_items_top, collection_key, **fetch_kwargs
                     )
                 else:
-                    rows = zot.top(limit=100, **fetch_kwargs)
+                    rows = _helpers._paginate(zot.top, **fetch_kwargs)
                 # Items with nothing to render (attachments, notes) come back
                 # with the field empty; drop them rather than emitting blanks.
                 rendered = [
@@ -450,10 +485,10 @@ def export_bibliography(
             )
 
         entries = _render_entries(rendered)
+        scope = (
+            f" for collection {collection_key}" if collection_key else (" for the requested items" if keys else "")
+        )
         if not entries:
-            scope = (
-                f" for collection {collection_key}" if collection_key else (" for the requested items" if keys else "")
-            )
             return f"No bibliography entries produced{scope}."
 
         format_label = {
@@ -464,16 +499,21 @@ def export_bibliography(
 
         if export_format == "bibtex":
             body = "\n\n".join(e.strip() for e in entries if e.strip())
-            return f"# {format_label}\n\n```bibtex\n{body}\n```"
+            return _helpers._prepend_size_warning(
+                f"# {format_label}\n\n```bibtex\n{body}\n```", _EXPORT_SIZE_HINT
+            )
 
         header = f"# {format_label} ({style})"
         lines = [header, ""]
-        for i, entry in enumerate(entries, 1):
-            clean = _utils.clean_html(entry).strip()
-            if not clean:
-                continue
+        # Drop entries that are empty once the HTML is stripped *before*
+        # numbering them; otherwise each one uses up a number and the list
+        # comes out 4, 5, 7, 9, …
+        cleaned = [c for c in (_utils.clean_html(e).strip() for e in entries) if c]
+        if not cleaned:
+            return f"No bibliography entries produced{scope}."
+        for i, clean in enumerate(cleaned, 1):
             lines.append(f"{i}. {clean}")
-        return "\n".join(lines)
+        return _helpers._prepend_size_warning("\n".join(lines), _EXPORT_SIZE_HINT)
 
     except Exception as e:
         ctx.error(f"Error exporting bibliography: {str(e)}")

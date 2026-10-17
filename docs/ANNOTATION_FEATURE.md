@@ -117,9 +117,12 @@ LIGATURE_REPLACEMENTS = {...}     # fi, fl, ff → expanded
 #### Public API
 | Function | Purpose |
 |----------|---------|
+| `open_pdf()` | Open a PDF once and share the document across the helpers below (each accepts a path or an open document) |
 | `find_text_position()` | Main entry point for text search |
-| `get_page_label()` | Get PDF page label (e.g., "i", "ii") |
-| `verify_pdf_attachment()` | Check if file is valid PDF |
+| `get_page_label()` / `page_label()` | Get a PDF page label (e.g., "i", "ii") by page number or from a page |
+| `page_range_error()` | Error for a page outside the document, or None |
+| `build_area_position_data()` | Position data for an area (image) annotation |
+| `text_in_rects()` | Readable text under final highlight rects (dry-run previews) |
 | `build_annotation_position()` | Create Zotero position JSON |
 
 ---
@@ -187,7 +190,10 @@ Works with both:
 - **Zotero Cloud Storage**: Downloads via Web API
 - **WebDAV Storage**: Downloads via local Zotero (port 23119)
 
-Annotations are always created via Web API (local API is read-only).
+Annotations are created through whichever backend can write: the local API on Zotero 10
+or newer once `zotero-mcp authorize-local` has been run, otherwise the Web API. The
+attachment is still downloaded from whichever source has the bytes, which is not
+necessarily the same backend.
 
 ---
 
