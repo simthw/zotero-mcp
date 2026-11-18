@@ -48,7 +48,11 @@ from .config_light import (  # noqa: F401
 from .embeddings.registry import batch_capable_providers
 from .extract import PAGE_SEPARATOR
 from .identifiers import metadata_match_keys
-from .local_db import PERSONAL_LIBRARY_GROUP_ID, LocalZoteroReader
+from .local_db import (
+    PERSONAL_LIBRARY_GROUP_ID,
+    LocalZoteroReader,
+    _is_mineru_source,
+)
 from .utils import (
     _paginate,
     ensure_private_dir,
@@ -1750,9 +1754,10 @@ class ZoteroSemanticSearch:
                                 chroma_has_fulltext = existing_metadata.get("has_fulltext", False)
                                 local_has_fulltext = bool(att_keys)
                                 mineru_upgrade = (
-                                    existing_metadata.get("fulltext_source", "")
-                                    != "content_list_json"
-                                    and reader.has_content_list_json(it.item_id)
+                                    not _is_mineru_source(
+                                        existing_metadata.get("fulltext_source", "")
+                                    )
+                                    and reader.has_mineru_output(it.item_id)
                                 )
 
                                 # Skip if extraction previously failed AND neither the item
@@ -1807,14 +1812,16 @@ class ZoteroSemanticSearch:
                                     # Document exists but lacks fulltext - we need to update it
                                     updated_existing += 1
                                 elif (
-                                    reader.has_content_list_json(it.item_id)
-                                    and existing_metadata.get("fulltext_source") != "content_list_json"
+                                    reader.has_mineru_output(it.item_id)
+                                    and not _is_mineru_source(
+                                        existing_metadata.get("fulltext_source")
+                                    )
                                 ):
-                                    # MinerU content_list.json is now available
-                                    # (a higher-quality source than whatever
-                                    # produced the stored embedding) — re-extract.
+                                    # A MinerU sidecar (.md or legacy content_list.json)
+                                    # is now available (a higher-quality source than
+                                    # whatever produced the stored embedding) — re-extract.
                                     logger.info(
-                                        f"content_list.json found for item {it.key}, will re-extract"
+                                        f"MinerU output found for item {it.key}, will re-extract"
                                     )
                                     updated_existing += 1
                                 elif _attachment_priority_changed(

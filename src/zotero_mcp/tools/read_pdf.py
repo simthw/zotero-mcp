@@ -323,7 +323,7 @@ def read_pdf_text(
     ``surface`` picks whether the closing advice names the MCP tool's image
     format or the zotero-cli flag.
     """
-    # MinerU content_list.json, when present alongside the attachment, is a
+    # MinerU Markdown sidecar, when present alongside the attachment, is a
     # higher-quality structured source than raw PDF extraction. It carries no
     # page boundaries, so it is returned whole (the page range is ignored)
     # with a header noting the source. Local mode only.
@@ -335,15 +335,15 @@ def read_pdf_text(
                 db_path=load_config().resolve_zotero_db_path()
             ) as reader:
                 local_item = reader.get_item_by_key(item_key)
-                if local_item and reader.has_content_list_json(local_item.item_id):
-                    json_path = reader.get_content_list_json_path(local_item.item_id)
-                    if json_path:
-                        full_text = reader._extract_text_from_content_list_json(json_path)
+                if local_item and reader.has_mineru_output(local_item.item_id):
+                    mineru_path = reader.get_mineru_output_path(local_item.item_id)
+                    if mineru_path:
+                        full_text = reader._extract_text_from_mineru_md(mineru_path)
                         if full_text.strip():
                             return _helpers._prepend_size_warning(
                                 f"# {local_item.title or 'Untitled'}\n"
                                 f"**Item Key:** {item_key}\n"
-                                f"**Source:** MinerU content_list.json (full document)\n"
+                                f"**Source:** MinerU Markdown (full document)\n"
                                 f"\n{full_text}\n",
                                 "Consider using zotero_semantic_search to find specific content.",
                             )

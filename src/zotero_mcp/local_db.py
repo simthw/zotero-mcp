@@ -90,6 +90,11 @@ class FulltextExtraction:
     truncated: bool = False
 
 
+def _is_mineru_source(source: str | None) -> bool:
+    """Return True if ``source`` names a MinerU-derived fulltext source."""
+    return source == "mineru_md"
+
+
 def _read_string_pref(prefs_path: Path, pref: str) -> str | None:
     """Read a string preference from a Zotero prefs.js file.
 
@@ -182,7 +187,7 @@ class ZoteroItem:
     abstract: str | None = None
     creators: str | None = None
     fulltext: str | None = None
-    fulltext_source: str | None = None  # content_list_json, zotero-cache, pdf, html, or file
+    fulltext_source: str | None = None  # mineru_md, zotero-cache, pdf, html, or file
     notes: str | None = None
     extra: str | None = None
     date_added: str | None = None
@@ -1439,38 +1444,52 @@ class LocalZoteroReader:
         # rather than a stub or thumbnail.
         return max(candidates, key=lambda p: p.stat().st_size)
 
-    def _find_content_list_json(self, resolved_path: Path) -> Path | None:
-        """Find a MinerU ``content_list.json`` beside an attachment file.
+    # ------------------------------------------------------------------
+    # MinerU sidecar discovery (Markdown .md only)
+    # ------------------------------------------------------------------
 
-        Looks for MinerU's document-specific ``*_content_list.json`` first, then
-        the generic ``content_list.json`` fallback.
+    def _find_mineru_md(self, resolved_path: Path) -> Path | None:
+        """Find a MinerU Markdown sidecar (``.md``) beside an attachment file.
+
+        Tries, in order:
+
+        1. ``<stem>.md`` in the same directory as the attachment.
+        2. ``<stem>_content_list.md`` in the same directory.
+        3. ``content_list.md`` in the same directory.
+        4. Common MinerU output subdirectories: ``auto/<stem>.md``,
+           ``output/<stem>.md``, ``<stem>/<stem>.md``.
         """
         if not resolved_path.exists():
             return None
 
         parent_dir = resolved_path.parent
+        stem = resolved_path.stem
         try:
-            named_outputs = sorted(
-                (
-                    candidate
-                    for candidate in parent_dir.iterdir()
-                    if candidate.is_file()
-                    and candidate.name.endswith("_content_list.json")
-                ),
-                key=lambda candidate: candidate.name.casefold(),
-            )
-            if named_outputs:
-                return named_outputs[0]
+            candidates: list[Path] = []
 
-            content_list = parent_dir / "content_list.json"
-            if content_list.is_file():
-                return content_list
+            # Same-directory patterns.
+            for name in (f"{stem}.md", f"{stem}_content_list.md", "content_list.md"):
+                candidate = parent_dir / name
+                if candidate.is_file():
+                    candidates.append(candidate)
+
+            # Common MinerU output subdirectories.
+            for sub in ("auto", "output", stem):
+                candidate = parent_dir / sub / f"{stem}.md"
+                if candidate.is_file():
+                    candidates.append(candidate)
+
+            if candidates:
+                # Prefer same-directory matches first (they appear earlier in
+                # the list), then by file size under the assumption that the
+                # largest file is the real document body.
+                return max(candidates, key=lambda p: (p.parent == parent_dir, p.stat().st_size))
         except OSError as e:
-            logger.debug(f"Could not inspect MinerU output next to {resolved_path}: {e}")
+            logger.debug(f"Could not inspect MinerU .md output next to {resolved_path}: {e}")
         return None
 
-    def _get_content_list_json_path(self, item_id: int) -> Path | None:
-        """Return the best MinerU output available for an item's attachments."""
+    def _get_mineru_md_path(self, item_id: int) -> Path | None:
+        """Return the best MinerU ``.md`` sidecar available for an item's attachments."""
         for key, path, ctype in self._iter_parent_attachments(item_id):
             if ctype != "application/pdf" and not (ctype or "").startswith("text/html"):
                 continue
@@ -1479,101 +1498,30 @@ class LocalZoteroReader:
                 resolved = self._scan_storage_for_attachment(key, ctype)
                 if not resolved or not resolved.exists():
                     continue
-            if content_list := self._find_content_list_json(resolved):
-                return content_list
+            if md_path := self._find_mineru_md(resolved):
+                return md_path
         return None
 
-    def _extract_text_from_mineru_block(self, block) -> str:
-        """Extract text from a single MinerU content_list.json block.
+    def _extract_text_from_mineru_md(self, md_path: Path) -> str:
+        """Extract text from a MinerU Markdown sidecar file.
 
-        A block has ``type`` (paragraph, title, equation_interline, ...) and
-        ``content``, a dict such as
-        ``{"paragraph_content": [{"type": "text", "content": "..."}]}``. The
-        flat format with text directly under ``block['text']`` is also handled.
-        """
-        if not isinstance(block, dict):
-            return ""
-
-        block_type = block.get("type", "")
-        if block_type in ("page_header", "page_footer", "page_number"):
-            return ""
-
-        content = block.get("content")
-        if isinstance(content, dict):
-            math = content.get("math_content")
-            if isinstance(math, str) and math.strip():
-                return f"$$ {math.strip()} $$"
-
-            for key, spans in content.items():
-                if key in ("level", "math_type", "image_source"):
-                    continue
-                if isinstance(spans, list):
-                    parts = []
-                    for span in spans:
-                        if isinstance(span, dict):
-                            t = span.get("content", "")
-                            if isinstance(t, str) and t.strip():
-                                parts.append(t.strip())
-                    if parts:
-                        return " ".join(parts)
-
-        text = block.get("text", "")
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-
-        return ""
-
-    def _extract_text_from_content_list_json(self, json_path: Path) -> str:
-        """Extract text from a MinerU ``content_list.json`` file.
-
-        Supports the nested pages format (list of lists), the flat list of
-        blocks, and a dict wrapper with ``content``/``data``.
+        The file is already Markdown, so we return it largely as-is. We only
+        strip leading/trailing whitespace and normalize line endings.
         """
         try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            if isinstance(data, list):
-                content_list = data
-            else:
-                content_list = data.get("content") or data.get("data") or []
-
-            if isinstance(content_list, list):
-                text_parts = []
-                for item in content_list:
-                    if isinstance(item, list):
-                        for block in item:
-                            text = self._extract_text_from_mineru_block(block)
-                            if text:
-                                text_parts.append(text)
-                    elif isinstance(item, dict):
-                        text = self._extract_text_from_mineru_block(item)
-                        if text:
-                            text_parts.append(text)
-                    elif isinstance(item, str):
-                        if item.strip():
-                            text_parts.append(item.strip())
-
-                if text_parts:
-                    return "\n\n".join(text_parts)
-
-            if isinstance(data, dict):
-                for key in ["text", "content", "fulltext", "body"]:
-                    if key in data and isinstance(data[key], str):
-                        return data[key]
-
-            return ""
+            text = md_path.read_text(encoding="utf-8")
+            return text.strip()
         except Exception as e:
-            logger.warning(f"Failed to extract text from content_list.json: {e}")
+            logger.warning(f"Failed to extract text from MinerU .md file {md_path}: {e}")
             return ""
 
-    def has_content_list_json(self, item_id: int) -> bool:
-        """True if the item has a MinerU ``content_list.json`` sidecar."""
-        return self._get_content_list_json_path(item_id) is not None
+    def has_mineru_output(self, item_id: int) -> bool:
+        """True if the item has a MinerU ``.md`` sidecar."""
+        return self._get_mineru_md_path(item_id) is not None
 
-    def get_content_list_json_path(self, item_id: int) -> Path | None:
-        """Path to the item's MinerU ``content_list.json``, or None."""
-        return self._get_content_list_json_path(item_id)
+    def get_mineru_output_path(self, item_id: int) -> Path | None:
+        """Path to the item's MinerU ``.md`` sidecar, or None."""
+        return self._get_mineru_md_path(item_id)
 
     def _resolve_extraction_target(self, item_id: int) -> tuple[Path, str] | None:
         """Pick the attachment to extract for an item, by configured priority.
@@ -1695,8 +1643,8 @@ class LocalZoteroReader:
         """Extract fulltext from the item's best attachment, with page limits.
 
         Preference order (this fork prefers fast / structured sources first):
-        1. MinerU ``content_list.json`` alongside the attachment — source
-           ``"content_list_json"`` (highest-quality structured text).
+        1. MinerU Markdown sidecar (``.md``) alongside the attachment — source
+           ``"mineru_md"`` (highest-quality structured text).
         2. The transient fulltext cache, then ``.zotero-ft-cache`` — source
            ``"zotero-cache"`` (Zotero's pre-built pdftotext index; fast, and
            avoids slow PDF extraction).
@@ -1718,15 +1666,13 @@ class LocalZoteroReader:
         they are set on that path alone: both caches store flat text with no
         page bookkeeping, and neither is page-capped to begin with (#448).
         """
-        # 0. MinerU content_list.json, when present, is the highest-quality source.
-        best_content_list_json = self._get_content_list_json_path(item_id)
-        if best_content_list_json:
-            text = self._extract_text_from_content_list_json(best_content_list_json)
+        # 0. MinerU .md sidecar, when present, is the highest-quality source.
+        mineru_md_path = self._get_mineru_md_path(item_id)
+        if mineru_md_path:
+            text = self._extract_text_from_mineru_md(mineru_md_path)
             if text:
-                logger.info(
-                    f"Using content_list.json for item {item_id}: {best_content_list_json}"
-                )
-                return FulltextExtraction(text, "content_list_json")
+                logger.info(f"Using MinerU .md for item {item_id}: {mineru_md_path}")
+                return FulltextExtraction(text, "mineru_md")
 
         chosen = self._resolve_extraction_target(item_id)
 
@@ -2134,14 +2080,15 @@ class LocalZoteroReader:
             max_workers=self.extraction_workers, initializer=_init_extraction_worker
         ) as pool:
             for item_id, item_key in items:
-                # MinerU content_list.json outranks every parser path; resolve
-                # it here so the pool is never asked to parse such an item.
-                mineru_path = self._get_content_list_json_path(item_id)
-                if mineru_path:
-                    mineru_text = self._extract_text_from_content_list_json(mineru_path)
+                # MinerU .md sidecar outranks every parser path; resolve it
+                # here so the pool is never asked to parse such an item.
+                mineru_md_path = self._get_mineru_md_path(item_id)
+                if mineru_md_path:
+                    mineru_text = self._extract_text_from_mineru_md(mineru_md_path)
                     if mineru_text:
-                        yield item_id, (mineru_text, "content_list_json")
+                        yield item_id, (mineru_text, "mineru_md")
                         continue
+
                 chosen = self._resolve_extraction_target(item_id)
                 if not chosen:
                     deferred.append((item_id, item_key, None))

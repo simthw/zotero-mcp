@@ -78,7 +78,7 @@ class FakeReader:
     def get_fulltext_meta_for_item(self, item_id):
         return [list(row) for row in self._attachments]
 
-    def has_content_list_json(self, item_id):
+    def has_mineru_output(self, item_id):
         return self._mineru_available
 
     def extract_fulltext_for_item(self, item_id):
@@ -390,7 +390,7 @@ def test_legacy_record_without_attachment_keys_is_not_reextracted(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# MinerU content_list.json (local fork): a new sidecar must trigger a re-index
+# MinerU Markdown sidecar (local fork): a new sidecar must trigger a re-index
 # ---------------------------------------------------------------------------
 
 def test_failed_item_retried_when_mineru_output_appears(monkeypatch):
@@ -407,12 +407,12 @@ def test_failed_item_retried_when_mineru_output_appears(monkeypatch):
         stored,
         attachments=attachments,
         mineru_available=True,
-        extracted_source="content_list_json",
+        extracted_source="mineru_md",
     )
 
     assert len(items) == 1
     assert reader.extract_calls == 1
-    assert items[0]["data"]["fulltextSource"] == "content_list_json"
+    assert items[0]["data"]["fulltextSource"] == "mineru_md"
 
 
 def test_existing_pdf_fulltext_is_upgraded_to_mineru(monkeypatch):
@@ -430,10 +430,10 @@ def test_existing_pdf_fulltext_is_upgraded_to_mineru(monkeypatch):
         stored,
         attachments=attachments,
         mineru_available=True,
-        extracted_source="content_list_json",
+        extracted_source="mineru_md",
     )
 
     assert len(items) == 1
     assert reader.extract_calls == 1
-    assert items[0]["data"]["fulltextSource"] == "content_list_json"
+    assert items[0]["data"]["fulltextSource"] == "mineru_md"
 

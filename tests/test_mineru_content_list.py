@@ -1,6 +1,5 @@
-"""Regression tests for the local MinerU content_list.json extension."""
+"""Regression tests for the local MinerU Markdown (.md) sidecar extension."""
 
-import json
 from pathlib import Path
 
 from zotero_mcp.local_db import LocalZoteroReader
@@ -22,6 +21,7 @@ class FakeMinerUReader(LocalZoteroReader):
         self._extracted_text = extracted_text
         self._scanned_path = scanned_path
         self.attachment_priority = ("pdf", "html", "file")
+        self.pdf_max_pages = 50
 
     def _iter_parent_attachments(self, _parent_item_id):
         yield from self._attachments
@@ -39,85 +39,36 @@ class FakeMinerUReader(LocalZoteroReader):
         return self._extracted_text
 
 
-def _write_json(path: Path, payload) -> None:
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def test_nested_mineru_blocks_preserve_text_and_math(tmp_path):
-    content_list = tmp_path / "paper_content_list.json"
-    _write_json(
-        content_list,
-        [
-            [
-                {
-                    "type": "title",
-                    "content": {
-                        "title_content": [
-                            {"type": "text", "content": "A structured title"}
-                        ]
-                    },
-                },
-                {
-                    "type": "equation_interline",
-                    "content": {"math_content": "E = mc^2", "math_type": "latex"},
-                },
-                {
-                    "type": "page_header",
-                    "content": {
-                        "paragraph_content": [
-                            {"type": "text", "content": "Repeated header"}
-                        ]
-                    },
-                },
-            ]
-        ],
-    )
+def test_mineru_md_extraction_returns_plain_markdown(tmp_path):
+    md = tmp_path / "paper.md"
+    md.write_text("# Title\n\nParagraph with $x^2$ math.", encoding="utf-8")
     reader = FakeMinerUReader([])
 
-    assert reader._extract_text_from_content_list_json(content_list) == (
-        "A structured title\n\n$$ E = mc^2 $$"
+    assert reader._extract_text_from_mineru_md(md) == (
+        "# Title\n\nParagraph with $x^2$ math."
     )
 
 
-def test_flat_mineru_format_is_supported(tmp_path):
-    content_list = tmp_path / "content_list.json"
-    _write_json(
-        content_list,
-        [
-            {"type": "text", "text": "First paragraph"},
-            {"type": "text", "text": "Second paragraph"},
-        ],
-    )
-    reader = FakeMinerUReader([])
-
-    assert reader._extract_text_from_content_list_json(content_list) == (
-        "First paragraph\n\nSecond paragraph"
-    )
-
-
-def test_document_specific_mineru_output_has_highest_priority(tmp_path):
+def test_mineru_md_has_highest_priority(tmp_path):
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF-1.4\n")
-    _write_json(tmp_path / "content_list.json", [{"text": "generic output"}])
-    _write_json(
-        tmp_path / "paper_content_list.json",
-        [{"text": "document-specific output"}],
-    )
+    md = tmp_path / "paper.md"
+    md.write_text("# Markdown output\n\nSome text.", encoding="utf-8")
     reader = FakeMinerUReader(
         [("ATTACH01", str(pdf), "application/pdf")],
         cache_text="cached fallback",
     )
 
     assert reader.extract_fulltext_for_item(1) == (
-        "document-specific output",
-        "content_list_json",
+        "# Markdown output\n\nSome text.",
+        "mineru_md",
     )
 
 
-def test_invalid_mineru_output_falls_back_to_zotero_cache(tmp_path):
+def test_invalid_mineru_md_falls_back_to_zotero_cache(tmp_path):
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF-1.4\n")
-    (tmp_path / "paper_content_list.json").write_text("{invalid", encoding="utf-8")
+    (tmp_path / "paper.md").write_bytes(b"\xff\xfe invalid utf-8")
     reader = FakeMinerUReader(
         [("ATTACH01", str(pdf), "application/pdf")],
         cache_text="cached fallback",
@@ -133,12 +84,24 @@ def test_invalid_mineru_output_falls_back_to_zotero_cache(tmp_path):
 def test_mineru_discovery_uses_attachment_scan_fallback(tmp_path):
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF-1.4\n")
-    _write_json(tmp_path / "paper_content_list.json", [{"text": "scanned output"}])
+    (tmp_path / "paper.md").write_text("scanned output", encoding="utf-8")
     missing_recorded_path = tmp_path / "renamed.pdf"
     reader = FakeMinerUReader(
         [("ATTACH01", str(missing_recorded_path), "application/pdf")],
         scanned_path=pdf,
     )
 
-    assert reader.has_content_list_json(1) is True
-    assert reader.get_content_list_json_path(1) == tmp_path / "paper_content_list.json"
+    assert reader.has_mineru_output(1) is True
+    assert reader.get_mineru_output_path(1) == tmp_path / "paper.md"
+
+
+def test_mineru_output_prefers_same_directory_md(tmp_path):
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    (tmp_path / "paper.md").write_text("same-dir output", encoding="utf-8")
+    (tmp_path / "auto").mkdir()
+    (tmp_path / "auto" / "paper.md").write_text("sub-dir output", encoding="utf-8")
+    reader = FakeMinerUReader([("ATTACH01", str(pdf), "application/pdf")])
+
+    assert reader.get_mineru_output_path(1) == tmp_path / "paper.md"
+
