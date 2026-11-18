@@ -38,6 +38,7 @@ import threading
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from zotero_mcp import strict_sqlite as _strict_sqlite
 from zotero_mcp import utils as _utils
 from pyzotero.zotero_errors import ResourceNotFoundError
 
@@ -82,6 +83,9 @@ class LibraryBackend(Protocol):
     def find_by_citation_key(self, citekey: str) -> dict | None: ...
     def recent_items(self, *, limit: int = 10, collection_key: str | None = None) -> list[dict]: ...
     def top_items(self, *, limit: int = 100) -> list[dict]: ...
+    def duplicate_scan_items(self, collection_key: str | None = None) -> list[dict] | None:
+        """Unbounded local scan, or None to request the caller's bounded API path."""
+        ...
     def list_items(
         self,
         item_type: str | None = None,
@@ -163,6 +167,11 @@ class SqliteBackend:
     def __init__(self, reader, group_id: int):
         self._reader = reader
         self._group_id = group_id
+
+    def duplicate_scan_items(self, collection_key: str | None = None) -> list[dict]:
+        return self._reader.get_duplicate_scan_items(
+            collection_key=collection_key, group_id=self._group_id,
+        )
 
     # -- items ------------------------------------------------------------
 
@@ -304,6 +313,10 @@ class ApiBackend:
     def __init__(self, zot):
         self._zot = zot
 
+    def duplicate_scan_items(self, collection_key: str | None = None) -> None:
+        # HTTP scans must retain the caller's request/count ceiling.
+        return None
+
     # -- items ------------------------------------------------------------
 
     def get_item(self, key: str) -> dict | None:
@@ -378,20 +391,27 @@ class ApiBackend:
         return related
 
     def find_by_citation_key(self, citekey: str) -> dict | None:
-        # No indexed field to query server-side, so this stays the ranked
-        # substring search it always was: fetch candidates, verify locally.
+        # No indexed field to query server-side. The web API's quick search
+        # indexes neither ``citationKey`` nor ``extra``, so the ranked search
+        # only finds a key that also happens to appear in another field. When
+        # it misses, scan the top-level items — child attachments and notes
+        # never carry a citekey — and verify each one locally.
         from zotero_mcp.tools import _helpers
+
+        def matches(item: dict) -> bool:
+            data = item.get("data", {})
+            return data.get("citationKey") == citekey or _helpers._extra_has_citekey(
+                data.get("extra", ""), citekey
+            )
 
         self._zot.add_parameters(
             q=citekey, qmode="everything", itemType="-attachment", limit=25
         )
         for item in self._zot.items() or []:
-            data = item.get("data", {})
-            if data.get("citationKey") == citekey or _helpers._extra_has_citekey(
-                data.get("extra", ""), citekey
-            ):
+            if matches(item):
                 return item
-        return None
+        found = _utils._paginate(self._zot.top, keep=matches, max_items=1)
+        return found[0] if found else None
 
     def recent_items(self, *, limit: int = 10, collection_key: str | None = None) -> list[dict]:
         if collection_key:
@@ -564,6 +584,8 @@ class FallbackBackend:
             try:
                 return target(*args, **kwargs)
             except UnsupportedByBackend as exc:
+                if _strict_sqlite.is_active():
+                    raise _strict_sqlite.declined(attr, exc) from exc
                 logger.debug("SQLite cannot answer %s (%s); asking the API", attr, exc)
                 return getattr(self._api_backend(), attr)(*args, **kwargs)
 
@@ -606,15 +628,20 @@ def get_library_backend(zot=None) -> LibraryBackend:
                 lambda: ApiBackend(zot if zot is not None else _client.get_zotero_client()),
             )
 
+    if _strict_sqlite.is_active():
+        raise _strict_sqlite.no_database()
+
     return ApiBackend(zot if zot is not None else _client.get_zotero_client())
 
 
-def attachment_path_for(key: str) -> Path | None:
+def attachment_path_for(key: str, *, own_only: bool = False) -> Path | None:
     """Best local path for an attachment key, or None.
 
     Reads ``zotero.sqlite`` directly regardless of the configured backend:
     the file lives on this machine either way, and resolving it locally is
     both faster than downloading and the only option with Zotero closed.
+    A parent item's key gives its first attachment on disk, unless
+    ``own_only``, for a caller that has not checked ``key`` is an attachment.
     """
     reader = _sqlite_reader()
     if reader is None:
@@ -624,8 +651,8 @@ def attachment_path_for(key: str) -> Path | None:
     # for them and every outline read copied or downloaded a file that was
     # already on disk.
     path = reader.resolve_attachment_file(key)
-    if path is not None:
-        return Path(path)
+    if path is not None or own_only:
+        return Path(path) if path is not None else None
     for entry in reader.get_attachment_paths(key):
         resolved = entry.get("resolved_path")
         if resolved and entry.get("exists"):

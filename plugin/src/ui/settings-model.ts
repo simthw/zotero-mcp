@@ -1,23 +1,22 @@
 // What the settings screen changes, as pure functions from the current settings to a patch for
 // `host.setSettings`. No DOM, so the save paths are unit-tested against the fake host.
 import type { BackendId, Catalog, ModeOption, PanelSettings, PromptEntry } from "../types.ts";
+import { t } from "../i18n.ts";
+import type { Key } from "../i18n.ts";
 
 /** Friendly one-liners for the permission modes we know; anything else shows the catalog's own words. */
-const MODE_HELP: Record<string, string> = {
-  default: "Asks before editing files or running commands.",
-  acceptEdits: "Edits files without asking; still asks before running commands.",
-  plan: "Reads and plans. Changes nothing.",
-  auto: "Lets the agent judge what needs asking.",
-  bypassPermissions: "Never asks. Use with care.",
-  "read-only": "Reads files; asks before anything else.",
-  "workspace-write": "Edits inside the workspace; asks before going outside it.",
-  agent: "Works on its own inside the workspace; asks for the rest.",
-  "agent-full-access": "No sandbox and no questions. Use with care.",
+const MODE_HELP: Record<string, Key> = {
+  default: "mode.default", acceptEdits: "mode.acceptEdits", plan: "mode.plan", auto: "mode.auto", bypassPermissions: "mode.bypassPermissions",
+  "read-only": "mode.readOnly", "workspace-write": "mode.workspaceWrite", agent: "mode.agent", "agent-full-access": "mode.agentFullAccess",
+  build: "mode.build",
 };
-export const modeHelp = (m: ModeOption): string => MODE_HELP[m.id] ?? m.description ?? "";
+/** Backends with no subscription or API key of ours: they run on the providers set up in the agent itself. */
+export const ownProviders = (b: BackendId): boolean => b === "pi" || b === "opencode";
+
+export const modeHelp = (m: ModeOption): string => (MODE_HELP[m.id] ? t(MODE_HELP[m.id]!) : m.description ?? "");
 
 export type PerBackend = "model" | "mode" | "effort";
-export type FlagKey = "followFocus" | "attachSelection" | "attachAreas" | "enterToSend" | "showThinking" | "expandTools" | "showUsage" | "openAtStart" | "translate";
+export type FlagKey = "followFocus" | "attachSelection" | "attachAreas" | "enterToSend" | "showThinking" | "expandTools" | "showUsage" | "openAtStart" | "scrollOnSend" | "translate";
 
 /** Model, mode, effort and the translator's model are saved per backend: ids from one backend mean nothing to another. */
 export const setPerBackend = (s: PanelSettings, key: PerBackend | "translateModel", backend: BackendId, id: string): Partial<PanelSettings> =>
@@ -80,11 +79,11 @@ export const removePrompt = (list: PromptEntry[], i: number): PromptEntry[] => l
 
 /** The shortcut reference: [what, keys] for this platform. */
 export const shortcuts = (mac: boolean, enterToSend: boolean): [string, string][] => [
-  ["Show or hide the panel", mac ? "⌘⌥L" : "Ctrl+Alt+L"],
-  ["Run a pinned skill or prompt", mac ? "⌘⌃ 1–4" : "Ctrl+Alt+1–4"],
-  ["Skills and prompts", "/"],
-  ["Send", enterToSend ? "Enter" : mac ? "⌘Enter" : "Ctrl+Enter"],
-  ["New line", enterToSend ? "Shift+Enter" : "Enter"],
-  ["Stop the answer", "Esc"],
-  ["Add an item or collection", "@"],
+  [t("keys.toggle"), mac ? "⌘⌥L" : "Ctrl+Alt+L"],
+  [t("keys.pinned"), mac ? "⌘⌃ 1–4" : "Ctrl+Alt+1–4"],
+  [t("keys.slash"), "/"],
+  [t("keys.send"), enterToSend ? "Enter" : mac ? "⌘Enter" : "Ctrl+Enter"],
+  [t("keys.newline"), enterToSend ? "Shift+Enter" : "Enter"],
+  [t("keys.stop"), "Esc"],
+  [t("keys.mention"), "@"],
 ];

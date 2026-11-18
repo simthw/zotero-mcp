@@ -161,6 +161,13 @@ class TestArgumentHelpers:
             ["annotations", "create", "--attachment-key", "A1", "--page", "3",
              "--rect", "0.1,0.2,0.3,0.4", "--tags", "x,y", "--color", "green"])
         assert parsed.text is None and parsed.rect == "0.1,0.2,0.3,0.4"
+        assert parsed.underline is False
+
+    def test_create_takes_underline(self):
+        parsed = build_parser().parse_args(
+            ["annotations", "create", "--attachment-key", "A1", "--page", "3",
+             "--text", "exact words", "--underline"])
+        assert parsed.underline is True
 
     def test_batch_and_layout_parse(self):
         parser = build_parser()
@@ -188,6 +195,19 @@ class TestCreateForwarding:
         assert kwargs["text"] is None
         assert kwargs["color"] == "#a28ae5"
         assert kwargs["tags"] == ["a", "b"]
+
+
+class TestUnderlineForwarding:
+    def test_underline_reaches_the_tool(self, capsys):
+        annotations = MagicMock()
+        annotations.create_annotation.return_value = "Successfully created underline annotation"
+        args = _args(subcommand="create", attachment_key="A1", page=2, text="exact words",
+                     rect=None, note=None, underline=True, comment=None, color="red", tags=None)
+        env, tools = _with_tools(annotations)
+        with env, tools:
+            cli_standalone.cmd_annotations(args)
+        kwargs = annotations.create_annotation.call_args.kwargs
+        assert kwargs["underline"] is True and kwargs["text"] == "exact words"
 
 
 class TestNoteForwarding:
@@ -291,6 +311,16 @@ class TestBatch:
         assert annotations.create_annotations.call_args.kwargs["dry_run"] is True
         assert code == 0
         assert "(found on p3): the words" in out and "Located 1/1" in out
+
+    def test_dry_run_reports_underlines_like_highlights(self, tmp_path, capsys):
+        outcome = [{"index": 1, "page": 2, "type": "underline", "ok": True,
+                    "page_found": 2, "matched_text": "the words"}]
+        annotations, out, code = self._run(
+            tmp_path, capsys, [{"page": 2, "text": "the words", "underline": True}],
+            lambda key, specs, **kwargs: outcome, json_out=False, dry_run=True)
+        assert code == 0
+        assert "#1 p2: the words" in out
+        assert annotations.create_annotations.call_args.args[1][0]["underline"] is True
 
     def test_all_succeeded_exits_zero_with_a_summary(self, tmp_path, capsys):
         outcome = [{"index": 1, "page": 1, "type": "highlight", "ok": True, "annotation_key": "DDDD4444"}]
@@ -519,6 +549,33 @@ class TestCreateAnnotations:
         assert position["pageIndex"] == 0
         # Point (306, 198) from the top of a 612 x 792 page is y = 594 in PDF space.
         assert position["rects"] == [[295.0, 583.0, 317.0, 605.0]]
+
+    def test_underline_is_placed_like_a_highlight(self, writer):
+        annotations, fake, _fetches = writer
+        results = annotations.create_annotations("ATT00001", [
+            {"page": 1, "text": "sequential nature precludes"},
+            {"page": 1, "text": "sequential nature precludes", "underline": True, "color": "#ff6666"},
+        ], ctx=MagicMock())
+
+        assert [r["type"] for r in results] == ["highlight", "underline"]
+        assert all(r["ok"] for r in results)
+        highlight, underline = fake.create_items.call_args.args[0]
+        assert [k for k in underline if k.startswith("annotation")][0] == "annotationType"
+        assert underline["annotationType"] == "underline"
+        assert underline["annotationText"] == "sequential nature precludes"
+        assert underline["annotationColor"] == "#ff6666"
+        for key in ("annotationPosition", "annotationSortIndex", "annotationPageLabel"):
+            assert underline[key] == highlight[key]
+
+    @pytest.mark.parametrize("spec, error", [
+        ({"page": 1, "rect": [0.1, 0.1, 0.1, 0.1], "underline": True}, "underline applies to text"),
+        ({"page": 1, "note": [0.5, 0.5], "comment": "c", "underline": True}, "underline applies to text"),
+        ({"page": 1, "text": "sequential", "underline": "yes"}, "true or false"),
+    ])
+    def test_bad_underline_specs_fail_alone(self, writer, spec, error):
+        annotations, _fake, _fetches = writer
+        (result,) = annotations.create_annotations("ATT00001", [spec], ctx=MagicMock())
+        assert not result["ok"] and error in result["error"]
 
     @pytest.mark.parametrize("spec, error", [
         ({"page": 1, "note": [0.5, 0.5]}, "needs a comment"),
@@ -813,6 +870,26 @@ class TestRenderPages:
         # 40% of the page width, rendered larger than that share of the full page.
         assert crop[0]["width"] > 0.4 * full[0]["width"] * 1.5
 
+    def test_grid_draws_lines_in_whole_page_coordinates(self, two_page_pdf):
+        from zotero_mcp.tools import read_pdf
+
+        def png_pixel(png, x, y):
+            return tuple(fitz.Pixmap(png).pixel(int(x), int(y)))[:3]
+
+        _h, (plain,) = read_pdf.render_pdf_pages("KEY00001", 1, ctx=MagicMock())
+        _h, (gridded,) = read_pdf.render_pdf_pages("KEY00001", 1, grid=True, ctx=MagicMock())
+        assert (plain["width"], plain["height"]) == (gridded["width"], gridded["height"])
+        x, y = 0.5 * gridded["width"], 0.6 * gridded["height"]
+        assert png_pixel(plain["png"], x, y + 5) == (255, 255, 255)
+        assert png_pixel(gridded["png"], x, y + 5) != (255, 255, 255)      # on the 0.5 line
+        assert png_pixel(gridded["png"], 0.43 * gridded["width"], y + 5) == (255, 255, 255)   # between lines
+
+        # Zoomed to x 0.1-0.5, the 0.3 line sits half way across the crop, not at 0.3 of its width.
+        _h, (crop,) = read_pdf.render_pdf_pages("KEY00001", 1, rect=[0.1, 0.1, 0.4, 0.2],
+                                                grid=True, ctx=MagicMock())
+        assert png_pixel(crop["png"], 0.5 * crop["width"], 0.6 * crop["height"]) != (255, 255, 255)
+        assert png_pixel(crop["png"], 0.3 * crop["width"], 0.6 * crop["height"]) == (255, 255, 255)
+
     @pytest.mark.parametrize("kwargs,code", [
         (dict(rect=[0.5, 0.5, 0.6, 0.1]), "bad_rect"),
         (dict(rect="nope"), "bad_rect"),
@@ -870,6 +947,29 @@ class TestCliReadImages:
         assert image["path"] == os.path.join(str(tmp_path), "KEY00001-p4-region.png")
         with open(image["path"], "rb") as handle:
             assert handle.read() == b"\x89PNGdata"
+
+    def test_grid_reaches_the_renderer_and_marks_the_file_name(self, tmp_path, capsys, monkeypatch):
+        from zotero_mcp.tools import read_pdf
+
+        seen = {}
+
+        def render(*a, **k):
+            seen.update(k)
+            return "# Pages 4-4 of Paper", [{"page": 4, "png": b"\x89PNGdata", "width": 10, "height": 20}]
+
+        monkeypatch.setattr(read_pdf, "render_pdf_pages", render)
+        args = _args(item_key="KEY00001", start_page=4, end_page=None, format="image", rect=None,
+                     grid=True, out=str(tmp_path), json_out=True)
+        with patch("zotero_mcp.cli_standalone.setup_zotero_environment"):
+            cli_standalone.cmd_read(args)
+        assert seen["grid"] is True
+        assert json.loads(capsys.readouterr().out)["data"]["images"][0]["path"].endswith("KEY00001-p4-grid.png")
+
+    def test_grid_without_image_format_is_a_usage_error(self):
+        with pytest.raises(CliError) as exc:
+            cli_standalone.cmd_read(_args(item_key="K", start_page=1, end_page=None,
+                                          format="text", rect=None, grid=True, out=None))
+        assert exc.value.code == "bad_grid"
 
     def test_rect_without_image_format_is_a_usage_error(self):
         with pytest.raises(CliError) as exc:

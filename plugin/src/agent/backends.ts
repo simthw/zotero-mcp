@@ -16,17 +16,32 @@
 //   pi-acp 0.0.34            configOptions: model (hundreds of "provider/model") / thought_level;
 //                            `modes` are pi's thinking levels, NOT permissions (ignored here);
 //                            session/set_config_option works. No permission frames at all.
-import type { BackendId, Spawner } from "../types.ts";
-import { findBinary } from "./env.ts";
+//   opencode 1.19.5          no bridge: the CLI speaks ACP itself (`opencode acp`; it also opens an HTTP server for its own
+//                            use on a free 127.0.0.1 port). configOptions only, no `models`/`modes` blocks: model (category
+//                            model, "provider/model" ids; with no provider set up, OpenCode Zen's free models, default
+//                            "opencode/big-pickle") / mode (build, plan: OpenCode's agents) / effort (category
+//                            thought_level, only for a model with variants, e.g. low/medium/high/max plus "default").
+//                            session/set_config_option, session/set_model and session/set_mode all work; session/load
+//                            replays the history (loadSession: true). No permission frames: build edits and runs commands
+//                            as OpenCode's own permission config says (by default without asking), plan cannot edit.
+//                            Its /compact works but is not advertised (available_commands: init, review, ...), so it is
+//                            not offered here. Reads AGENTS.md and both .agents/skills and .claude/skills. A provider
+//                            error (e.g. Zen's "Free usage limit reached") is only logged: session/prompt never answers,
+//                            and Stop (session/cancel) is the way out. Measured 2026-11-12 with no account (Zen's free
+//                            models): handshake, chat, session/load, the zotero-cli skill and a locked Translate session,
+//                            through this runtime. Not measured: paid providers' model lists and effort names, Windows.
+import type { BackendId, BuiltinBackendId, Spawner } from "../types.ts";
+import { dirnameOf, findBinary } from "./env.ts";
+import { shimTarget } from "./windows.ts";
+import { t } from "../i18n.ts";
+import type { Key } from "../i18n.ts";
 
 export interface BackendSpec {
   id: BackendId;
   label: string;
-  /** npm package of the ACP bridge, and the version we pin (checked with `npm view`). */
-  pkg: string;
-  version: string;
   /** The CLI the user must have on their login PATH, when the backend needs one. */
-  cli?: { name: string; hint: string };
+  /** `hint`: how to install it, a message key (shown in the user's language). */
+  cli?: { name: string; hint: Key };
   /** How the model is chosen after session/new: a config option, or session/set_model. */
   modelVia: "config_option" | "set_model";
   /** Where the reasoning effort lives: a config option (`effort` / `thought_level`), or a `[level]` suffix on model ids (codex). */
@@ -41,17 +56,49 @@ export interface BackendSpec {
   claudeMeta: boolean;
   /** Its advertised `/compact` was verified live (summarises on demand, the chat goes on): Claude, and Codex (2026-10-05, test/live/skills.live.ts). pi-acp lists one too, but reported no summary. */
   compacts: boolean;
-  /** The terminal command that continues a session by its id, run from the folder the session ran in. */
+  /**
+   * Measured: this backend never pushes a titled `session_info_update`, but serves LLM-generated titles on
+   * `session/list` (opencode v2.2.7, probed 2026-11-13). The pull after a turn's end adopts the live session's
+   * title unless it matches `placeholder` — the backend's own name for a session that never got one
+   * (opencode: "New session - <ISO timestamp>").
+   */
+  titlesViaList?: { placeholder?: RegExp };
+}
+
+export interface BridgeSpec extends BackendSpec {
+  /** npm package of the ACP bridge, and the pinned version. */
+  pkg: string;
+  version: string;
   resume: (sessionId: string) => string;
 }
 
-export const BACKENDS: Record<BackendId, BackendSpec> = {
+/** A CLI that is itself an ACP agent (`opencode acp`): no bridge to install, no Node needed. */
+export interface NativeSpec extends BackendSpec {
+  cli: { name: string; hint: Key };
+  /** The arguments that make the CLI serve ACP over stdio. */
+  acpArgs: string[];
+  resume: (sessionId: string) => string;
+}
+
+export const isNative = (spec: BackendSpec): spec is NativeSpec => "acpArgs" in spec;
+
+// An unmeasured endpoint: prefer the wire IDs in ACP's models block, falling back to config options.
+// Only advertised choices are shown; no vendor login probe, compaction claim or terminal resume command.
+const CUSTOM: BackendSpec = {
+  id: "custom", label: "Custom agent", modelVia: "set_model", effortVia: "config_option",
+  apiKeyVars: [], permissionModes: true, briefVia: "first-prompt", claudeMeta: false, compacts: false,
+};
+
+/** The backends run through an npm bridge; OpenCode is its own ACP agent. */
+export type BridgedBackendId = Exclude<BuiltinBackendId, "opencode">;
+
+export const BACKENDS: Record<BridgedBackendId, BridgeSpec> & Record<"opencode", NativeSpec> = {
   "claude-code": {
     id: "claude-code",
     label: "Claude Code",
     pkg: "@agentclientprotocol/claude-agent-acp",
     version: "0.85.1",
-    cli: { name: "claude", hint: "Install Claude Code (https://claude.com/claude-code), then run `claude` once to sign in." },
+    cli: { name: "claude", hint: "agent.install.claude" },
     modelVia: "config_option",
     effortVia: "config_option",
     apiKeyVars: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
@@ -66,7 +113,7 @@ export const BACKENDS: Record<BackendId, BackendSpec> = {
     label: "Codex",
     pkg: "@agentclientprotocol/codex-acp",
     version: "2.1.1",
-    cli: { name: "codex", hint: "Install Codex (npm i -g @openai/codex), then run `codex login`." },
+    cli: { name: "codex", hint: "agent.install.codex" },
     modelVia: "set_model",
     effortVia: "model-suffix",
     apiKeyVars: ["OPENAI_API_KEY", "CODEX_API_KEY"],
@@ -81,7 +128,7 @@ export const BACKENDS: Record<BackendId, BackendSpec> = {
     label: "pi",
     pkg: "pi-acp",
     version: "0.0.34",
-    cli: { name: "pi", hint: "Install pi (npm i -g @earendil-works/pi-coding-agent) and configure a provider." },
+    cli: { name: "pi", hint: "agent.install.pi" },
     modelVia: "config_option",
     effortVia: "config_option",
     apiKeyVars: [],
@@ -91,11 +138,28 @@ export const BACKENDS: Record<BackendId, BackendSpec> = {
     compacts: false,
     resume: (id) => `pi --session ${id}`,
   },
+  opencode: {
+    id: "opencode",
+    label: "OpenCode",
+    acpArgs: ["acp"],
+    cli: { name: "opencode", hint: "agent.install.opencode" },
+    modelVia: "config_option",
+    effortVia: "config_option",
+    // OpenCode runs on whatever providers the user set up in it (or Zen's free models): no key of ours to strip.
+    apiKeyVars: [],
+    permissionModes: true,
+    briefVia: "first-prompt",
+    claudeMeta: false,
+    compacts: false,
+    titlesViaList: { placeholder: /^New session - / },
+    resume: (id) => `opencode --session ${id}`,
+  },
 };
 
-export const BACKEND_IDS: BackendId[] = ["claude-code", "codex", "pi"];
+export const BACKEND_IDS: BuiltinBackendId[] = ["claude-code", "codex", "pi", "opencode"];
 
 export function backendOf(id: BackendId): BackendSpec {
+  if (id === "custom") return CUSTOM;
   const b = BACKENDS[id];
   if (!b) throw new Error(`unknown backend "${id}"`);
   return b;
@@ -106,21 +170,36 @@ interface LoginProbe {
   /** undefined = the CLI cannot tell. */
   loggedIn?: boolean;
   account?: string;
+  /** A failed check is not evidence that the user is signed out. */
+  reason?: string;
+  /** The CLI could not read its own config file: chats with it fail too, whatever the login (#811). */
+  configError?: boolean;
 }
 
-/** `claude auth status` prints JSON; `codex login status` prints a sentence. pi has no login of its own. */
-export async function probeLogin(spawner: Spawner, env: Record<string, string>, id: BackendId, cliPath: string): Promise<LoginProbe> {
+/**
+ * `claude auth status` prints JSON; `codex login status` prints a sentence. pi has no login of its own, and neither does
+ * OpenCode in a sense that matters here: `opencode auth list` counts stored credentials, but with none it still chats on
+ * OpenCode Zen's free models (and keys in the environment count too), so no answer of it means "signed out".
+ */
+export async function probeLogin(spawner: Spawner, env: Record<string, string>, id: BackendId, cliPath: string, cliArgs: string[] = []): Promise<LoginProbe> {
   try {
     if (id === "claude-code") {
-      const r = await spawner.run(cliPath, ["auth", "status"], { env, timeoutMs: 15_000 });
+      const r = await spawner.run(cliPath, [...cliArgs, "auth", "status"], { env, timeoutMs: 15_000 });
       const s = JSON.parse(r.stdout) as { loggedIn?: boolean; subscriptionType?: string; authMethod?: string };
       if (typeof s.loggedIn !== "boolean") return {};
       const plan = s.subscriptionType ? `Claude ${s.subscriptionType[0]!.toUpperCase()}${s.subscriptionType.slice(1)}` : undefined;
       return s.loggedIn ? { loggedIn: true, ...(plan ? { account: plan } : s.authMethod ? { account: s.authMethod } : {}) } : { loggedIn: false };
     }
     if (id === "codex") {
-      const r = await spawner.run(cliPath, ["login", "status"], { env, timeoutMs: 15_000 });
+      const r = await spawner.run(cliPath, [...cliArgs, "login", "status"], { env, timeoutMs: 15_000 });
+      if (r.code === null || r.code < 0) {
+        return { loggedIn: false, reason: t("agent.codexLoginCheck", { code: r.code ?? "?" }) };
+      }
       const text = `${r.stdout}\n${r.stderr}`;
+      const config = /Error loading config[^:]*:\s*([\s\S]+)/i.exec(text)?.[1]?.replace(/\s+/g, " ").trim().replace(/\.$/, "");
+      if (r.code !== 0 && config) return { loggedIn: false, configError: true, reason: t("agent.codexConfig", { error: config }) };
+      // Newer Codex reports an API key as "API key configured - sk-…" rather than "Logged in using an API key" (#785).
+      if (r.code === 0 && /api key configured/i.test(text)) return { loggedIn: true, account: "API key" };
       if (r.code === 0 && /logged in/i.test(text)) {
         const via = /using (.+)/i.exec(text)?.[1]?.trim();
         return { loggedIn: true, ...(via ? { account: via } : {}) };
@@ -140,8 +219,28 @@ export async function findCli(spawner: Spawner, env: Record<string, string>, spe
   return findBinary(spawner, env, spec.cli.name, spec.id === "claude-code" && home ? [`${home}/.local/bin`] : []);
 }
 
+/** The ACP bridge spawns the override directly, so it cannot use a Windows batch file. */
+export async function findClaudeExecutable(spawner: Spawner, env: Record<string, string>, node: string): Promise<string | null> {
+  const cli = await findCli(spawner, env, BACKENDS["claude-code"]);
+  if (!cli || !spawner.windows || !/\.(cmd|bat)$/i.test(cli)) return cli;
+
+  try {
+    const opts = { env, timeoutMs: 10_000 };
+    const shim = await spawner.run(node, ["-e", 'process.stdout.write(require("fs").readFileSync(process.argv[1], "utf8"))', cli], opts);
+    const target = shim.code === 0 ? shimTarget(shim.stdout) : null;
+    if (!target || !/\.exe$/i.test(target)) return null;
+    const file = `${dirnameOf(cli)}\\${target}`;
+    const check = await spawner.run(node, ["-e", 'process.exit(require("fs").statSync(process.argv[1], {throwIfNoEntry:false})?.isFile() ? 0 : 1)', file], opts);
+    return check.code === 0 ? file : null;
+  } catch {
+    // The bridge can use its bundled CLI if this shim cannot be resolved.
+    return null;
+  }
+}
+
 /** `cd "<folder>" && <resume command>`: what to paste in a terminal to continue a chat started in the panel. */
-export function resumeCommand(backend: BackendId, cwd: string, sessionId: string): string {
+export function resumeCommand(backend: BackendId, cwd: string, sessionId: string): string | null {
+  if (backend === "custom") return null;
   const quoted = `'${cwd.replace(/'/g, `'\\''`)}'`;
   return `cd ${quoted} && ${BACKENDS[backend].resume(sessionId)}`;
 }

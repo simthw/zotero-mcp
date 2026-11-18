@@ -36,7 +36,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
     # PDF text extraction. Rust with prebuilt abi3 wheels for every platform
     # we support and no Python dependencies of its own. Pinned exactly while
-    # it is pre-1.0 — the extraction output is user-visible.
+    # it is pre-1.0 — the extraction output is user-visible. A bump also means
+    # the version and hashes in flake.nix and the pin in .github/workflows/release.yml.
     "pdf-inspector==0.2.6",
     # HTML snapshots only.
     "markdownify>=1.2",
@@ -118,7 +119,7 @@ artifacts = ["src/zotero_mcp/chat_plugin/zotero-agent.xpi"]
 
 # hatchling reads only the top-level .gitignore, so the ignores in plugin/ (and plugin/preview/) are repeated here.
 [tool.hatch.build.targets.sdist]
-exclude = ["plugin/node_modules", "plugin/dist", "plugin/.dev*", "plugin/preview/shots", "plugin/**/*.xpi"]
+exclude = ["site", "plugin/node_modules", "plugin/dist", "plugin/.dev*", "plugin/preview/shots", "plugin/**/*.xpi"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/zotero_mcp"]

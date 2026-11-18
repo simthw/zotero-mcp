@@ -12,12 +12,12 @@ The MCP server sends every enabled tool's name, description and JSON parameter s
 
 | Route | Tokens in context | When it is paid |
 |---|---:|---|
-| MCP, default profile (41 tools) | 16,799 | every request |
-| MCP, `ZOTERO_MCP_TOOLSETS=none` (34 tools) | 14,301 | every request |
-| MCP, `ZOTERO_MCP_TOOLSETS=all` (53 tools) | 20,926 | every request |
+| MCP, default profile (38 tools) | 7,939 | every request |
+| MCP, `ZOTERO_MCP_TOOLSETS=none` (31 tools) | 6,863 | every request |
+| MCP, `ZOTERO_MCP_TOOLSETS=all` (50 tools) | 11,225 | every request |
 | CLI skill, frontmatter only | 98 | always |
 | CLI skill, body loaded | 2,400 | once the skill fires |
-| CLI skill + full command reference | 6,141 | worst case |
+| CLI skill + full command reference | 6,582 | worst case |
 
 That is the *fixed* cost only. It does not measure task success, output size, or how many round trips each route takes to finish a job — a cheaper surface that gets the answer wrong is not cheaper. Numbers are `cl100k_base` tokens and are re-measured, not estimated; `tests/test_context_cost_claim.py` fails if the relationship stops holding.
 
@@ -86,6 +86,10 @@ zotero-cli get children ABC123                 # attachments and notes
 # Edit item metadata
 zotero-cli edit ABC123 --title "New Title"
 zotero-cli edit ABC123 --add-tags "reviewed,important" --date "2024"
+zotero-cli edit BOOK1234 --field seriesNumber=2
+zotero-cli edit SOFT1234 --field versionNumber=v9.15 --field extra=
+# Every tag flag is comma-separated; a JSON array addresses names with commas
+zotero-cli edit ABC123 --remove-tags '["Barrel organ, Hydraulic"]'
 
 # Notes and annotations
 zotero-cli notes list ABC123
@@ -97,9 +101,12 @@ zotero-cli ann search "highlight text"
 
 # Add items
 zotero-cli add doi 10.1038/s41586-021-03819-2
+zotero-cli add doi 10.1038/s41586-021-03819-2 --attach-file ~/papers/p.pdf -c Course --tags week-3   # add and attach a local PDF in one call
+zotero-cli add folder ~/papers/week3 -c Course --tags week-3 [--dry-run]   # every PDF in a folder, by the DOI inside it
 zotero-cli add url https://arxiv.org/abs/2301.00001
 zotero-cli add file --filepath /path/to/paper.pdf --title "Override Title"
 zotero-cli add isbn 9780262046305
+zotero-cli add pmid 31842878,16446872                # PubMed record: keeps PMID/PMCID, MeSH tags
 zotero-cli add bibtex --file refs.bib                # or --bibtex '@article{...}'
 zotero-cli add bibtex --bibtex - < refs.bib          # stdin via -
 zotero-cli add csl-json --file refs.json             # or --json '...' / --json -
@@ -121,17 +128,19 @@ zotero-cli add doi 10.1038/s41586-021-03819-2 -c "New Topic" --create-collection
 # --collections remains the comma-separated form
 
 # Collections and tags
-zotero-cli coll list                          # list collections (short alias)
+zotero-cli get collections
 zotero-cli coll search "PhD Research"
-zotero-cli tags list
+zotero-cli get tags
 
 # Semantic search database
 zotero-cli db update
 zotero-cli db update --fulltext --force-rebuild
+zotero-cli db update --batch --auto-loop    # same flags as zotero-mcp update-db
+zotero-cli db batch-status                  # reads the configured provider's batches (or --provider)
 zotero-cli db status
 
 # Library and duplicates
-zotero-cli library info
+zotero-cli get libraries
 zotero-cli duplicates find
 
 # Reading PDFs — find the section first, then read only those pages
@@ -140,19 +149,27 @@ zotero-cli read ABC123 --find "robustness check"          # ranked pages with sh
 zotero-cli read ABC123 --start-page 42 --end-page 55      # flags garbled math, figures, tables
 zotero-cli read ABC123 --start-page 44 --format image    # PNG page images (up to 10 pages)
 zotero-cli read ABC123 --start-page 44 --format image --rect 0.35,0.49,0.3,0.05   # zoom in
+zotero-cli read ABC123 --start-page 44 --format image --grid   # with a labelled 0.05 grid to read coordinates from
 zotero-cli path ABC123                        # where the file lives on disk
 zotero-cli open ABC123 --page 44              # show page 44 in the Zotero reader
 zotero-cli open --annotation ANN01            # jump to an annotation and select it
 
 # Annotating a PDF — boxes to aim at, then a checked plan written in one run
-zotero-cli --json layout ATTACH01 --pages 3-9            # figure, table and equation boxes
+zotero-cli --json layout ATTACH01 --pages 3-9 --panels   # figure, table and equation boxes, plus one per panel letter
 zotero-cli annotations create --attachment-key ATTACH01 --page 4 --text "exact words" --color yellow
+zotero-cli annotations create --attachment-key ATTACH01 --page 5 --text "exact words" --underline
 zotero-cli annotations create --attachment-key ATTACH01 --page 3 --rect 0.32,0.09,0.36,0.41 --comment "Figure 1"
+zotero-cli annotations create --attachment-key ATTACH01 --page 3 --rect auto --near 0.5,0.1,0.4,0.3   # fit to the nearest panel
+zotero-cli --json annotations list --item-key ATTACH01 --positions   # stored page, rects and a rect to pass back to update
+zotero-cli annotations update ANN01 --rect 0.30,0.10,0.36,0.40   # move or resize a box in place (--page N to change page)
 zotero-cli annotations batch --attachment-key ATTACH01 --file plan.jsonl --dry-run   # where each highlight lands
+zotero-cli annotations batch --attachment-key ATTACH01 --file plan.jsonl --dry-run --render out/   # draw the plan on page PNGs
 zotero-cli annotations batch --attachment-key ATTACH01 --file plan.jsonl             # write them all
+zotero-cli annotations preview --attachment-key ATTACH01 --pages 3-5 --out out/   # draw what is stored
 
 # Attachments, deletion, bibliographies
 zotero-cli attach ABC123 --file /path/to/paper.pdf
+zotero-cli attach ABC123 --file /path/to/paper.pdf --link   # link in place, nothing uploaded
 zotero-cli delete item ABC123
 zotero-cli export --item-keys ABC123,DEF456 --style apa
 zotero-cli export --collection COLL01 --format bibtex
@@ -172,6 +189,14 @@ zotero-cli batch --item-keys ABC123,DEF456 --add-tags screened
 zotero-cli batch --query "machine learning" --add-tags survey --limit 100
 ```
 
+`attach --file` accepts any existing regular file, including VTT transcripts,
+TXT files and images. Symlinks and Windows `.lnk` shortcuts are rejected. Unknown
+file types use `application/octet-stream`; storage does not imply preview or
+full-text indexing support. `--url` remains PDF-only. `add` keeps its existing
+document-import formats and parses `.json` / `.bib` as citation data.
+
+For metadata without a dedicated `edit` flag, repeat `--field NAME=VALUE` using Zotero's field names. Values stay strings; only the first `=` separates the name from the value, and `--field extra=` clears Extra. Generic assignments override matching named flags; the last assignment to the same name wins. Fields use the same item-type schema validation as other edits: unknown names fail, and fields unavailable on the item's type are reported as skipped.
+
 An annotation plan (`plan.jsonl`) is one JSON object per line: `{"page": 4, "text": "exact words", "comment": "...", "color": "yellow"}` for a highlight, or `{"page": 3, "rect": "x,y,w,h", "comment": "..."}` for a box. Colors take Zotero's names: yellow, red, green, blue, purple, magenta, orange, gray.
 
 Paging: listings cap at `--limit` and the response names the next offset.
@@ -187,3 +212,7 @@ Add `-v` anywhere to see progress messages (e.g., which API calls are made):
 ```bash
 zotero-cli -v search "CRISPR"
 ```
+
+## Finding a flag
+
+`zotero-cli --help` and `zotero-cli <command> --help` show the options of `zotero-cli`. The server's own commands (`serve`, `setup`, `update-db`, `batch-status`, `repair-db` and the rest) have a single reference: `zotero-mcp help` prints every command with every option, and `zotero-mcp help update-db` shows one command.

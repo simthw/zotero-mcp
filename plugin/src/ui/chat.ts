@@ -1,12 +1,14 @@
 // The conversation: the transcript state, the agent session behind it, and saving. No DOM here; the panel
 // renders `tr` whenever `onChange` fires.
 import type { AgentSession, ChatEvent, ContextChip, PanelHost, PanelSettings, SavedSession } from "../types.ts";
-import { clip, errMessage, nextId } from "./dom.ts";
+import { cleanTitle, clip, errMessage, nextId } from "./dom.ts";
 import { summary } from "./context.ts";
-import { planContext } from "./economy.ts";
+import { chipHash, planContext } from "./economy.ts";
 import { Persister } from "./persist.ts";
+import { ownProviders } from "./settings-model.ts";
 import { applyEvent, emptyTranscript, promptFor, replay } from "./transcript.ts";
 import type { TranscriptState } from "./transcript.ts";
+import { t } from "../i18n.ts";
 
 export interface ChatDeps {
   host: PanelHost;
@@ -22,6 +24,8 @@ export interface ChatDeps {
   sessionChanged(): void;
   /** What the agent reads for what the user typed (`/skill rest` becomes a plain instruction), in the agent's folder `cwd`. */
   expand(text: string, cwd: string): Promise<string>;
+  /** Which chips count as already shown changed (a send, a new chat, a compaction): repaint the composer's chips. */
+  shownChanged(): void;
 }
 
 export class Chat {
@@ -40,6 +44,8 @@ export class Chat {
   private cwd = "";
   /** Chips this agent session has already read (id -> fingerprint): unchanged ones are not sent again. */
   private sent = new Map<string, string>();
+  /** Chips this chat has shown in a sent message (id -> fingerprint): the composer stops showing them (isShown). */
+  private shown = new Map<string, string>();
   private persister: Persister;
   private d: ChatDeps;
 
@@ -48,11 +54,20 @@ export class Chat {
     this.persister = new Persister((ev) => this.write(ev));
   }
 
+  /**
+   * Already shown in a message of this chat. Where the user is (the open paper, a selected item or collection) counts
+   * once per item, whatever page they are on; what they point at (a selection, an area, a picture) until it changes.
+   */
+  isShown(c: ContextChip): boolean {
+    const h = this.shown.get(c.id);
+    return h !== undefined && (c.kind === "reader" || c.kind === "item" || c.kind === "collection" || h === chipHash(c));
+  }
+
   get busy(): boolean { return this.sending || this.tr.running !== null; }
 
   /** Fold an event into the transcript, ask for a render, and save it. */
   dispatch(ev: ChatEvent, persist = true): void {
-    if (ev.t === "notice" && ev.compacted) this.sent.clear(); // the summary may have dropped what was sent
+    if (ev.t === "notice" && ev.compacted) { this.sent.clear(); this.shown.clear(); this.d.shownChanged(); } // the summary may have dropped what was sent
     this.tr = applyEvent(this.tr, ev);
     this.d.onChange();
     if (persist && (this.saved || ev.t === "user")) this.persister.push(ev);
@@ -78,7 +93,7 @@ export class Chat {
         ...(set.model[set.backend] ? { model: set.model[set.backend] } : {}),
         ...(set.mode[set.backend] ? { mode: set.mode[set.backend] } : {}),
         ...(set.effort[set.backend] ? { effort: set.effort[set.backend] } : {}),
-        ...(set.backend !== "pi" ? { auth: set.auth[set.backend] } : {}),
+        ...(!ownProviders(set.backend) ? { auth: set.auth[set.backend] } : {}),
         ...(this.resume?.agentSessionId ? { resumeSessionId: this.resume.agentSessionId } : {}),
       });
       if (gen !== this.gen) { void sess.close().catch(() => {}); throw new Error("cancelled"); }
@@ -86,6 +101,7 @@ export class Chat {
       this.sent.clear(); // a new or resumed session: everything goes in full once (DESIGN.md "Context budget")
       this.resume = null;
       this.unsub = sess.on((ev) => {
+        if (ev.t === "session_title") this.takeAgentTitle(ev.title); // before dispatch: the persist writes the new title to the index
         this.dispatch(ev);
         if (ev.t === "turn_end") { this.d.turnEnded(ev.stop); this.persister.flush(); }
       });
@@ -111,10 +127,20 @@ export class Chat {
     if (this.busy || this.d.blockReason()) return;
     const host = this.d.host;
     if (!this.saved) {
-      this.saved = { id: nextId("s") + Date.now().toString(36), title: clip(text, 60), backend: host.getSettings().backend, cwd: this.resume?.cwd ?? "", agentSessionId: this.resume?.agentSessionId ?? "", updatedAt: Date.now() };
+      const set = host.getSettings();
+      // The chat's name starts on the first filled rung of its source's chain: agent summary can never be ready
+      // here (it arrives during the turn), so agent falls to the focused paper, then the question. The source is
+      // snapshotted onto the chat: changing the setting later never re-rules an existing conversation.
+      const titleSource = set.titleSource;
+      const paper = titleSource === "question" ? null : host.paperTitle(used);
+      this.saved = { id: nextId("s") + Date.now().toString(36), title: paper ? clip(paper, 80) : clip(text, 60), titleSource, backend: set.backend, cwd: this.resume?.cwd ?? "", agentSessionId: this.resume?.agentSessionId ?? "", updatedAt: Date.now() };
     }
     this.sending = true;
-    this.dispatch({ t: "user", id: nextId("u") + Date.now().toString(36), text, chips: used.map(summary) });
+    // The bubble shows what the composer showed: context already in this chat is only named to the agent, not shown again.
+    const fresh = used.filter((c) => !this.isShown(c));
+    for (const c of used) this.shown.set(c.id, chipHash(c));
+    this.d.shownChanged();
+    this.dispatch({ t: "user", id: nextId("u") + Date.now().toString(36), text, chips: fresh.map(summary) });
     try {
       const starting = this.ensureSession();
       // The focused paper's metadata and full-text file, prepared while the session starts (never longer than 1.5 s after).
@@ -130,6 +156,7 @@ export class Chat {
         this.sent = next;
         this.lastContext = plan;
       } catch { /* the question still goes */ }
+      if (ctx.images.length && !sess.supportsImages) this.dispatch({ t: "notice", level: "warn", message: t("chat.noImages") });
       const said = await this.d.expand(text, this.cwd);
       await sess.prompt({
         text: [ctx.text, said].filter(Boolean).join("\n\n"),
@@ -142,6 +169,35 @@ export class Chat {
       this.persister.flush();
       this.d.onChange();
     }
+  }
+
+  /** The agent named the conversation (ACP `session_info_update`): it replaces the fallback name whenever it arrives — unless the chat runs under another naming source, or the user has named it themselves. */
+  private takeAgentTitle(title: string): void {
+    const s = this.saved;
+    const name = cleanTitle(title); // agent text: control characters and length are ours to bound (it renders as text, never markup)
+    if (!s || !name || s.titleLocked || (s.titleSource === "paper" || s.titleSource === "question")) return;
+    this.saved = { ...s, title: name };
+  }
+
+  /** A user rename, from the chat header or the history list: it wins over every automatic source, permanently. Empty changes nothing. */
+  async rename(title: string): Promise<void> {
+    const s = this.saved;
+    const name = cleanTitle(title);
+    if (!s || !name || (s.title === name && s.titleLocked)) return;
+    // Take it in memory first: the transcript saver rewrites this chat's index entry from `this.saved` while the
+    // answer streams, and a write queued behind the rename must not put the old title (and no lock) back.
+    this.saved = { ...s, title: name, titleLocked: true };
+    this.d.onChange();
+    try { await this.d.host.renameSession(s.id, name); }
+    catch (e) { if (this.saved?.id === s.id) this.saved = s; this.d.onChange(); throw e; }
+  }
+
+  /** A rename done elsewhere (the history list): when it is this open chat's, mirror it, so the header stays in step. */
+  adoptRename(id: string, title: string): void {
+    const s = this.saved;
+    if (!s || s.id !== id) return;
+    this.saved = { ...s, title, titleLocked: true };
+    this.d.onChange();
   }
 
   /** Summarise the conversation now (the bridge's own /compact, when it has a verified one); a notice tells the result. */
@@ -166,7 +222,7 @@ export class Chat {
     if (msg === "cancelled") return;
     const running = this.tr.running;
     if (running) this.dispatch({ t: "turn_end", turn: running, stop: "error" });
-    this.dispatch({ t: "notice", level: "error", message: this.session ? `The agent stopped: ${msg}` : `Couldn't start the agent: ${msg}`, hint: "Check Status for what is missing, then send again." });
+    this.dispatch({ t: "notice", level: "error", message: this.session ? t("chat.stopped", { error: msg }) : t("chat.startFailed", { error: msg }), hint: t("chat.checkStatus") });
     // A rejected prompt means the bridge is gone: the next send starts a fresh one and resumes this chat.
     if (this.session) this.resume = this.saved;
     await this.closeSession();
@@ -217,6 +273,8 @@ export class Chat {
     this.resume = null;
     this.sending = false;
     this.lastContext = [];
+    this.shown.clear();
+    this.d.shownChanged();
     this.d.onChange();
   }
 
@@ -228,7 +286,7 @@ export class Chat {
       // A save that ends mid-turn (a crash) must not look like it is still streaming.
       if (this.tr.running) this.tr = applyEvent(this.tr, { t: "turn_end", turn: this.tr.running, stop: "cancelled" });
     } catch (e) {
-      this.tr = replay([{ t: "notice", level: "error", message: `Couldn't open that chat: ${errMessage(e)}` }]);
+      this.tr = replay([{ t: "notice", level: "error", message: t("chat.loadFailed", { error: errMessage(e) }) }]);
     }
     this.saved = s;
     this.resume = s;

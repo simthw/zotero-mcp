@@ -27,6 +27,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from zotero_mcp.embeddings.providers.default import DefaultEmbeddingFunction
 from zotero_mcp.embeddings.providers.gemini import GeminiEmbeddingFunction
 from zotero_mcp.embeddings.providers.huggingface import HuggingFaceEmbeddingFunction
 from zotero_mcp.embeddings.providers.ollama import OllamaEmbeddingFunction
@@ -130,15 +131,30 @@ def _remote_pacing_kwargs(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _with_max_input_tokens(ef: Any, config: dict[str, Any]) -> Any:
+    """Apply ``max_input_tokens`` from the config over the provider's default.
+
+    OpenAI-compatible and Ollama servers can run a model with a shorter context
+    than the 8000 tokens assumed for OpenAI (llama-server rejects a longer
+    input outright). Counted with tiktoken, so leave headroom for the model's
+    own tokenizer.
+    """
+    if config.get("max_input_tokens"):
+        ef.max_input_tokens = int(config["max_input_tokens"])
+    return ef
+
+
 def _openai_ef_factory(config: dict[str, Any]) -> Any:
-    return OpenAIEmbeddingFunction(
-        model_name=config.get("model_name", "text-embedding-3-small"),
-        api_key=config.get("api_key"),
-        base_url=config.get("base_url"),
-        request_batch_size=config.get("request_batch_size"),
-        dimensions=config.get("dimensions"),
-        max_input_tokens=config.get("max_input_tokens"),
-        **_remote_pacing_kwargs(config),
+    return _with_max_input_tokens(
+        OpenAIEmbeddingFunction(
+            model_name=config.get("model_name", "text-embedding-3-small"),
+            api_key=config.get("api_key"),
+            base_url=config.get("base_url"),
+            request_batch_size=config.get("request_batch_size"),
+            dimensions=config.get("dimensions"),
+            **_remote_pacing_kwargs(config),
+        ),
+        config,
     )
 
 
@@ -153,25 +169,28 @@ def _gemini_ef_factory(config: dict[str, Any]) -> Any:
 
 
 def _ollama_ef_factory(config: dict[str, Any]) -> Any:
-    return OllamaEmbeddingFunction(
-        model_name=config.get("model_name", "qwen3-embedding"),
-        base_url=config.get("base_url"),
-        timeout=config.get("timeout"),
-        request_batch_size=config.get("request_batch_size"),
-        **_remote_pacing_kwargs(config),
+    return _with_max_input_tokens(
+        OllamaEmbeddingFunction(
+            model_name=config.get("model_name", "qwen3-embedding"),
+            base_url=config.get("base_url"),
+            timeout=config.get("timeout"),
+            query_instruction=config.get("query_instruction"),
+            request_batch_size=config.get("request_batch_size"),
+            **_remote_pacing_kwargs(config),
+        ),
+        config,
     )
 
 
 def _huggingface_ef_factory(config: dict[str, Any]) -> Any:
     return HuggingFaceEmbeddingFunction(
         model_name=config.get("model_name", "Qwen/Qwen3-Embedding-0.6B"),
+        query_instruction=config.get("query_instruction"),
     )
 
 
 def _default_ef_factory(config: dict[str, Any]) -> Any:
-    from chromadb.utils import embedding_functions
-
-    ef = embedding_functions.DefaultEmbeddingFunction()
+    ef = DefaultEmbeddingFunction()
     ef.max_input_tokens = 256  # all-MiniLM-L6-v2 max_seq_length
     return ef
 

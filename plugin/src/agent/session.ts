@@ -14,6 +14,7 @@ import type { AcpClient, InitializeResult } from "./acp.ts";
 import type { BackendSpec } from "./backends.ts";
 import { withBrief } from "./brief.ts";
 import { JsonRpcError, MethodNotFound } from "./jsonrpc.ts";
+import { t } from "../i18n.ts";
 
 type Obj = Record<string, unknown>;
 type ToolEvent = Extract<ChatEvent, { t: "tool" }> & { name?: string };
@@ -332,6 +333,7 @@ export class AcpAgentSession implements AgentSession {
         await session.setEffort(opts.effort).catch(() => undefined);
       }
       await session.#settle();
+      if (opts.resumeSessionId) session.#scheduleTitlePull(1200); // a list-only backend already has its title; a pushed one ignores this
       return session;
     } catch (e) {
       await client.close();
@@ -528,7 +530,7 @@ export class AcpAgentSession implements AgentSession {
     const stop = stopOf(result?.["stopReason"]);
     // pi, for one, reports a rejected request (a 400 for a reasoning level the model refuses) as a clean, empty end_turn.
     if (stop === "end_turn" && !turn.produced) {
-      this.#emit({ t: "notice", level: "warn", message: "The agent finished without answering.", hint: "The model or its reasoning effort may have been rejected. Try another model or a lower effort; the agent's own settings or log can say why." });
+      this.#emit({ t: "notice", level: "warn", message: t("agent.noAnswer"), hint: t("agent.noAnswerHint") });
     }
     this.#endTurn(turn.id, stop, usage);
   }
@@ -536,6 +538,42 @@ export class AcpAgentSession implements AgentSession {
   #endTurn(turnId: string, stop: Extract<ChatEvent, { t: "turn_end" }>["stop"], usage?: Usage): void {
     this.#turn = undefined;
     this.#emit({ t: "turn_end", turn: turnId, stop, ...(usage ? { usage } : {}) });
+    this.#scheduleTitlePull();
+  }
+
+  // ───────────── titles for backends that never push (OpenCode) ─────────────
+
+  /** Adopted a pulled title already: OpenCode names a session once, so stop asking after that. */
+  #titlePulled = false;
+  /** A pull chain (delay + retry) is outstanding; a second turn ending inside it does not stack another. */
+  #pullBusy = false;
+
+  /**
+   * Measured (opencode v2.2.7, 2026-11-13): a backend flagged `titlesViaList` never sends a titled
+   * `session_info_update`, but `session/list` already serves its LLM-generated title once a turn has run. Ask
+   * shortly after a turn ends (generation may lag the turn by a little: one retry), and again after a resume.
+   * A local request: no tokens, nothing sent to any provider.
+   */
+  #scheduleTitlePull(delayMs = 2000): void {
+    const via = this.#spec.titlesViaList;
+    if (!via || this.#closed || this.#titlePulled || this.#pullBusy) return;
+    this.#pullBusy = true;
+    setTimeout(() => { void this.#pullTitle(via, 2).finally(() => { this.#pullBusy = false; }); }, delayMs);
+  }
+
+  async #pullTitle(via: { placeholder?: RegExp }, triesLeft: number): Promise<void> {
+    if (this.#closed || this.#titlePulled) return;
+    try {
+      const res = asObj(await this.#client.request("session/list", {}));
+      // Newest first, and the live session is the one just touched: the first page carries it.
+      const title = str(objs(res?.["sessions"]).find((s) => str(s["sessionId"]) === this.sessionId)?.["title"]);
+      if (title && !(via.placeholder?.test(title) ?? false)) {
+        this.#titlePulled = true;
+        this.#emit({ t: "session_title", title });
+        return;
+      }
+    } catch { /* no list served, no entry, a dead request: the next turn tries again */ }
+    if (triesLeft > 1) setTimeout(() => void this.#pullTitle(via, triesLeft - 1), 5000);
   }
 
   get canCompact(): boolean {
@@ -561,8 +599,8 @@ export class AcpAgentSession implements AgentSession {
       this.#cancelPending();
       this.#turn = undefined;
     }
-    if (silent.compacted) this.#emit({ t: "notice", level: "info", message: COMPACTED, compacted: true, ...(this.#ctx ? { context: { ...this.#ctx } } : {}) });
-    else if (!this.#cancelled) this.#emit({ t: "notice", level: "warn", message: "The agent did not summarise this chat.", ...(silent.said.trim() ? { hint: silent.said.trim() } : {}) });
+    if (silent.compacted) this.#emit({ t: "notice", level: "info", message: t("agent.compacted"), compacted: true, ...(this.#ctx ? { context: { ...this.#ctx } } : {}) });
+    else if (!this.#cancelled) this.#emit({ t: "notice", level: "warn", message: t("agent.notCompacted"), ...(silent.said.trim() ? { hint: silent.said.trim() } : {}) });
   }
 
   async cancel(): Promise<void> {
@@ -653,6 +691,14 @@ export class AcpAgentSession implements AgentSession {
       if (typeof used === "number" && typeof size === "number" && size > 0) this.#ctx = { used, size };
       return;
     }
+    if (kind === "session_info_update") {
+      // The agent's own name for the conversation (often a summary it wrote after the first exchange). A session-level
+      // fact, not a turn event: it counts whenever it arrives, and an empty/null title (the protocol's "clear") is ignored —
+      // the saved chat's fallback title stays rather than being wiped.
+      const title = str(update["title"]);
+      if (title) this.#emit({ t: "session_title", title });
+      return;
+    }
 
     const turn = this.#turn;
     if (!turn) return; // replayed history, startup banners: never live events
@@ -692,12 +738,13 @@ export class AcpAgentSession implements AgentSession {
       case "compaction_update": // claude and codex, because initialize says we take them (acp.ts)
         if (update["status"] !== "completed" || this.#compactions.has(String(update["compactionId"]))) return; // claude repeats the terminal frame with token counts
         this.#compactions.add(String(update["compactionId"]));
-        this.#emit({ t: "notice", level: "info", message: COMPACTED, compacted: true });
+        this.#emit({ t: "notice", level: "info", message: t("agent.compacted"), compacted: true });
         return;
       default:
-        return; // user_message_chunk, session_info_update, ...
+        return; // user_message_chunk, ...
     }
   }
+  // NOTE: session_info_update is handled above, in the session-level section: it is not a turn event.
 
   #onTool(turn: { id: string; tools: Map<string, ToolState> }, update: Obj, kind: "tool_call" | "tool_call_update"): void {
     const id = str(update["toolCallId"]);
@@ -720,8 +767,6 @@ export class AcpAgentSession implements AgentSession {
   }
 }
 
-const COMPACTED = "Older parts of this chat were summarised to make room.";
-
 function usageOf(result: Obj | undefined, cost: number, ctx?: { used: number; size: number }): Usage | undefined {
   const u = asObj(result?.["usage"]);
   const usage: Usage = {};
@@ -739,7 +784,7 @@ function usageOf(result: Obj | undefined, cost: number, ctx?: { used: number; si
 function hintFor(e: JsonRpcError, account: string | undefined): { hint?: string } {
   const text = `${e.rpc.message} ${JSON.stringify(e.rpc.data ?? "")}`;
   if (/auth|log ?in|sign ?in|credential|api key|unauthor|401/i.test(text)) {
-    return { hint: account ? "Sign in again in the agent's own app, then start a new chat." : "Sign in in the agent's own app (for Claude Code: run `claude` once), or use an API key, then start a new chat." };
+    return { hint: account ? t("agent.signInAgain") : t("agent.signIn") };
   }
   return {};
 }

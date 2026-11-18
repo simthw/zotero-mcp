@@ -1,11 +1,17 @@
 // Windows: no /bin/sh anywhere on the detection and launch path (#700). A scripted Spawner plays where.exe and node.
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { after, describe, it } from "node:test";
 import { BACKENDS } from "../../src/agent/backends.ts";
 import { dirnameOf, findBinary, withPathFirst } from "../../src/agent/env.ts";
 import { createRuntime, prepareWorkspace } from "../../src/agent/index.ts";
 import { cmdLine, shimTarget } from "../../src/agent/windows.ts";
 import type { Spawner } from "../../src/types.ts";
+import { createNodeSpawner } from "../node-spawner.ts";
+import { cleanupTemp, fakeBridgeDir, tempDir } from "./helpers.ts";
+
+after(cleanupTemp);
 
 const ENV = { PATH: "C:\\Windows\\System32;C:\\Program Files\\nodejs", HOME: "C:\\Users\\me", SystemRoot: "C:\\Windows" };
 const NODE = "C:\\Program Files\\nodejs\\node.exe";
@@ -98,9 +104,54 @@ describe("windows: npm .cmd shims", () => {
     assert.equal(shimTarget("@echo off\r\nsome-other-tool %*"), null);
   });
 
+  // Node's own C:\Program Files\nodejs\npm.cmd is not a cmd-shim: it runs npm-cli.js through %NODE_EXE%.
+  const NPM = [
+    "@ECHO OFF",
+    "SETLOCAL",
+    'SET "NODE_EXE=%~dp0\\node.exe"',
+    'IF NOT EXIST "%NODE_EXE%" (',
+    '  SET "NODE_EXE=node"',
+    ")",
+    'SET "NPM_PREFIX_JS=%~dp0\\node_modules\\npm\\bin\\npm-prefix.js"',
+    'SET "NPM_CLI_JS=%~dp0\\node_modules\\npm\\bin\\npm-cli.js"',
+    'FOR /F "delims=" %%F IN (\'CALL "%NODE_EXE%" "%NPM_PREFIX_JS%"\') DO (',
+    '  SET "NPM_PREFIX_NPM_CLI_JS=%%F\\node_modules\\npm\\bin\\npm-cli.js"',
+    ")",
+    'IF EXIST "%NPM_PREFIX_NPM_CLI_JS%" (',
+    '  SET "NPM_CLI_JS=%NPM_PREFIX_NPM_CLI_JS%"',
+    ")",
+    "",
+    '"%NODE_EXE%" "%NPM_CLI_JS%" %*',
+  ].join("\r\n");
+
+  it("shimTarget finds npm-cli.js behind Node's own npm.cmd, so npm is not run through cmd.exe (#730)", () => {
+    assert.equal(shimTarget(NPM), "node_modules\\npm\\bin\\npm-cli.js");
+    assert.equal(shimTarget(NPM.replaceAll("NPM_CLI_JS", "NPX_CLI_JS").replace("npm-cli.js", "npx-cli.js")), "node_modules\\npm\\bin\\npx-cli.js");
+  });
+
   it("anything else goes through cmd.exe", () => {
     assert.deepEqual(cmdLine("C:\\Windows\\System32\\cmd.exe", "C:\\x\\a.bat", ["b"]), ["C:\\Windows\\System32\\cmd.exe", ["/d", "/c", "C:\\x\\a.bat", "b"]]);
   });
+});
+
+it("passes the executable behind claude.cmd to the Windows ACP bridge", { skip: process.platform !== "win32" }, async () => {
+  const prefix = tempDir("zmc npm prefix ");
+  const target = join(prefix, "node_modules", "@anthropic-ai", "claude-code", "bin");
+  mkdirSync(target, { recursive: true });
+  const systemRoot = process.env["SystemRoot"] ?? "C:\\Windows";
+  const executable = join(target, "claude.exe");
+  copyFileSync(join(systemRoot, "System32", "where.exe"), executable);
+  writeFileSync(join(prefix, "claude.cmd"), '@"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe" %*\r\n');
+  const spawner = createNodeSpawner({ baseEnv: { PATH: prefix, SystemRoot: systemRoot, PATHEXT: ".EXE;.CMD" } });
+  const runtime = createRuntime({ spawner: { ...spawner, windows: true }, bridgeDir: fakeBridgeDir(["claude-code"]), nodePath: process.execPath });
+  const dump = join(prefix, "bridge-env.json");
+  const session = await runtime.start({ backend: "claude-code", cwd: prefix, brief: "", env: { MOCK_DUMP: dump } });
+  try {
+    const { env } = JSON.parse(readFileSync(dump, "utf8")) as { env: Record<string, string> };
+    assert.equal(env["CLAUDE_CODE_EXECUTABLE"], executable);
+  } finally {
+    await session.close();
+  }
 });
 
 describe("windows: detect and workspace never touch /bin/sh", () => {

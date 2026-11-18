@@ -11,9 +11,11 @@ from zotero_mcp.cli_standalone import (
     build_parser,
     cmd_add,
     cmd_annotations,
+    cmd_attach,
     cmd_edit,
     cmd_notes,
     cmd_search,
+    cmd_tags,
     main,
 )
 
@@ -37,9 +39,10 @@ class TestCLIContext:
         ctx.warning("watch out")
         assert "watch out" in capsys.readouterr().err
 
-    def test_error_always_prints(self, capsys):
+    def test_error_prints_when_flushed(self, capsys):
         ctx = CLIContext(verbose=False)
         ctx.error("boom")
+        ctx.flush_errors()
         assert "boom" in capsys.readouterr().err
 
 
@@ -234,7 +237,7 @@ def test_cmd_annotations_passes_json_format(capsys):
         json_out=False,
     )
     mock_annotations = MagicMock()
-    mock_annotations.get_annotations.return_value = "[]"
+    mock_annotations.list_annotations.return_value = "[]"
 
     with patch("zotero_mcp.cli_standalone.setup_zotero_environment"):
         with patch(
@@ -243,7 +246,7 @@ def test_cmd_annotations_passes_json_format(capsys):
         ):
             cmd_annotations(args)
 
-    assert mock_annotations.get_annotations.call_args.kwargs["format"] == "json"
+    assert mock_annotations.list_annotations.call_args.kwargs["format"] == "json"
     assert capsys.readouterr().out.strip() == "[]"
 
 class TestMain:
@@ -470,6 +473,65 @@ class TestCmdEdit:
         call_kwargs = mock_write.update_item.call_args.kwargs
         assert call_kwargs["add_tags"] == ["tag1", "tag2", "tag3"]
 
+    def test_edit_takes_a_json_array_for_tags_with_commas(self):
+        args = self._args(remove_tags='["Barrel organ, Hydraulic", "Organ"]')
+        mock_write = MagicMock()
+        mock_write.update_item.return_value = "ok"
+
+        with patch("zotero_mcp.cli_standalone.setup_zotero_environment"):
+            with patch("zotero_mcp.cli_standalone._import_tools",
+                       return_value=(MagicMock(), MagicMock(), MagicMock(), mock_write, MagicMock())):
+                cmd_edit(args)
+
+        call_kwargs = mock_write.update_item.call_args.kwargs
+        assert call_kwargs["remove_tags"] == ["Barrel organ, Hydraulic", "Organ"]
+
+
+# ---------------------------------------------------------------------------
+# cmd_tags
+# ---------------------------------------------------------------------------
+
+class TestCmdTags:
+    """Parsed from real argv, with batch_update_tags autospecced, so a flag
+    the parser lacks or a kwarg the tool lacks fails here."""
+
+    def _run(self, argv):
+        mock_write = MagicMock()
+        mock_write.batch_update_tags = create_autospec(
+            write_tools.batch_update_tags, return_value="ok")
+        args = build_parser().parse_args(["tags", *argv])
+        with patch("zotero_mcp.cli_standalone.setup_zotero_environment"):
+            with patch("zotero_mcp.cli_standalone._import_tools",
+                       return_value=(MagicMock(), MagicMock(), MagicMock(),
+                                     mock_write, MagicMock())):
+                cmd_tags(args)
+        return mock_write.batch_update_tags.call_args.kwargs
+
+    def test_warns_on_stderr_that_it_is_deprecated(self, capsys):
+        self._run(["--tag", "a", "--add", "b"])
+        assert "zotero-cli tags is deprecated" in capsys.readouterr().err
+
+    def test_comma_separated_flags_still_split(self):
+        kwargs = self._run(["--tag", "a,b", "--add", "x, y", "--remove", "z"])
+        assert kwargs["tag"] == ["a", "b"]
+        assert kwargs["add_tags"] == ["x", "y"]
+        assert kwargs["remove_tags"] == ["z"]
+
+    def test_json_array_addresses_a_tag_containing_a_comma(self):
+        kwargs = self._run([
+            "--tag", '["Barrel organ, Hydraulic"]',
+            "--remove", '["Barrel organ, Hydraulic"]',
+        ])
+        assert kwargs["tag"] == ["Barrel organ, Hydraulic"]
+        assert kwargs["remove_tags"] == ["Barrel organ, Hydraulic"]
+
+    def test_item_keys_select_a_known_set_of_items(self):
+        kwargs = self._run(["--item-keys", "ABCD1234,EFGH5678", "--remove", "x"])
+        assert kwargs["item_keys"] == ["ABCD1234", "EFGH5678"]
+
+    def test_item_keys_default_to_none(self):
+        assert self._run(["--tag", "x", "--remove", "x"])["item_keys"] is None
+
 
 # ---------------------------------------------------------------------------
 # cmd_add
@@ -486,7 +548,7 @@ class TestCmdAdd:
     def _args(self, **kwargs):
         defaults = dict(
             verbose=False, collections=None, collection=None, tags=None,
-            if_exists="file", create_collections=False,
+            if_exists="file", create_collections=False, attach_file=None,
         )
         defaults.update(kwargs)
         return MagicMock(**defaults)
@@ -561,7 +623,7 @@ class TestCmdAdd:
         assert call_kwargs["create_missing_collections"] is True
 
     def test_add_doi_default_if_exists_is_file(self):
-        """The CLI defaults to convergent behavior; MCP keeps 'duplicate'."""
+        """The CLI and MCP both default to convergent behavior."""
         args = self._args(subcommand="doi", doi="10.1234/test",
                           attach_mode="auto")
         mock_write = self._run(args)
@@ -622,3 +684,42 @@ class TestCmdAdd:
         call_kwargs = mock_write.add_by_csl_json.call_args.kwargs
         assert call_kwargs["file_path"] == "/tmp/refs.json"
         assert call_kwargs["csl_json"] is None
+
+
+class TestCmdAttach:
+    """`attach --link` reaches attach_file(link_mode="linked"); without it the
+    upload default is untouched. Autospec means a kwarg the tool lacks fails here."""
+
+    def _run(self, argv):
+        mock_write = MagicMock()
+        mock_write.attach_file = create_autospec(
+            write_tools.attach_file, return_value="ok")
+        args = build_parser().parse_args(["attach", *argv])
+        with patch("zotero_mcp.cli_standalone.setup_zotero_environment"):
+            with patch("zotero_mcp.cli_standalone._import_tools",
+                       return_value=(MagicMock(), MagicMock(), MagicMock(),
+                                     mock_write, MagicMock())):
+                cmd_attach(args)
+        return mock_write.attach_file.call_args.kwargs
+
+    def test_default_still_uploads(self):
+        kwargs = self._run(["ABCD2345", "--file", "/tmp/paper.pdf"])
+        assert kwargs["link_mode"] == "import"
+        assert kwargs["file_path"] == "/tmp/paper.pdf"
+
+    def test_link_flag_links_in_place(self):
+        kwargs = self._run(["ABCD2345", "--file", "/tmp/paper.pdf", "--link"])
+        assert kwargs["link_mode"] == "linked"
+        assert kwargs["file_path"] == "/tmp/paper.pdf"
+        assert kwargs["url"] is None
+
+    def test_link_flag_forwards_filename_as_title(self):
+        kwargs = self._run(["ABCD2345", "--file", "/tmp/paper.pdf", "--link",
+                            "--filename", "Smith 2020"])
+        assert kwargs["link_mode"] == "linked"
+        assert kwargs["filename"] == "Smith 2020"
+
+    def test_link_flag_defaults_to_false_in_parser(self):
+        parser = build_parser()
+        assert parser.parse_args(["attach", "ABCD2345", "--file", "x.pdf"]).link is False
+        assert parser.parse_args(["attach", "ABCD2345", "--file", "x.pdf", "--link"]).link is True

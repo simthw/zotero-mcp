@@ -19,6 +19,8 @@ zotero-mcp setup --no-local --api-key YOUR_API_KEY --library-id YOUR_LIBRARY_ID
 
 Generate an API key at [zotero.org/settings/security](https://www.zotero.org/settings/security#applications). `ZOTERO_LIBRARY_ID` is your numeric **userID**, shown on that same page (for a group library, use the group's ID and also set `ZOTERO_LIBRARY_TYPE=group`).
 
+If you sync your personal library's attachment files over WebDAV, setup also asks for its address and login, so that files you attach go to your WebDAV server instead of counting against your Zotero Storage quota. A re-run offers the stored settings as defaults.
+
 <a id="local-write-support"></a>
 
 ## Local write support (Zotero 10+)
@@ -77,6 +79,9 @@ rather than opening a dialog that can't help.
 - `ZOTERO_API_KEY`: Your Zotero API key (for web API)
 - `ZOTERO_LIBRARY_ID`: Your Zotero library ID (for web API)
 - `ZOTERO_LIBRARY_TYPE`: The type of library (user or group, default: user)
+- `ZOTERO_API_URL`: Web API base URL, for a self-hosted server that speaks the Zotero Web
+  API (e.g. [altero](https://github.com/eseifert/altero)) instead of zotero.org — the same
+  value as Zotero desktop's `extensions.zotero.api.url` (default: `https://api.zotero.org`)
 - `ZOTERO_LOCAL_API_KEY`: Local API key for writes (Zotero 10+). Normally set for you by
   `zotero-mcp authorize-local`; use the variable for containers and CI, where the config
   file isn't convenient
@@ -84,11 +89,22 @@ rather than opening a dialog that can't help.
   discovered automatically)
 - `ZOTERO_LOCAL_WRITE`: `auto` (default) or `false` to force writes onto the web API even
   when a local key exists
-- `ZOTERO_WEBDAV_URL`: Optional WebDAV folder URL for direct attachment downloads in remote mode
+- `ZOTERO_WEBDAV_URL`: Optional WebDAV folder that holds your Zotero files, as a full URL
+  including `https://`: the address in Zotero's File Syncing settings followed by `/zotero/`.
+  When set, attachments added to your personal library through the web API are written to it
+  directly rather than to Zotero Storage (group libraries always use Zotero Storage), and
+  attachments are downloaded from it in remote mode. `zotero-mcp setup --no-local` asks for
+  this and the two settings below
 - `ZOTERO_WEBDAV_USERNAME`: Optional WebDAV username
 - `ZOTERO_WEBDAV_PASSWORD`: Optional WebDAV password
 
 Environment variables set in the shell you launch a client from (for example `claude`) override the values in its config file.
+
+**HTTP authentication:**
+
+- `ZOTERO_MCP_AUTH_TOKEN`: Shared bearer token required by the `streamable-http`
+  and `sse` transports when configured. It does not affect `stdio`. See
+  [HTTP authentication and network access](#http-authentication-and-network-access).
 
 **Semantic search** (see [Semantic search](semantic-search.md)):
 - `ZOTERO_EMBEDDING_MODEL`: Embedding model to use (default, openai, gemini, ollama)
@@ -102,6 +118,9 @@ Environment variables set in the shell you launch a client from (for example `cl
 - `GEMINI_BASE_URL`: Custom Gemini endpoint URL (optional, for use with compatible APIs)
 - `OLLAMA_EMBEDDING_MODEL`: Ollama embedding model name (qwen3-embedding by default)
 - `OLLAMA_BASE_URL`: Ollama server URL (default: http://localhost:11434)
+- `ZOTERO_ONNX_THREADS`: Thread count for the default model's ONNX Runtime (optional).
+  Where zotero-mcp may run on only some CPUs (a container's cpuset, a Slurm job, taskset),
+  set it to that number of CPUs to stop the `pthread_setaffinity_np failed` errors
 - `ZOTERO_DB_PATH`: Custom `zotero.sqlite` path (optional). When unset, the
   database is located automatically: a data directory configured in Zotero's
   preferences (read from the profile's `prefs.js`) is tried first, then the
@@ -126,6 +145,11 @@ narrower than the API's. Writes always go through Zotero.
   0.12.1. `ZOTERO_BACKEND=sqlite` forces SQLite; `ZOTERO_SEARCH_BACKEND` is
   accepted as an older name for the same setting. Outside local mode the API is
   always used.
+- `ZOTERO_STRICT_SQLITE=1`: a developer check. A read that would reach the Zotero
+  API (a GET on `/users/...` or `/groups/...`, any Better BibTeX request, a query
+  SQLite declines, or no readable `zotero.sqlite`) fails with an error naming the
+  code that made it, instead of falling back. Writes, the reads a write makes
+  through its own client, and citation rendering are still allowed. Off unless set.
 - `ZOTERO_MCP_DB_SNAPSHOT_MIN_INTERVAL`: Zotero keeps recent changes in a WAL file
   next to `zotero.sqlite`, so reads use a private copy of the database plus that
   file. The copy is refreshed when Zotero writes, at most once per this many
@@ -179,6 +203,44 @@ libraries is two items, and collapsing them would hide where each copy lives.
 - `ZOTERO_MCP_SCHEMA_CACHE`: Custom path for the refreshed schema cache
   (default: `~/.cache/zotero-mcp/schema.json`).
 
+## HTTP authentication and network access
+
+These settings apply to `serve --transport streamable-http` and `sse`; `stdio`
+is not affected. With `ZOTERO_MCP_AUTH_TOKEN` set, every HTTP request must carry
+`Authorization: Bearer <token>` or gets `401`. The token is a shared secret
+(compared in constant time, never logged) that gives the holder every enabled
+tool, writes included; it is separate from the Zotero API key.
+
+Generate one and give the same value to the server and each client:
+
+```bash
+export ZOTERO_MCP_AUTH_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+zotero-mcp serve --transport streamable-http --host 127.0.0.1 --port 8000
+```
+
+(PowerShell: `$env:ZOTERO_MCP_AUTH_TOKEN = python -c "import secrets; print(secrets.token_urlsafe(32))"`.)
+To keep it, put it in `client_env` in `~/.config/zotero-mcp/config.json`; the
+process environment and `.env` win over the config file, and re-running
+`zotero-mcp setup` keeps it. There is deliberately no `--token` flag, which
+would show the secret in the process list. An empty or malformed value (spaces,
+`null`, a number) stops the server at startup rather than being used.
+
+| Bind | No token | Token set |
+|---|---|---|
+| Loopback (`localhost`, `127.0.0.1`, `::1`) | Starts, with a warning; local clients unchanged | Bearer required |
+| Anything else (`0.0.0.0`, a LAN address) | Refuses to start unless `--allow-unauthenticated` | Bearer required |
+
+On a loopback bind the server also checks the `Host` and `Origin` headers, so a
+web page cannot reach it through DNS rebinding; behind a tunnel or reverse proxy,
+see [Troubleshooting](troubleshooting.md). A tunnel can expose even a loopback
+server, so set a token before opening one. An auth provider configured through
+FastMCP's own settings is kept when no token is set.
+
+Use HTTPS outside the local machine (the token is not encryption), never put the
+token in a URL, and note that an MCP session ID or SSE `session_id` is not a
+credential. Client examples: [authenticated HTTP clients](getting-started.md#authenticated-http-clients);
+ChatGPT: [Secure MCP Tunnel](getting-started.md#integrating-with-openais-chatgpt).
+
 ## Text extraction settings
 
 PDFs are parsed with [pdf-inspector](https://github.com/firecrawl/pdf-inspector), which produces Markdown with the document's heading structure intact. These keys live under `semantic_search.extraction` in `~/.config/zotero-mcp/config.json`:
@@ -209,6 +271,77 @@ To read one specific attachment regardless of priority, pass that attachment's o
 
 Extracted text is reliable for prose and unreliable for math and tables. `zotero_read_pdf_pages` flags the pages where that happens and can return those pages as images (`format='image'`).
 
+## Passage chunking
+
+By default each item is indexed as one vector: title, authors, abstract and any full text joined and cut at the embedding model's input limit. The default model, all-MiniLM-L6-v2, reads 256 tokens (about 1,000 characters), so with `update-db --fulltext` the body of a PDF is extracted but never embedded and only the start of each item is searchable. `zotero-mcp update-db --fulltext` and `zotero-mcp db-status` say so when this applies.
+
+Passage chunking also indexes each item as several overlapping passages, in a separate ChromaDB collection (not a Zotero collection), so search can match anywhere in a paper and return the matching passage with its page. The one-vector article record stays: articles suit finding works on a topic, and passages suit finding where something is done or stated. It is off by default. These keys live under `semantic_search.chunking`:
+
+```json
+{
+  "semantic_search": {
+    "chunking": {
+      "enabled": true,
+      "chunk_size": 1500,
+      "overlap": 200,
+      "max_chunks_per_item": 100
+    }
+  }
+}
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `enabled` | `false` | Index passages as well as one vector per item. Semantic search uses passages by default when this is on and articles when it is off. |
+| `chunk_size` | `1500` | Target passage length in characters. |
+| `overlap` | `200` | Characters shared between neighbouring passages. |
+| `max_chunks_per_item` | `20` | Passages kept per item. Text past the last passage is not indexed. |
+
+After turning it on, run `zotero-mcp update-db --fulltext` once in local mode (`ZOTERO_LOCAL=true`). With the web API, where `--fulltext` is not available, run `zotero-mcp update-db`, which uses the text Zotero has already extracted. It adds the passages and keeps the article vectors you already have, with no `--force-rebuild` and no re-embedding of articles. It works the same on the realtime and Batch API paths.
+
+An update writes every article record before any passage, so article search covers a long run's items early. A changed item has no passages from the moment its new article record is written until its new passages are, and passage search misses it meanwhile; on the Batch API path, where passage files can land days after the article files, that can last until the whole run is imported. A run stopped in between leaves the rest to the next update.
+
+`zotero_semantic_search` takes `level="articles"` or `level="passages"` to choose per search, and `zotero-cli search --mode semantic` takes `--level`.
+
+While passages are being built, a default search covers only the items that have them so far. If passages don't exist at all yet, it searches articles instead. When the other level holds more items, the results say so, with the counts for the whole index, for example `Searched passages (12,000 items in the index). The article level has 48,750 items, so level="articles" may find more.`
+
+Passages and articles live in two ChromaDB collections in the same index directory, `zotero_library_passages` and `zotero_library`, so an article search never loads passage vectors into memory. With chunking off, an item that changes loses its passages, and they are added back when chunking is next on.
+
+An index built with chunking on by an earlier version holds its passages in `zotero_library`, the article-level ChromaDB collection: passages only, or passages beside article records left from before chunking was turned on (a mixed index). Search keeps working that way until you migrate, and the status commands (`zotero-mcp db-status`, `zotero-cli db status`, the `zotero_get_search_database_status` tool) say so, with the steps and an estimate of what the last one costs. To migrate:
+
+1. Stop any running server, and upgrade any other copy of zotero-mcp using the same index; an older version would go back to writing passages in `zotero_library`.
+2. `zotero-mcp migrate-index --dry-run` reports what would change.
+3. `zotero-mcp migrate-index` renames the collection to `zotero_library_passages`, keeping every vector, and moves any article records into a new `zotero_library`. It embeds nothing and takes seconds however large the index is. The server can start again after it.
+4. `zotero-mcp update-db --fulltext`, with the options you usually use, embeds one article vector for each item that has passages but no article record. In local mode, without `--fulltext`, items indexed with their full text wait for it and get no article vector; status leaves the flag out only when no such item was indexed with full text. With the web API, `--fulltext` is not available: run `zotero-mcp update-db`, which uses the text Zotero has already extracted (unless `include_fulltext` is `false`), and status gives it that way. This is the only step that embeds anything, and with a paid embedding API it is billed: status gives the number of items and an estimated token total, from the length of each item's indexed text, cut to the model's input limit. An interrupted run carries on where it stopped.
+
+A passage longer than the model can read would lose its tail, so `chunk_size` is lowered to fit: about 85% of the model's token limit, at 4 characters per token (3 for OpenAI). For the default model that is roughly 870 characters per passage whatever `chunk_size` says. Models with a larger limit keep your `chunk_size`, and the change is logged once at info level.
+
+With the default model, 20 passages cover about 13,000 characters, a few pages. To index whole papers, raise `max_chunks_per_item`: 100 covers roughly 20 pages, and longer papers need more. Each passage is one vector, so the database grows with it.
+
+<a id="semantic-search-memory"></a>
+
+## Semantic search memory
+
+ChromaDB loads the whole vector index into memory the first time a search runs, and keeps it there until the process holding it exits. Each vector takes its dimension × 4 bytes: a million passages with OpenAI's `text-embedding-3-small` (1,536 dimensions) need about 6 GB. To get that memory back, set `idle_unload_minutes`: the MCP server then runs ChromaDB in a separate worker process. The worker starts at the first semantic search and exits after a set time with no semantic calls, which returns that memory to the system. The next search starts a new worker and loads the index again, which takes a few seconds for a small index and can take half a minute for a large one.
+
+Passages and articles load separately, and the passage ChromaDB collection is much the larger. Once a worker has loaded passages, only passage activity keeps it running: a passage search, or an update that writes or deletes passages. Article searches alone let it exit after the wait, and the next one starts a new worker that loads articles only. On an index whose passages are still in the article collection (not yet migrated with `migrate-index`), every call keeps the worker. The worker never exits while an index update runs in the server.
+
+The article reload is quick: on an Apple M1 Max, a new worker answered its first article search in under a second for 50,000 articles, while the first passage search over 1.2 million passages took 6 to 7 s and about 15 GB. When the first passage search in a new worker takes 5 s or more, its result says so. To set the wait:
+
+```json
+{
+  "semantic_search": {
+    "idle_unload_minutes": 10
+  }
+}
+```
+
+| Setting | Default | What it does |
+|---|---|---|
+| `idle_unload_minutes` | `0` (off) | Minutes without a semantic search or index update before the worker exits. Once the worker has loaded passages from their own ChromaDB collection, only passage searches and updates that write or delete passages count. It never exits during an index update in the server. `0` runs ChromaDB inside the server, where the index stays loaded until the server exits. |
+
+The status tool (`zotero_get_search_database_status`) reads its counts from the database file and never loads the index. Command-line tools such as `update-db` run ChromaDB in their own process, which frees the index when the command finishes.
+
 ## Command-line options
 
 ```bash
@@ -217,6 +350,12 @@ zotero-mcp serve
 
 # Specify transport method
 zotero-mcp serve --transport stdio|streamable-http|sse
+
+# HTTP network listener (set ZOTERO_MCP_AUTH_TOKEN first)
+zotero-mcp serve --transport streamable-http --host 0.0.0.0 --port 8000
+
+# Explicitly allow a network listener without a token (see access controls above)
+zotero-mcp serve --transport streamable-http --host 0.0.0.0 --allow-unauthenticated
 
 # Setup and configuration
 zotero-mcp setup --help                    # Get help on setup options

@@ -1,5 +1,6 @@
 """Search-related tool functions for the Zotero MCP server."""
 
+import contextvars
 import json
 import logging as _logging
 import re
@@ -8,14 +9,12 @@ import time as _time
 from pathlib import Path
 from typing import Literal
 
-from fastmcp.exceptions import ToolError
-
 from zotero_mcp import client as _client
 from zotero_mcp import library as _library
 from zotero_mcp import search_semantics as _semantics
 from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
-from zotero_mcp._context import Context
+from zotero_mcp._context import Context, ToolError
 from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp.local_db import PERSONAL_LIBRARY_GROUP_ID, get_local_zotero_reader
 from zotero_mcp.tools import _helpers
@@ -31,32 +30,88 @@ _last_presearch_sync_ts: float = 0.0
 _presearch_sync_lock = _threading.Lock()
 
 
-def _maybe_fire_presearch_sync(search) -> None:
+def _maybe_fire_presearch_sync(search) -> bool:
     """Schedule a background semantic-search DB update if auto-update is due.
 
     Runs in a daemon thread so the current tool call returns immediately.
     Intentionally swallows exceptions — a failed background sync must never
-    surface as a search-tool error to the user.
+    surface as a search-tool error to the user. Returns whether it started one.
     """
     global _last_presearch_sync_ts
     try:
         if not search.should_update_database():
-            return
+            return False
     except Exception:
-        return
+        return False
     now = _time.monotonic()
     with _presearch_sync_lock:
         if now - _last_presearch_sync_ts < _PRESEARCH_SYNC_MIN_INTERVAL:
-            return
+            return False
         _last_presearch_sync_ts = now
 
     def _run():
         try:
-            search.update_database(extract_fulltext=_utils.is_local_mode())
+            search.update_database(extract_fulltext=_utils.is_local_mode(), automatic=True)
         except Exception as e:
             _search_logger.debug(f"Background pre-search sync failed: {e}")
 
-    _threading.Thread(target=_run, daemon=True, name="zmcp-presearch-sync").start()
+    # In the caller's context, so the sync covers the library this client
+    # session has switched to (#739), not the process-wide one.
+    _threading.Thread(
+        target=contextvars.copy_context().run, args=(_run,),
+        daemon=True, name="zmcp-presearch-sync",
+    ).start()
+    return True
+
+
+#: How long a library version read for the stale-index note is reused.
+_LIBRARY_VERSION_TTL = 60.0
+_library_versions: dict[int, tuple[float, int | None]] = {}
+
+
+def _library_version_check(search, group_id: int):
+    """Start reading the library version through the search's own client;
+    returns a function that gives it (or None). The read is one request, run
+    while the search embeds its query, and reused for a minute, a failed or
+    slow read too, so a Zotero that does not answer costs one wait a minute."""
+    cached = _library_versions.get(group_id)
+    if cached and _time.monotonic() - cached[0] < _LIBRARY_VERSION_TTL:
+        return lambda: cached[1]
+    box: dict[str, int] = {}
+
+    def _read():
+        try:
+            version = search.zotero_client.last_modified_version()
+            if isinstance(version, int):
+                box["version"] = version
+        except Exception as e:
+            _search_logger.debug(f"Library version read failed: {e}")
+
+    thread = _threading.Thread(target=_read, daemon=True, name="zmcp-library-version")
+    thread.start()
+
+    def result() -> int | None:
+        thread.join(1.0)
+        version = box.get("version")
+        _library_versions[group_id] = (_time.monotonic(), version)
+        return version
+
+    return result
+
+
+def _stale_index_note(search, library_version: int | None) -> str | None:
+    """One line when the library changed after the index's last update."""
+    load = getattr(search, "_load_last_sync_version", None)
+    if library_version is None or load is None:
+        return None
+    indexed = load()
+    if not isinstance(indexed, int) or not indexed or library_version <= indexed:
+        return None
+    return (
+        "Note: the library has changed since the index was last updated "
+        f"(version {library_version}, index at {indexed}); "
+        "zotero_update_search_database adds the changes."
+    )
 
 
 #: How long the client-side advanced-search walk may run before it returns a
@@ -64,6 +119,13 @@ def _maybe_fire_presearch_sync(search) -> None:
 #: broad search cannot cascade into "Zotero API busy" on every other tool
 #: (#456), and far under the 300s MCP idle timeout it used to hit.
 _ADVANCED_SCAN_BUDGET_SECONDS = 20
+
+#: Ceilings for semantic_search(full_passage=True), per hit and for all hits
+#: together. A passage is at most 1500 characters (chunk_size), so the per-hit
+#: cap only bites on item-level records, whose stored text can be far longer;
+#: the total keeps a large ``limit`` from returning whole papers.
+_FULL_PASSAGE_MAX_CHARS = 1500
+_FULL_PASSAGE_TOTAL_CHARS = 15000
 
 
 def _server_side_filters(
@@ -363,36 +425,25 @@ def _search_items_via_backend(zot, query: str, qmode: str, limit: int,
 @mcp.tool(
     name="zotero_search_items",
     description=(
-        "Search Zotero items by substring match against metadata (title, "
-        "creators, year, and — in 'everything' mode — abstract). Returns "
-        "metadata + abstracts as markdown. "
-        "IMPORTANT: keep queries SHORT and SIMPLE — 'Author Year' "
-        "(e.g. 'Brewer 2011') or just an author name ('Cladder-Micus'). "
-        "This is substring matching, not web search: each extra word "
-        "NARROWS the match, so adding topic words usually returns fewer "
-        "results, not more. For topic discovery, use zotero_semantic_search "
-        "instead; for tag filtering use zotero_search_by_tag. "
-        "If a query finds nothing, this tool automatically falls back to "
-        "simplified queries and then semantic search. "
-        "query: required substring. qmode: 'titleCreatorYear' (default) "
-        "matches only title/authors/year; 'everything' also searches "
-        "abstract. item_type: '-attachment' (default) excludes attachments; "
-        "pass 'journalArticle', 'book', etc. to filter. tag: optional list "
-        "of tag conditions (ANDed). limit: max results (default 10). "
-        "collection_key: 8-char key to restrict to a collection (bypasses "
-        "the fallback cascade). include_subcollections: also search "
-        "collections nested beneath it (default False). "
-        "search_all_libraries: search personal + all group libraries at "
-        "once, labelling each result with its library — use it when you "
-        "don't know which library holds the item. Needs the SQLite "
-        "backend (the default in local mode); excludes collection_key. "
-        "Example: zotero_search_items(query='Cladder-Micus') or "
-        "zotero_search_items(query='Brewer 2011', search_all_libraries=True)."
+        "Keyword search of item metadata: substring match on title, creators "
+        "and year (qmode='everything' adds abstracts). Keep queries short, "
+        "like 'Brewer 2011' or a surname: every extra word narrows the match. "
+        "For topics or concepts use zotero_semantic_search. If nothing "
+        "matches it retries simpler queries, then semantic search, and says "
+        "so. tag: conditions that are ANDed; within one, ' OR ' alternates "
+        "and a leading '-' excludes, e.g. ['methods OR methodology', "
+        "'-draft']. Omit query to list items by tag alone (zotero_get_tags "
+        "lists the names). item_type: '-attachment' (default) excludes "
+        "attachments, or e.g. 'journalArticle'. limit: default 10. "
+        "collection_key: search one collection (no retries); "
+        "include_subcollections adds its subcollections. "
+        "search_all_libraries=True searches every library and labels each "
+        "result; needs a query, not with collection_key."
     )
 )
 @with_zotero_api_lock
 def search_items(
-    query: str,
+    query: str = "",
     qmode: Literal["titleCreatorYear", "everything"] = "titleCreatorYear",
     item_type: str = "-attachment",  # Exclude attachments by default
     limit: int | str | None = 10,
@@ -407,7 +458,9 @@ def search_items(
     Search for items in your Zotero library.
 
     Args:
-        query: Search query string
+        query: Search query string. May be empty when ``tag`` is given, which
+            lists the items carrying those tags (the former
+            ``zotero_search_by_tag``, now :func:`search_by_tag`).
         qmode: Query mode (titleCreatorYear or everything)
         item_type: Type of items to search for. Use "-attachment" to exclude attachments.
         limit: Maximum number of results to return
@@ -432,7 +485,18 @@ def search_items(
     """
     try:
         if not query.strip():
-            return "Error: Search query cannot be empty"
+            if not _helpers._normalize_tag_filter(tag):
+                return "Error: Search query cannot be empty. Pass query, tag, or both."
+            if search_all_libraries:
+                return (
+                    "Error: search_all_libraries needs a query. To list items by "
+                    "tag alone, search one library at a time."
+                )
+            return search_by_tag(
+                tag=tag, item_type=item_type, limit=limit,
+                collection_key=collection_key,
+                include_subcollections=include_subcollections, ctx=ctx,
+            )
 
         if search_all_libraries:
             if gate_error := _helpers.global_search_error():
@@ -662,22 +726,9 @@ def search_items(
 @mcp.tool(
     name="zotero_search_by_tag",
     description=(
-        "Find items carrying one or more tags, with boolean syntax "
-        "support. tag: list of tag strings; each entry is a condition ANDed "
-        "with the others, and within an entry you can use ' OR ' for "
-        "disjunction and a leading '-' for exclusion. "
-        "Example: tag=['methods OR methodology', '-draft'] matches items "
-        "tagged 'methods' OR 'methodology' AND NOT tagged 'draft'. "
-        "item_type: '-attachment' (default) excludes attachments; pass "
-        "'journalArticle', 'book', etc. to filter. "
-        "limit: max results (default 10). "
-        "collection_key: optional 8-char key to scope to a collection. "
-        "include_subcollections: also search collections nested beneath it "
-        "(default False). "
-        "Use zotero_get_tags to discover available tag names first. For "
-        "free-text content search, use zotero_search_items or "
-        "zotero_semantic_search instead. "
-        "Example: zotero_search_by_tag(tag=['to-read'], limit=20)."
+        "Deprecated (removed in 0.17): use zotero_search_items(tag=...) "
+        "without a query. Lists items matching tag conditions, ANDed; ' OR ' "
+        "alternates and a leading '-' excludes."
     )
 )
 @with_zotero_api_lock
@@ -778,20 +829,10 @@ def search_by_tag(
 @mcp.tool(
     name="zotero_search_by_citation_key",
     description=(
-        "Look up a single Zotero item by its BetterBibTeX citation key "
-        "(e.g. 'Smith2024' or 'cladderMicus2018'). Returns that one item's "
-        "metadata, or a not-found message if no item has that key. "
-        "citekey: the citation key exactly as assigned by BetterBibTeX "
-        "(case-sensitive). "
-        "In local mode: queries the running Better BibTeX plugin via its "
-        "HTTP API (Zotero desktop must be running and have BBT installed). "
-        "In web mode: scans the 'Extra' field of items for 'Citation Key:' "
-        "lines — slower, and may miss items whose keys aren't persisted to "
-        "Extra. "
-        "Requires the Better BibTeX plugin in the user's Zotero install. "
-        "For partial-key or free-text lookup, use zotero_search_items. "
-        "Example: zotero_search_by_citation_key(citekey='hasan2026mcp') → "
-        "metadata for that single item."
+        "Find the one item with this BetterBibTeX citation key (exact, "
+        "case-sensitive), e.g. 'smith2024'. Checks Zotero's citationKey "
+        "field, then 'Citation Key:' lines in Extra. For partial keys or free "
+        "text use zotero_search_items."
     )
 )
 @with_zotero_api_lock
@@ -895,37 +936,22 @@ def _unknown_condition_field_error(
 @mcp.tool(
     name="zotero_advanced_search",
     description=(
-        "Advanced item search with multiple structured-field conditions "
-        "joined by AND or OR. Use this when you need to filter by fields "
-        "that zotero_search_items and zotero_search_by_tag can't express "
-        "(date ranges, specific itemTypes, etc.). "
-        "For plain text use zotero_search_items; for tags use "
-        "zotero_search_by_tag; for topic discovery use "
-        "zotero_semantic_search. "
-        "conditions: list of {field, operation, value} dicts (also accepts "
-        "a JSON string). "
-        "  Common fields: title, creator, date, dateAdded, dateModified, "
-        "tag, itemType, publicationTitle, abstractNote, collection. "
-        "  Supported operations (exhaustive): is, isNot, contains, "
-        "doesNotContain, beginsWith, endsWith, isGreaterThan, isLessThan, "
-        "isBefore, isAfter. "
-        "For 'added in the last N days', use field='dateAdded' with "
-        "operation='isAfter' and an ISO date value (e.g. '2026-03-22'). "
-        "join_mode: 'all' (AND, default) or 'any' (OR). "
-        "sort_by: dateAdded, dateModified, title, creator, etc. "
-        "sort_direction: 'asc' (default) or 'desc'. "
-        "limit: max results (default 50, max 500). "
-        "include_subcollections: make a 'collection' condition match items "
-        "anywhere in that collection's subtree, for the is/isNot operations "
-        "(default False). "
-        "search_all_libraries: search every accessible library at once, "
-        "labelling each result with its library; needs the SQLite backend "
-        "(the default in local mode). 'tag' conditions work; 'collection' "
-        "conditions and include_subcollections do not. "
-        "Example: zotero_advanced_search(conditions=[{'field': 'itemType', "
-        "'operation': 'is', 'value': 'preprint'}, {'field': 'dateAdded', "
-        "'operation': 'isAfter', 'value': '2026-03-22'}], "
-        "join_mode='all')."
+        "Search with structured field conditions, for what "
+        "zotero_search_items cannot express: date ranges, item types, matches "
+        "on one field. conditions: a list of {field, operation, value}. "
+        "Fields include title, creator, date, dateAdded, dateModified, tag, "
+        "itemType, publicationTitle, abstractNote, collection. Operations: "
+        "is, isNot, contains, doesNotContain, beginsWith, endsWith, "
+        "isGreaterThan, isLessThan, isBefore, isAfter. Dates are ISO; 'added "
+        "in the last 30 days' is dateAdded isAfter <that date>. join_mode: "
+        "'all' (AND, default) or 'any' (OR). sort_by: a field such as "
+        "dateAdded or title; sort_direction: 'asc' (default) or 'desc'. "
+        "limit: default 50, max 500. include_subcollections=True makes "
+        "collection is/isNot match the whole subtree. "
+        "search_all_libraries=True searches every library (no collection "
+        "conditions). Example: conditions=[{'field': 'itemType', 'operation': "
+        "'is', 'value': 'preprint'}, {'field': 'dateAdded', 'operation': "
+        "'isAfter', 'value': '2026-03-22'}]."
     )
 )
 @with_zotero_api_lock
@@ -1399,32 +1425,21 @@ def advanced_search(
 @mcp.tool(
     name="zotero_semantic_search",
     description=(
-        "Prioritized topic-search tool. Find papers by semantic similarity "
-        "to a query using AI embeddings — the BEST tool for finding papers "
-        "on a topic (e.g. 'papers about mindfulness-based therapy'), far "
-        "more efficient than scanning collection items or reading "
-        "abstracts. Searches the ACTIVE library by default; pass "
-        "search_all_libraries=True to cover every indexed library. "
-        "query: the topic or concept; natural-language phrases work well. "
-        "limit: max results (default 10). "
-        "filters: optional ChromaDB metadata filter, one key per dict (e.g. "
-        "{'item_type': 'journalArticle'}); also accepts a JSON string. Keys: "
-        "item_type, item_key, citation_key, doi, publication, tags, "
-        "has_fulltext. Combine keys with {'$and': [{...}, {...}]}. There is "
-        "no year filter: 'date' holds the raw Zotero date string. "
-        "library_id: optional — scope to one library other than the active "
-        "one: 0 or 'user' for personal, else a groupID (see "
-        "zotero_list_libraries). search_all_libraries: search every indexed "
-        "library at once, labelling each result with its library; needs the "
-        "SQLite backend (the default in local mode), excludes library_id. "
-        "Requires the semantic search database to be POPULATED — run "
-        "zotero_update_search_database first if you just installed the "
-        "server or added new items; check readiness with "
-        "zotero_get_search_database_status. "
-        "Available only when the [semantic] optional dependency is "
-        "installed. "
-        "Example: zotero_semantic_search(query='mindfulness-based "
-        "cognitive therapy for depression', limit=5)."
+        "Find papers by meaning, using embeddings: the best tool for topic "
+        "questions ('papers about mindfulness-based therapy'). query: a topic "
+        "or natural-language description. limit: default 10. full_passage=True "
+        "returns the whole matched passage, not a short excerpt. filters: a "
+        "metadata filter with one key per dict, e.g. {'item_type': "
+        "'journalArticle'}; keys item_type, item_key, citation_key, doi, "
+        "publication, tags, has_fulltext; combine with {'$and': [{...}, "
+        "{...}]}; there is no year filter. level: 'articles' (works on a topic) "
+        "or 'passages' (where something is stated); default follows the "
+        "chunking setting. Searches the active library; "
+        "library_id picks another (0 or 'user', or a group ID), "
+        "search_all_libraries=True searches every indexed library (not with "
+        "library_id). Needs a built index: if results look empty or stale, "
+        "check zotero_get_search_database_status and run "
+        "zotero_update_search_database."
     )
 )
 @with_zotero_api_lock
@@ -1434,6 +1449,8 @@ def semantic_search(
     filters: dict[str, str] | str | None = None,
     library_id: int | str | None = None,
     search_all_libraries: bool = False,
+    full_passage: bool = False,
+    level: Literal["articles", "passages"] | None = None,
     *,
     ctx: Context
 ) -> str:
@@ -1449,6 +1466,10 @@ def semantic_search(
         search_all_libraries: Search every indexed library at once (#163).
             Requires the SQLite backend; results are labelled with their
             source library. Mutually exclusive with library_id.
+        full_passage: Return the whole matched passage instead of a short
+            excerpt (default: False). On a passage-indexed library this is
+            the complete chunk; otherwise the indexed text is capped at
+            1500 characters. Hits share 15000 characters, at least 400 each.
         ctx: MCP context
 
     Returns:
@@ -1524,40 +1545,101 @@ def semantic_search(
 
         # Fire-and-forget: if auto-update is due, kick off a background sync
         # so subsequent searches see fresh library state. Never blocks here.
-        _maybe_fire_presearch_sync(search)
+        syncing = _maybe_fire_presearch_sync(search)
+        # Is the index behind the library? Only for the active library, and
+        # not while the sync just started catches it up.
+        version_check = (
+            _library_version_check(search, group_id)
+            if not syncing and group_id is not None and group_id == _client.get_active_group_id()
+            else None
+        )
 
         # Perform search
-        results = search.search(query=query, limit=limit, filters=filters, group_id=group_id)
+        results = search.search(
+            query=query, limit=limit, filters=filters, group_id=group_id,
+            **({"level": level} if level else {}),
+        )
+        stale_note = _stale_index_note(search, version_check()) if version_check else None
 
         if results.get("error"):
-            return f"Semantic search error: {results['error']}"
+            message = f"Semantic search error: {results['error']}"
+            if results.get("embedding_api_unreachable"):
+                message += " Use zotero_search_items for a keyword search meanwhile."
+            return message
 
         search_results = results.get("results", [])
+        level_note = results.get("level_note")
+        load_note = results.get("load_note")
 
         if not search_results:
-            return f"No semantically similar items found for query: '{query}'"
+            empty = f"No semantically similar items found for query: '{query}'"
+            notes = [
+                n for n in (
+                    f"*{level_note}*" if level_note else None,
+                    f"*{load_note}*" if load_note else None,
+                    stale_note,
+                ) if n
+            ]
+            return "\n\n".join([empty, *notes])
 
         # Format results as markdown
         output = [f"# Semantic Search Results for '{query}'", ""]
         if search_all_libraries:
             output.append("*Scope: all indexed libraries.*")
             output.append("")
+        if level_note:
+            output.append(f"*{level_note}*")
+            output.append("")
+        if load_note:
+            output.append(f"*{load_note}*")
+            output.append("")
         output.append(f"Found {len(search_results)} similar items:")
         output.append("")
+        # Say how the order was produced. A hosted re-ranker that fails falls
+        # back to retrieval order on purpose, and without this line that
+        # fallback is invisible: a wrong model name or an expired key would
+        # quietly degrade every search.
+        rerank = results.get("rerank")
+        if rerank:
+            if rerank.get("applied"):
+                output.append(
+                    f"*Ranked by {rerank.get('model')} over "
+                    f"{rerank.get('candidates')} candidates.*"
+                )
+            else:
+                output.append(
+                    f"**Note:** re-ranking with {rerank.get('model')} failed "
+                    f"({rerank.get('error')}); results are in embedding-similarity order."
+                )
+            output.append("")
 
+        passage_cap = min(
+            _FULL_PASSAGE_MAX_CHARS,
+            max(400, _FULL_PASSAGE_TOTAL_CHARS // len(search_results)),
+        )
         for i, result in enumerate(search_results, 1):
             similarity_score = result.get("similarity_score", 0)
+            rerank_score = result.get("rerank_score")
             zotero_item = result.get("zotero_item", {})
 
             # Prefer the grounded passage — the window of the document that
             # actually overlaps the query — over a blind head-truncation, so
             # the agent gets a citable quote rather than the abstract's opening.
             passage = result.get("matched_passage") or result.get("matched_text", "")
-            snippet = passage[:400] + "..." if len(passage) > 400 else passage
+            if full_passage:
+                full = result.get("matched_text") or passage
+                snippet = full[:passage_cap] + "..." if len(full) > passage_cap else full
+            else:
+                snippet = passage[:400] + "..." if len(passage) > 400 else passage
 
             # Provenance for citing: page (when the index carries page breaks),
             # else which passage of how many, else an approximate char offset.
             loc_bits = []
+            # Section first: it is what tells a reader whether the hit is this
+            # paper's own claim or a citation of someone else's, which changes
+            # how the result should be read before anything else does.
+            if section := result.get("section"):
+                loc_bits.append(str(section))
             if (page := result.get("page")) is not None:
                 loc_bits.append(f"p. {page}")
             if (ci := result.get("chunk_index")) is not None and (nc := result.get("n_chunks")):
@@ -1566,7 +1648,13 @@ def semantic_search(
                 loc_bits.append(f"char ~{off}")
 
             if zotero_item:
-                extra = {"Relevance": f"{similarity_score:.3f}"}
+                if rerank_score is not None:
+                    extra = {
+                        "Relevance": f"{rerank_score:.3f}",
+                        "Similarity": f"{similarity_score:.3f}",
+                    }
+                else:
+                    extra = {"Relevance": f"{similarity_score:.3f}"}
                 if loc_bits:
                     extra["Location"] = ", ".join(loc_bits)
                 if snippet:
@@ -1589,6 +1677,8 @@ def semantic_search(
                     output.append(f"**Error:** {error}")
                 output.append("")
 
+        if stale_note:
+            output.append(stale_note)
         return "\n".join(output)
 
     except Exception as e:
@@ -1599,23 +1689,11 @@ def semantic_search(
 @mcp.tool(
     name="zotero_update_search_database",
     description=(
-        "Build or refresh the semantic search embedding database from "
-        "Zotero items. Run this: (a) after first install, (b) after adding "
-        "items via zotero_add_item, or "
-        "(c) when the user has added items directly in Zotero desktop "
-        "since the last update. "
-        "By default the update is INCREMENTAL — only new or changed items "
-        "are re-embedded, so repeated calls are cheap. "
-        "force_rebuild=True re-embeds ALL items from scratch (slow; use "
-        "when changing the embedding model or recovering from corruption). "
-        "limit: optional cap on items processed (useful for smoke-testing). "
-        "Progress is reported via the MCP context; on large libraries an "
-        "incremental update is seconds, a full rebuild can take minutes. "
-        "Requires the [semantic] optional dependency and a configured "
-        "embedding provider (see config.json). Check status with "
-        "zotero_get_search_database_status. "
-        "Example: zotero_update_search_database() after adding a batch of "
-        "papers."
+        "Build or refresh the semantic search index. Incremental by default: "
+        "only new or changed items are embedded, so it is cheap to run after "
+        "adding items. force_rebuild=True re-embeds everything (slow; for a "
+        "model change or a damaged index). limit: cap on items processed, for "
+        "testing."
     )
 )
 @with_zotero_api_lock
@@ -1667,6 +1745,8 @@ def update_search_database(
 
         if stats.get("error"):
             output.append(f"**Error:** {stats['error']}")
+        elif stats.get("skipped_message"):
+            output.append(stats["skipped_message"])
         else:
             output.append(f"**Total items:** {stats.get('total_items', 0)}")
             output.append(f"**Processed:** {stats.get('processed_items', 0)}")
@@ -1695,17 +1775,10 @@ def update_search_database(
 @mcp.tool(
     name="zotero_get_search_database_status",
     description=(
-        "Report the semantic search database's readiness and stats: item "
-        "count, last update time, embedding provider / model, and whether "
-        "the [semantic] optional dependency is installed. "
-        "Use this to decide whether zotero_semantic_search will return "
-        "useful results, or whether the user should run "
-        "zotero_update_search_database first. "
-        "Takes no parameters; no side effects. "
-        "Returns a human-readable status block. If the [semantic] extras "
-        "are not installed, returns an install hint instead of stats. "
-        "Example: zotero_get_search_database_status() → count, last sync, "
-        "provider summary."
+        "Report the semantic index's state: item count, last update, "
+        "embedding model, and whether the [semantic] extra is installed. Use "
+        "it to judge whether zotero_semantic_search will find anything or "
+        "zotero_update_search_database should run first."
     )
 )
 def get_search_database_status(*, ctx: Context) -> str:
@@ -1754,15 +1827,46 @@ def get_search_database_status(*, ctx: Context) -> str:
         output.append("## Collection Information")
         output.append(f"**Name:** {collection_info.get('name', 'Unknown')}")
         output.append(f"**Document Count:** {collection_info.get('count', 0)}")
+        output.append(f"**Article-level Records:** {collection_info.get('article_records', 0)}")
+        output.append(f"**Passage-level Records:** {collection_info.get('passage_records', 0)}")
+        for label, key in (("Items with Article Records", "article_items"), ("Items with Passages", "passage_items")):
+            if key in collection_info:
+                count = collection_info[key]
+                output.append(f"**{label}:** {'unknown' if count is None else count}")
+        if collection_info.get("pending_writes"):
+            output.append(
+                f"**Pending Writes:** {collection_info['pending_writes']} "
+                "(logged but not yet applied; applied when the index is next opened)"
+            )
         output.append(f"**Embedding Model:** {collection_info.get('embedding_model', 'Unknown')}")
         output.append(f"**Database Path:** {collection_info.get('persist_directory', 'Unknown')}")
 
         if collection_info.get("initialized") is False and not collection_info.get("error"):
             output.append("**Status:** Not initialized — run zotero_update_search_database first.")
-        if collection_info.get('error'):
+        if collection_info.get("unreadable"):
+            # A damaged index reads as 0 documents; say so, with what to run (#747).
+            from zotero_mcp.chroma_client import unreadable_index_message
+
+            output.append("**Status:** Unreadable — the index is damaged, not empty.")
+            output.append("")
+            output.append("```")
+            output.append(unreadable_index_message(collection_info, update_config.get("last_update")))
+            output.append("```")
+        elif collection_info.get('error'):
             output.append(f"**Error:** {collection_info['error']}")
 
         output.append("")
+
+        if collection_info.get("migration"):
+            from zotero_mcp.index_migration import status_note
+
+            output.append("## Index Migration")
+            output.append("```")
+            output.extend(
+                status_note(collection_info["migration"], "zotero-mcp update-db", local_mode=_utils.is_local_mode())
+            )
+            output.append("```")
+            output.append("")
 
         output.append("## Update Configuration")
         output.append(f"**Auto Update:** {update_config.get('auto_update', False)}")

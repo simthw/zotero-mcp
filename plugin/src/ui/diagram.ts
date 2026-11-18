@@ -1,13 +1,15 @@
-// Diagrams, the DOM half: a ```svg block as a themed figure card with a quiet toolbar (Source, Copy as PNG,
+// Diagrams, the DOM half: a ```svg block (or a ```mermaid one, drawn by mermaid.ts) as a themed figure card with a quiet toolbar (Source, Copy as PNG,
 // Save as PNG, Save as SVG, Add to a note). mdview.ts imports this module dynamically on the first ```svg block, so a chat
 // without diagrams never runs it; its stylesheet is added to the panel's shadow root on first use too.
 // Nodes come from diagram-svg.ts's sanitized tree, built with createElementNS: no markup is ever parsed.
 import type { NoteImage, NoteRequest, SavedNote } from "../types.ts";
 import type { SvgEl } from "./diagram-svg.ts";
 import { HUES, HUE_DARK, HUE_LIGHT, SOFT_DARK, SOFT_LIGHT, exportPalette, prepareSvg, serializeSvg } from "./diagram-svg.ts";
+import { mermaidToSvg } from "./mermaid.ts";
 import { copyText, edgeFade, env, h, icon } from "./dom.ts";
 import type { IconName } from "./dom.ts";
 import { noteLine, trySave } from "./notes.ts";
+import { t } from "../i18n.ts";
 
 export interface DiagramOpts {
   /** The host's file picker (PanelHost.saveFile); absent, the Save buttons are not shown. */
@@ -80,12 +82,16 @@ function build(n: SvgEl): SVGElement {
   return out;
 }
 
+export type DiagramLang = "svg" | "mermaid";
+
 const cache = new Map<string, ReturnType<typeof prepareSvg>>();
-function prepared(src: string): ReturnType<typeof prepareSvg> {
-  if (cache.has(src)) return cache.get(src) ?? null;
-  const p = prepareSvg(src);
+function prepared(src: string, lang: DiagramLang): ReturnType<typeof prepareSvg> {
+  const key = `${lang}\u0000${src}`;
+  if (cache.has(key)) return cache.get(key) ?? null;
+  const svg = lang === "mermaid" ? mermaidToSvg(src) : src;
+  const p = svg === null ? null : prepareSvg(svg);
   if (cache.size >= 40) cache.delete(cache.keys().next().value as string);
-  cache.set(src, p);
+  cache.set(key, p);
   return p;
 }
 
@@ -93,13 +99,13 @@ function prepared(src: string): ReturnType<typeof prepareSvg> {
  * Fills `card` (an empty div) with the drawing and its toolbar. False when the text is not a drawing we
  * can show; the caller then shows it as code.
  */
-export function fill(card: HTMLElement, src: string, opts: DiagramOpts): boolean {
-  const p = prepared(src);
+export function fill(card: HTMLElement, src: string, opts: DiagramOpts, lang: DiagramLang = "svg"): boolean {
+  const p = prepared(src, lang);
   if (!p) return false;
   const { svg: tree, fit, title } = p;
   const fig = build(tree);
   fig.setAttribute("role", "img");
-  fig.setAttribute("aria-label", tree.attrs["aria-label"] || title || "Diagram");
+  fig.setAttribute("aria-label", tree.attrs["aria-label"] || title || t("diagram.label"));
   // Between 0.9x and 1.3x its own size: labels never billboard-size in a wide panel, never below ~11px in a narrow one
   // (there it scrolls sideways, with a soft fade on the side that has more).
   fig.style.maxWidth = `${Math.round(fit.box[2] * 1.3)}px`;
@@ -116,9 +122,9 @@ export function fill(card: HTMLElement, src: string, opts: DiagramOpts): boolean
     b.addEventListener("click", () => void run(b));
     return b;
   };
-  const sourceBtn = btn("Show the SVG source", "code", (b) => {
+  const sourceBtn = btn(t(lang === "mermaid" ? "diagram.sourceMermaid" : "diagram.source"), "code", (b) => {
     const on = !srcEl;
-    if (on) { srcEl = h("div.dg__src", null, opts.codeBlock(src, "svg")); card.appendChild(srcEl); }
+    if (on) { srcEl = h("div.dg__src", null, opts.codeBlock(src, lang)); card.appendChild(srcEl); }
     else { srcEl?.remove(); srcEl = null; }
     b.setAttribute("aria-pressed", String(on));
     card.classList.toggle("dg--src", on);
@@ -133,9 +139,9 @@ export function fill(card: HTMLElement, src: string, opts: DiagramOpts): boolean
     return cs.getPropertyValue("--accent-l").trim() || (app.getAttribute("data-theme") === "dark" ? undefined : cs.getPropertyValue("--accent").trim()) || undefined;
   };
   const exported = () => serializeSvg(tree, fit, exportPalette(accent()));
-  const copyBtn = btn("Copy as an image", "copy", async (b) => done(b, await copyPng(exported(), fit.box[2], fit.box[3])));
+  const copyBtn = btn(t("diagram.copy"), "copy", async (b) => done(b, await copyPng(exported(), fit.box[2], fit.box[3])));
   const saveBtn = (fmt: "PNG" | "SVG") => {
-    const b = h("button.dg__btn", { type: "button", title: `Save as ${fmt}`, "aria-label": `Save as ${fmt}` }, icon("download"), fmt);
+    const b = h("button.dg__btn", { type: "button", title: t("diagram.saveAs", { format: fmt }), "aria-label": t("diagram.saveAs", { format: fmt }) }, icon("download"), fmt);
     b.addEventListener("click", () => void (async () => {
       if (!opts.saveFile) return;
       try {
@@ -148,16 +154,16 @@ export function fill(card: HTMLElement, src: string, opts: DiagramOpts): boolean
   };
   // A note under the item the user is on: the title, then the drawing as an embedded PNG; the line under the card says where it went.
   let noteEl: HTMLElement | null = null;
-  const noteBtn = (save: NonNullable<DiagramOpts["saveNote"]>) => btn("Add to a note", "note", async (b) => {
+  const noteBtn = (save: NonNullable<DiagramOpts["saveNote"]>) => btn(t("diagram.note"), "note", async (b) => {
     b.setAttribute("disabled", "");
-    const st = await trySave(async () => save({ ...(title ? { title } : {}), markdown: fence(src), images: [await pngOf(src, accent())] }));
+    const st = await trySave(async () => save({ ...(title ? { title } : {}), markdown: fence(src, lang), images: [await pngOf(src, accent(), lang)] }));
     b.removeAttribute("disabled");
     if ("ok" in st) done(b, true);
     noteEl?.remove();
     noteEl = noteLine(st, (uri) => opts.open?.(uri));
     card.insertBefore(noteEl, srcEl);
   });
-  const bar = h("div.dg__bar", { role: "toolbar", "aria-label": "Diagram" }, sourceBtn, copyBtn,
+  const bar = h("div.dg__bar", { role: "toolbar", "aria-label": t("diagram.label") }, sourceBtn, copyBtn,
     opts.saveFile ? [h("span.dg__sep"), saveBtn("PNG"), saveBtn("SVG")] : null,
     opts.saveNote ? [h("span.dg__sep"), noteBtn(opts.saveNote)] : null);
   card.className = "dg";
@@ -171,20 +177,20 @@ export function fill(card: HTMLElement, src: string, opts: DiagramOpts): boolean
 export function pending(card: HTMLElement): void {
   card.className = "dg dg--pending";
   card.setAttribute("role", "status");
-  card.replaceChildren("Drawing…");
+  card.replaceChildren(t("diagram.drawing"));
   ensureStyles(card);
   env.win.queueMicrotask?.(() => ensureStyles(card));
 }
 
 /** The source back in a fence longer than any run of backticks inside it. */
-const fence = (src: string) => {
+const fence = (src: string, lang: DiagramLang) => {
   const t = "`".repeat(Math.max(3, ...[...src.matchAll(/`+/g)].map((m) => m[0].length + 1)));
-  return `${t}svg\n${src}\n${t}`;
+  return `${t}${lang}\n${src}\n${t}`;
 };
 
 /** The drawing as a PNG for a note (light palette, on white), shown at its own width up to 640 px. Null when it is no drawing. */
-export async function pngOf(src: string, accent?: string): Promise<NoteImage | null> {
-  const p = prepared(src);
+export async function pngOf(src: string, accent?: string, lang: DiagramLang = "svg"): Promise<NoteImage | null> {
+  const p = prepared(src, lang);
   if (!p) return null;
   const [, , w, hh] = p.fit.box;
   const width = Math.min(640, Math.round(w));
@@ -195,7 +201,7 @@ const fileName = (title: string) => title.toLowerCase().replace(/[^a-z0-9]+/g, "
 
 /** A check mark for a moment on success; the button's own content again after. */
 function done(b: HTMLElement, ok: boolean): void {
-  if (!ok) { b.title = "That did not work"; return; }
+  if (!ok) { b.title = t("diagram.failed"); return; }
   const kids = [...b.childNodes];
   b.replaceChildren(icon("check"));
   env.win.setTimeout(() => b.replaceChildren(...kids), 1200);

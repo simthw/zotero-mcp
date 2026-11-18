@@ -4,6 +4,7 @@
 import type { ChipSummary } from "../types.ts";
 import type { AssistantMessage, Message, NoticeMessage, TranscriptState, UserMessage } from "./transcript.ts";
 import { answerText, textsOf } from "./transcript.ts";
+import { linkCallouts, takeCalloutsDirty } from "./callout.ts";
 import { collectSources } from "./markdown.ts";
 import type { CitedSource } from "./markdown.ts";
 import { dots, glint, permSeg, planSeg, stepsSeg, textSeg, thoughtSeg, toSegs } from "./parts.ts";
@@ -12,7 +13,11 @@ import { CHIP_ICON, clear, env, flashCheck, fmtTokens, h, icon, setKids } from "
 import { noteLine, trySave } from "./notes.ts";
 import type { NoteState } from "./notes.ts";
 import { Pacer, thinkOf } from "./think.ts";
+import { START, intentUp, isUpKey, pinned, scrolled } from "./follow.ts";
+import type { Follow } from "./follow.ts";
 import type { Think } from "./think.ts";
+import { t } from "../i18n.ts";
+import type { Key } from "../i18n.ts";
 
 export type { MsgActions };
 
@@ -33,11 +38,7 @@ const CLOCK = { now: () => Date.now(), set: (fn: () => void, ms: number) => env.
 
 // ───────────────────────────── assistant message ─────────────────────────────
 
-const STOP_NOTE: Record<string, string> = {
-  cancelled: "Stopped",
-  max_tokens: "Stopped at the length limit",
-  refusal: "The model declined to answer",
-};
+const STOP_NOTE: Record<string, Key> = { cancelled: "stop.cancelled", max_tokens: "stop.maxTokens", refusal: "stop.refusal" };
 
 class AssistantView {
   readonly el: HTMLElement;
@@ -105,33 +106,34 @@ class AssistantView {
       this.sources = collectSources(textsOf(msg));
     }
     const text = answerText(msg);
-    const copyBtn = h("button.iconbtn.iconbtn--sm", { type: "button", "aria-label": "Copy answer", title: "Copy", disabled: text ? null : true }, icon("copy"));
+    const copyBtn = h("button.iconbtn.iconbtn--sm", { type: "button", "aria-label": t("answer.copy"), title: t("common.copy"), disabled: text ? null : true }, icon("copy"));
     copyBtn.addEventListener("click", () => { this.actions.copy(text); flashCheck(copyBtn); });
-    const noteBtn = h("button.iconbtn.iconbtn--sm", { type: "button", "aria-label": "Save as a Zotero note", title: "Save as note", disabled: text && !this.saving ? null : true, onclick: () => void this.saveNote() }, icon("note"));
+    const noteBtn = h("button.iconbtn.iconbtn--sm", { type: "button", "aria-label": t("answer.saveNoteLabel"), title: t("answer.saveNote"), disabled: text && !this.saving ? null : true, onclick: () => void this.saveNote() }, icon("note"));
     // The last answer only: asking again is about what was just said.
     const explainBtn = f.canRetry && text
-      ? h("button.iconbtn.iconbtn--sm", { type: "button", "aria-label": "Explain it better", title: "Explain better: intuition first, a tiny example, then the details", onclick: () => this.actions.explain() }, icon("bulb"))
+      ? h("button.iconbtn.iconbtn--sm", { type: "button", "aria-label": t("answer.explainLabel"), title: t("answer.explainTip"), onclick: () => this.actions.explain() }, icon("bulb"))
       : null;
     const retryBtn = f.canRetry
-      ? h("button.iconbtn.iconbtn--sm", { type: "button", "aria-label": "Try again", title: "Try again", onclick: () => this.actions.retry(msg.id) }, icon("retry"))
+      ? h("button.iconbtn.iconbtn--sm", { type: "button", "aria-label": t("common.tryAgain"), title: t("common.tryAgain"), onclick: () => this.actions.retry(msg.id) }, icon("retry"))
       : null;
     const u = msg.usage;
     // Tokens and cost are off by default: a running price under every answer makes people hesitate to ask.
     const usage = f.showUsage && u && (u.inputTokens || u.outputTokens || u.costUsd)
-      ? [u.inputTokens ? `${fmtTokens(u.inputTokens)} in` : "", u.outputTokens ? `${fmtTokens(u.outputTokens)} out` : "", u.costUsd ? `$${u.costUsd.toFixed(u.costUsd < 0.1 ? 3 : 2)}` : ""].filter(Boolean).join(" · ")
+      ? [u.inputTokens ? t("usage.in", { n: fmtTokens(u.inputTokens) }) : "", u.outputTokens ? t("usage.out", { n: fmtTokens(u.outputTokens) }) : "", u.costUsd ? `$${u.costUsd.toFixed(u.costUsd < 0.1 ? 3 : 2)}` : ""].filter(Boolean).join(" · ")
       : "";
     const n = this.sources.length;
     const srcBtn = n
       ? h("button.foot__src", { type: "button", "aria-expanded": String(this.sourcesOpen), onclick: () => { this.sourcesOpen = !this.sourcesOpen; this.paintFoot(msg, f); } },
-        icon("chev", "foot__chev"), `${n} ${n === 1 ? "source" : "sources"}`)
+        icon("chev", "foot__chev"), t("answer.sources", { n }))
       : null;
     const list = n && this.sourcesOpen
       ? h("ul.sources", null, this.sources.map((s) => h("li", null,
         h("button.source", { type: "button", onclick: () => this.actions.open(s.href), title: s.href.replace(/^zotero:\/\//, "") },
           icon("item"), h("span.source__t", null, s.label),
-          s.pages.length ? h("span.source__p", null, `${s.pages.length === 1 ? "p." : "pp."} ${s.pages.join(", ")}`) : null))))
+          s.pages.length ? h("span.source__p", null, t(s.pages.length === 1 ? "answer.page" : "answer.pages", { pages: s.pages.join(", ") })) : null))))
       : null;
-    const note = STOP_NOTE[msg.stop ?? "end_turn"];
+    const stop = STOP_NOTE[msg.stop ?? "end_turn"];
+    const note = stop ? t(stop) : "";
     this.foot.className = `foot${this.sourcesOpen ? " foot--open" : ""}`;
     setKids(this.foot,
       note ? h(`div.stopnote.stopnote--${msg.stop}`, null, icon(msg.stop === "cancelled" ? "stop" : "warn"), note) : null,
@@ -146,7 +148,7 @@ class AssistantView {
     this.note = await trySave(() => this.actions.saveAnswer(this.msg.id));
     this.saving = false;
     this.paintFoot(this.msg, this.flags);
-    this.announce("ok" in this.note ? "Saved to note" : "Couldn't save the note");
+    this.announce("ok" in this.note ? t("note.saved") : t("note.saveFailedShort"));
   }
 }
 
@@ -154,7 +156,7 @@ class AssistantView {
 
 function chipRow(chips: ChipSummary[], actions: MsgActions): HTMLElement {
   return h("div.ubub__chips", null, chips.map((c) =>
-    h("button.chip.chip--sm", { type: "button", title: c.text ? `${c.label}: ${c.text.slice(0, 300)}` : c.label, onclick: () => actions.open(c.ref) },
+    h("button.chip.chip--sm", { type: "button", title: c.text ? `${c.label}: ${c.text.slice(0, 300)}` : c.label, ...(c.kind === "image" ? { disabled: true } : { onclick: () => actions.open(c.ref) }) },
       h("span.chip__i", null, icon(CHIP_ICON[c.kind] ?? "item")), h("span.chip__t", null, c.label))));
 }
 
@@ -170,7 +172,7 @@ function noticeView(m: NoticeMessage, actions: MsgActions): HTMLElement {
     h("div.notice__body", null,
       h("div.notice__msg", null, m.message),
       m.hint ? h("div.notice__hint", null, m.hint) : null,
-      bad ? h("div.notice__acts", null, h("button.btn.btn--sm", { type: "button", onclick: () => actions.checkSetup() }, "Check setup")) : null));
+      bad ? h("div.notice__acts", null, h("button.btn.btn--sm", { type: "button", onclick: () => actions.checkSetup() }, t("common.checkSetup"))) : null));
 }
 
 // ───────────────────────────── the feed ─────────────────────────────
@@ -185,8 +187,8 @@ export class Feed {
   private jump: HTMLElement;
   private live: HTMLElement;
   private views = new Map<string, { msg: Message; el: HTMLElement; asst?: AssistantView }>();
-  private stick = true;
-  private lastTop = 0;
+  /** Whether new content scrolls the feed (follow.ts): only until the reader moves up. */
+  private follow: Follow = START;
   private empty: HTMLElement | null = null;
   private lastState: TranscriptState | null = null;
   private lastRetry = false;
@@ -197,25 +199,30 @@ export class Feed {
   constructor(actions: MsgActions) {
     this.actions = actions;
     this.inner = h("div.feed__inner");
-    this.scroller = h("div.feed", { tabindex: "0", role: "log", "aria-label": "Conversation", "aria-live": "off" }, this.inner);
-    this.jump = h("button.jump", { type: "button", hidden: true, "aria-label": "Jump to the latest message", title: "Jump to the latest", onclick: () => this.toBottom(true) }, icon("down"));
+    this.scroller = h("div.feed", { tabindex: "0", role: "log", "aria-label": t("feed.label"), "aria-live": "off" }, this.inner);
+    this.jump = h("button.jump", { type: "button", hidden: true, "aria-label": t("feed.jump"), title: t("feed.jumpTip"), onclick: () => this.toBottom(true) }, icon("down"));
     this.live = h("div.sr", { role: "status", "aria-live": "polite" });
     this.el = h("div.feedwrap", null, this.scroller, this.jump, this.live);
-    this.scroller.addEventListener("scroll", () => {
-      const s = this.scroller;
-      const dist = s.scrollHeight - s.scrollTop - s.clientHeight;
-      if (dist < 48) this.stick = true;
-      else if (s.scrollTop < this.lastTop - 1) this.stick = false;
-      this.lastTop = s.scrollTop;
-      this.jump.hidden = this.stick;
-    });
+    this.scroller.addEventListener("scroll", () => this.take(scrolled(this.follow, this.scroller)));
     // The scroll event comes a frame late, and a token rendered in that gap would snap a reader back down. Intent to read
-    // upward (wheel up, PageUp, Home, arrow up) lets go of the bottom at once; reaching the bottom again takes it back.
-    const letGo = () => { if (this.scroller.scrollTop > 0) { this.stick = false; this.jump.hidden = false; } };
+    // upward (wheel up, PageUp, Home, arrow up, a finger dragging down) lets go of the bottom at once; only coming back
+    // down to the bottom (or the jump button) takes it again — never a band near the bottom, which trapped a trackpad.
+    const letGo = () => this.take(intentUp(this.follow, this.scroller));
     this.scroller.addEventListener("wheel", (e) => { if (e.deltaY < 0) letGo(); }, { passive: true });
-    this.scroller.addEventListener("keydown", (e) => { if (e.key === "PageUp" || e.key === "Home" || e.key === "ArrowUp") letGo(); });
+    this.scroller.addEventListener("keydown", (e) => { if (isUpKey(e)) letGo(); });
+    let touchY: number | null = null;
+    this.scroller.addEventListener("touchstart", (e) => { touchY = e.touches[0]?.clientY ?? null; }, { passive: true });
+    this.scroller.addEventListener("touchmove", (e) => {
+      const y = e.touches[0]?.clientY;
+      if (y != null && touchY != null && y > touchY + 2) letGo();
+      if (y != null) touchY = y;
+    }, { passive: true });
     const RO = env.win.ResizeObserver;
-    if (RO) new RO(() => { if (this.stick) this.toBottom(false); }).observe(this.inner);
+    if (RO) {
+      const ro = new RO(() => { if (this.follow.on) this.toBottom(false); });
+      ro.observe(this.inner);
+      ro.observe(this.scroller); // the feed itself shrinking (the composer grew)
+    }
   }
 
   /** Content shown when the transcript is empty (the empty state); removed as soon as a message exists. */
@@ -239,7 +246,7 @@ export class Feed {
   setPending(label: string | null): void {
     this.pending = label;
     this.syncLine();
-    if (label !== null && this.stick) this.toBottom(false);
+    if (label !== null && this.follow.on) this.toBottom(false);
   }
 
   /** The one indicator: under the running answer (hidden while that answer's thought row carries it), else under the last
@@ -266,12 +273,15 @@ export class Feed {
 
   toBottom(smooth: boolean): void {
     const s = this.scroller;
-    this.stick = true;
-    this.jump.hidden = true;
     const reduce = env.win.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     if (smooth && !reduce) s.scrollTo({ top: s.scrollHeight, behavior: "smooth" });
     else s.scrollTop = s.scrollHeight;
-    this.lastTop = s.scrollTop;
+    this.take(pinned(s));
+  }
+
+  private take(f: Follow): void {
+    this.follow = f;
+    this.jump.hidden = f.on;
   }
 
   /** Re-render after the state changed. `canRetry`: the last answer may offer "Try again". */
@@ -300,7 +310,8 @@ export class Feed {
     });
     this.syncLine();
     this.syncEmpty();
-    if (this.stick) this.toBottom(false);
+    if (takeCalloutsDirty()) linkCallouts(this.inner);
+    if (this.follow.on) this.toBottom(false);
   }
 
   private create(m: Message): { msg: Message; el: HTMLElement; asst?: AssistantView } {
@@ -316,7 +327,7 @@ export class Feed {
     for (const k of [...this.inner.children]) if (k !== this.empty) k.remove();
     this.line.el.remove();
     this.pace.drop();
-    this.stick = true;
+    this.follow = START;
   }
 
   /** The chat settings that change how messages look; applied to what is already shown too. */

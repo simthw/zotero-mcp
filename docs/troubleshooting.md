@@ -6,6 +6,7 @@
 - **Can't connect to library**: Check your API key and library ID if using the web API, and that the key has the permissions you need.
 - **Full text not available**: Make sure you're using Zotero 7+ for local full-text access.
 - **Claude Desktop can't find the `zotero-mcp` command**: use the absolute path instead (run `zotero-mcp setup-info` or `which zotero-mcp` to find it) — GUI apps don't always inherit your shell `PATH`.
+- **Windows blocks `zotero-mcp.exe` (Smart App Control, "application control" events 3077/3033)**: the `.exe` is a launcher pip generates, and it is not signed. Run the same command through Python instead: `python -m zotero_mcp authorize-local`, `python -m zotero_mcp setup`, `python -m zotero_mcp serve`. In a client's config, use `"command": "python"` (or its full path) with `"args": ["-m", "zotero_mcp", "serve"]`. Same for `zotero-cli`: `python -m zotero_mcp.cli_standalone`.
 - **Settings seem ignored**: environment variables set in the shell you launch a client from override the values in its config file.
 - **Where to look for errors**: the Claude Desktop logs, or the MCP server's own output.
 - **Installation/search option switching issues**: Database problems from changing install methods or search options can often be resolved with `zotero-mcp update-db --force-rebuild` (see [Database issues](#database-issues)).
@@ -38,7 +39,7 @@ export FASTMCP_HTTP_ALLOWED_HOSTS='["zotero.example.com"]'
 export FASTMCP_HTTP_ALLOWED_ORIGINS='["https://app.example.com"]'
 ```
 
-Or have the proxy rewrite `Host` to `localhost:<port>`. To switch the check off entirely, set `FASTMCP_HTTP_HOST_ORIGIN_PROTECTION=false`; only do that on a trusted machine. Servers bound to `0.0.0.0` (for example in Docker) are not covered by the default check, so give those a bearer token or set `FASTMCP_HTTP_HOST_ORIGIN_PROTECTION=true` together with `FASTMCP_HTTP_ALLOWED_HOSTS`.
+Or have the proxy rewrite `Host` to `localhost:<port>`. To switch the check off entirely, set `FASTMCP_HTTP_HOST_ORIGIN_PROTECTION=false`; only do that on a trusted machine. Servers bound to `0.0.0.0` (for example in Docker) are not covered by the default check; they need `ZOTERO_MCP_AUTH_TOKEN` to start at all (see [HTTP authentication](configuration.md#http-authentication-and-network-access)), and you can add `FASTMCP_HTTP_HOST_ORIGIN_PROTECTION=true` together with `FASTMCP_HTTP_ALLOWED_HOSTS`.
 
 ## Semantic search issues
 
@@ -62,6 +63,24 @@ zotero-mcp update-db --force-rebuild
 ```
 
 A forced rebuild deletes the whole ChromaDB collection and re-embeds every item in the active library from scratch. With OpenAI or Gemini embeddings that is billed again in full, and it takes as long as the first build. If the index also holds other libraries (or documents with no library attribution), the command refuses and asks for `--allow-mass-deletion`; passing that flag drops those documents permanently. Back up `~/.config/zotero-mcp/chroma_db/` first, and try a plain `zotero-mcp update-db` before rebuilding.
+
+<a id="repairing-an-unreadable-index"></a>
+
+### Repairing an unreadable index
+
+When ChromaDB cannot read the index, `db-status` and `zotero_get_search_database_status` say the index is unreadable and show ChromaDB's error (for example `Failed to apply logs to the metadata segment`), the size of the index, the last successful update and when the index was last written. A last write after the last successful update means an update was most likely interrupted part way through. `update-db` and semantic search stop with the same explanation instead of failing later with ChromaDB's error alone. `repair-db` rebuilds the index from its own files without calling the embedding provider:
+
+```bash
+zotero-mcp repair-db --dry-run   # report what can be recovered; changes nothing
+zotero-mcp repair-db             # rebuild the index
+zotero-mcp update-db --fulltext  # embed the items repair-db left out
+```
+
+It reads the vectors from the index's HNSW files and the documents and metadata from `chroma.sqlite3`, and keeps an item only if all of its chunks have a document and a vector and their metadata agree. The rest are left out and listed in a report next to the index. The new index replaces the old one, which is kept as `chroma_db.broken-<timestamp>`; delete it once search works. The rebuild needs free disk space of about the size of the old index. `update-db --fulltext` skips items that are already indexed, so it only embeds the ones left out. Without `--fulltext`, `update-db` reads only items changed since the last sync and does not pick them up.
+
+`repair-db` cannot help when the vector files are missing or in a format it does not know (it says so); rebuild with `update-db --force-rebuild` then. On an unreadable index, `--force-rebuild` renames it to `chroma_db.broken-<timestamp>` and builds a new one, so nothing is deleted.
+
+Stop any running zotero-mcp server (quit the MCP client that started it) before repairing or rebuilding. A server that has the index open keeps the old files, and opening a damaged index makes ChromaDB try again to apply its pending writes to it.
 
 ## Update issues
 

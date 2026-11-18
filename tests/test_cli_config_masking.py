@@ -7,8 +7,27 @@ GOOGLE_API_KEY were printed in full.
 import argparse
 import json
 
+import pytest
+
 from zotero_mcp import cli_standalone
 from zotero_mcp.cli import obfuscate_config_for_display
+
+
+@pytest.mark.parametrize("token", ["short", "long-test-token-value", None, 123, {"secret": "value"}])
+def test_http_auth_token_is_fully_masked(token):
+    config = {"ZOTERO_MCP_AUTH_TOKEN": token}
+    assert obfuscate_config_for_display(config) == {"ZOTERO_MCP_AUTH_TOKEN": "********"}
+    assert config["ZOTERO_MCP_AUTH_TOKEN"] == token
+
+
+@pytest.mark.parametrize("key", ["ZOTERO_WEBDAV_PASSWORD", "WEBDAV_PASSWORD", "SOME_VENDOR_PASSWORD"])
+def test_a_password_is_fully_masked(key):
+    assert obfuscate_config_for_display({key: "hunter2"}) == {key: "********"}
+    assert obfuscate_config_for_display({key: "a-much-longer-passphrase"}) == {key: "********"}
+
+
+def test_an_empty_password_is_shown_as_empty():
+    assert obfuscate_config_for_display({"ZOTERO_WEBDAV_PASSWORD": ""}) == {"ZOTERO_WEBDAV_PASSWORD": ""}
 
 
 def test_provider_api_keys_are_masked():

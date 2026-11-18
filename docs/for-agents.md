@@ -9,9 +9,9 @@ Zotero MCP connects a [Zotero](https://www.zotero.org/) library to AI assistants
 | Entry point | What it is | Use it when |
 |---|---|---|
 | `zotero-cli` | A command-line client with `--json` output on every command | **You can run shell commands.** It costs no context until used. |
-| `zotero-mcp serve` | An MCP server exposing ~38 tools by default | Your client speaks MCP but has no shell (Claude Desktop, ChatGPT). |
+| `zotero-mcp serve` | An MCP server exposing ~41 tools by default | Your client speaks MCP but has no shell (Claude Desktop, ChatGPT). |
 
-Both read the same configuration. If you have a shell, prefer `zotero-cli`: the MCP server's tool schemas cost about 13.4k tokens on every request whether or not they are used.
+Both read the same configuration. If you have a shell, prefer `zotero-cli`: the MCP server's tool schemas cost about 8k tokens on every request whether or not they are used.
 
 ## Setting it up
 
@@ -95,7 +95,7 @@ Plan everything, check placement, then write in one run:
 1. `zotero-cli --json layout ATTACHMENT_KEY --pages 3-9` lists figure, table and equation boxes with captions and a ready `rect_arg`.
 2. Write a JSON Lines plan: `{"page": 4, "text": "exact words", "comment": "...", "color": "yellow"}` for a highlight, `{"page": 3, "rect": "x,y,w,h", "comment": "..."}` for a box. Copy highlight text exactly from `read`; it is searched on that page and two either side.
 3. `zotero-cli annotations batch --attachment-key ATTACHMENT_KEY --file plan.jsonl --dry-run` prints the words each highlight would cover. Fix every miss.
-4. Run it again without `--dry-run`. Failures are listed with `ok: false` and the exit code is 1.
+4. Run it again without `--dry-run`. Failures are listed with `ok: false` and the exit code is 1. Re-running with `--on-existing skip` adds only what is missing, instead of duplicating.
 
 Colors take Zotero's names (yellow, red, green, blue, purple, magenta, orange, gray). Three or four colors with fixed meanings read better than eight; explain them in a note (`zotero-cli notes create --item-key ITEM_KEY --text -`).
 
@@ -111,7 +111,7 @@ The full command reference is [docs/cli.md](cli.md) and, generated from the pars
 
 ## Using the MCP server
 
-The tools mirror the CLI: `zotero_search_items`, `zotero_get_item_metadata`, `zotero_get_item_children`, `zotero_read_pdf_pages` (with `format='image'` and `rect`), `zotero_get_page_layout`, `zotero_create_annotation` (`text=` for a highlight, `rect=` for a box), `zotero_manage_note`, `zotero_add_by_doi`, and more. Some groups are opt-in through `ZOTERO_MCP_TOOLSETS`. Every tool and group: [Tools](tools.md).
+The tools mirror the CLI: `zotero_search_items`, `zotero_get_item_metadata`, `zotero_get_item_children`, `zotero_read_pdf_pages` (with `format='image'` and `rect`), `zotero_get_page_layout`, `zotero_create_annotation` (`text=` for a highlight, `rect=` for a box), `zotero_manage_note`, `zotero_add_item`, and more. Some groups are opt-in through `ZOTERO_MCP_TOOLSETS`. Every tool and group: [Tools](tools.md).
 
 ## Rules that prevent mistakes
 

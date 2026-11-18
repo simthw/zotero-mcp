@@ -40,9 +40,15 @@ export function describeContext(chips: ContextChip[]): { text: string; images: {
         focus.push(`${c.ref.annotationKey ? `- selected area${page(c.ref) ? ` on ${page(c.ref)}` : ""} (annotation ${c.ref.annotationKey})` : `- the whole page ${page(c.ref)}`}${c.image ? ": the image is attached" : ""}`);
         if (c.image) images.push(c.image);
         break;
-      case "annotation":
-        focus.push(`- ${c.label.split(" · ")[0]} annotation ${c.ref.annotationKey}${page(c.ref) ? ` (${page(c.ref)})` : ""}: ${quote(c.text ?? "")}`);
+      case "image":
+        if (c.image) { focus.push(`- a picture they pasted (${c.label}): the image is attached`); images.push(c.image); }
         break;
+      case "annotation": {
+        // the agent reads Zotero's own type ("highlight"), not the chip's label in the user's language
+        const type = (c.ref.annotationKey && Zotero.Items.getByLibraryAndKey(c.ref.libraryID, c.ref.annotationKey)?.annotationType) || c.label.split(" · ")[0];
+        focus.push(`- ${type} annotation ${c.ref.annotationKey}${page(c.ref) ? ` (${page(c.ref)})` : ""}: ${quote(c.text ?? "")}`);
+        break;
+      }
       case "paper": // metadata, or the full text's file: already worded (paper.ts)
         if (c.text) lines.push(c.text);
         break;

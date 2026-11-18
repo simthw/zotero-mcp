@@ -21,7 +21,7 @@ const BASE = `
   --tint-hover: color-mix(in srgb, var(--ink) 5%, transparent);
   --tint-on: color-mix(in srgb, var(--ink) 9%, transparent);
   --shadow: 0 1px 2px rgb(0 0 0 / 0.06), 0 6px 16px rgb(0 0 0 / 0.1);
-  --font: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font: system-ui, sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --fs-1: 11px; --fs-2: 12px; --fs-3: 13px; --fs-4: 14px; --fs-5: 16px; --fs-6: 20px;
   --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px;
@@ -55,7 +55,7 @@ const BASE = `
 .zmc [hidden] { display: none !important; }
 .zmc svg { display: block; flex: none; }
 .zmc :is(.hrow__f svg, .stopnote svg) { width: 12px; height: 12px; }
-.zmc :is(.btn svg, .lnk svg, .chip__i svg, .chip__btn svg, .area__head svg, .pick svg, .pop__search svg, .pop__ic svg, .menu__check svg, .keyrow__ok svg, .folder svg, .step__icon svg, .step__st svg, .plan__head svg, .perm--done svg) { width: 14px; height: 14px; }
+.zmc :is(.btn svg, .lnk svg, .chip__i svg, .chip__btn svg, .pick svg, .pop__search svg, .pop__ic svg, .menu__check svg, .keyrow__ok svg, .folder svg, .step__icon svg, .step__st svg, .plan__head svg, .perm--done svg) { width: 14px; height: 14px; }
 .zmc :is(.iconbtn svg, .send svg, .dropveil svg, .jump svg) { width: 16px; height: 16px; }
 .zmc :is(.stat__t, .chip__t, .hrow__f span, .hrow__t, .folder__p, .source__t, .step__title, .perm--done .perm__what) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .zmc h1, .zmc h2, .zmc h3 { margin: 0; font-weight: 600; }
@@ -117,8 +117,14 @@ const BASE = `
 .zmc .seg__opt:disabled { opacity: 0.5; }
 
 /* ---------- header and frame ---------- */
-.zmc .hd { flex: none; display: flex; align-items: center; gap: var(--s1); padding: var(--s2); border-bottom: 1px solid var(--rule); }
-.zmc .hd__fill { flex: 1; min-width: var(--s1); }
+/* Same height and icon size as the reader's toolbar beside it (Zotero's reader.css: 41px bar, 28px buttons, 20px icons). */
+.zmc .hd { flex: none; display: flex; align-items: center; gap: var(--s1); box-sizing: border-box; height: 41px; padding: 0 var(--s2); border-bottom: 1px solid var(--rule); }
+.zmc .hd .iconbtn svg { width: 20px; height: 20px; stroke-width: 1; } /* 1.25px lines at 20px, like Zotero's 20px icons (our grid is 16) */
+.zmc .hd__fill { flex: 1; min-width: var(--s1); display: flex; align-items: center; }
+/* The chat's name, clickable to rename it (chat.ts: a user rename locks out every automatic source). */
+.zmc .hd__title { flex: 1; min-width: 0; padding: 2px var(--s2); border: 0; border-radius: var(--r1); background: none; color: var(--ink); font-size: var(--fs-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.zmc .hd__title:hover, .zmc .hd__title:focus-visible { background: var(--tint-hover); }
+.zmc .hd__title-input { flex: 1; min-width: 0; height: 28px; }
 .zmc .stat { display: inline-flex; align-items: center; gap: var(--s2); min-width: 0; max-width: 62%; height: var(--h-sm); padding: 0 var(--s3) 0 10px; border: 1px solid var(--rule); border-radius: var(--pill); background: var(--paper-raised); color: var(--ink-muted); font-size: var(--fs-2); transition: color var(--ease), border-color var(--ease); }
 .zmc .stat:hover, .zmc .stat[aria-pressed="true"] { color: var(--ink); border-color: var(--rule-strong); }
 .zmc .stat__t { min-width: 0; }
@@ -169,11 +175,26 @@ const BASE = `
 .zmc .chip__x { display: none; } .zmc .chip:hover .chip__x, .zmc .chip:focus-within .chip__x, .zmc .chip:not(.chip--auto) .chip__x { display: grid; }
 @media (hover: none) { .zmc .chip__x { display: grid; } }
 .zmc .cerr { flex: 1 0 100%; font-size: var(--fs-2); color: var(--danger); }
-.zmc .area { flex: 1 0 100%; padding: var(--s2) var(--s3); border: 1px solid var(--rule); border-radius: var(--r2); background: var(--paper); }
-.zmc .area__head { display: flex; align-items: center; gap: var(--s2); margin-bottom: var(--s2); font-size: var(--fs-2); font-weight: 500; color: var(--ink-muted); }
-.zmc .area__img { display: block; max-width: 100%; max-height: 120px; margin: 0 auto; border: 1px solid var(--rule); border-radius: var(--r1); background: #fff; object-fit: contain; }
-.zmc .area__none { padding: var(--s4); text-align: center; font-size: var(--fs-2); color: var(--ink-faint); }
-.zmc .area__acts { display: flex; justify-content: space-between; margin: var(--s2) calc(-1 * var(--s2)) calc(-1 * var(--s1)); }
+.zmc .cthumbs { flex: 1 0 100%; display: flex; flex-wrap: wrap; gap: var(--s2); padding: var(--s2) var(--s2) 0 0; }
+.zmc .thumb { position: relative; flex: none; width: 72px; height: 72px; }
+.zmc .thumb__main { display: block; width: 100%; height: 100%; padding: 0; border: 1px solid var(--rule); border-radius: var(--r2); overflow: hidden; background: var(--paper); }
+.zmc button.thumb__main { cursor: pointer; } .zmc button.thumb__main:hover { border-color: var(--rule-strong); }
+.zmc .thumb__img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.zmc .thumb__none { display: grid; place-items: center; height: 100%; color: var(--ink-faint); }
+.zmc .thumb__x { position: absolute; top: -8px; right: -8px; display: none; place-items: center; width: 22px; height: 22px; padding: 0; border: 1px solid var(--rule-strong); border-radius: 50%; background: var(--paper-raised); color: var(--ink); box-shadow: var(--shadow); }
+.zmc .thumb__x:hover { background: var(--paper-sunk); }
+.zmc .lb { position: absolute; inset: 0; z-index: 50; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--s2); padding: var(--s4); background: rgb(0 0 0 / 0.72); }
+.zmc .lb__pic { position: relative; }
+.zmc .lb__img { display: block; object-fit: contain; border-radius: var(--r1); background: #fff; box-shadow: var(--shadow); }
+.zmc .lb__cap { display: flex; align-items: center; gap: var(--s3); font-size: var(--fs-2); color: #fff; }
+.zmc .lb__cap .lnk { color: #fff; }
+.zmc .lb__x { position: absolute; bottom: 100%; right: -6px; display: grid; place-items: center; width: 24px; height: 24px; margin-bottom: 2px; padding: 0; border: 0; border-radius: var(--r1); background: none; color: rgb(255 255 255 / 0.85); }
+.zmc .lb__x:hover { color: #fff; background: rgb(255 255 255 / 0.12); }
+.zmc .lb__x svg { width: 16px; height: 16px; }
+.zmc .thumb__x svg { width: 12px; height: 12px; }
+/* Focus shows it only from the keyboard: a preview closed with the mouse hands focus back without leaving × up. */
+.zmc .thumb:hover .thumb__x, .zmc .thumb__main:focus-visible ~ .thumb__x, .zmc .thumb__x:focus-visible { display: grid; }
+@media (hover: none) { .zmc .thumb__x { display: grid; } }
 .zmc .cin { display: block; width: 100%; min-height: 24px; max-height: 168px; padding: 0; margin: 0; border: 0; background: none; resize: none; outline: none; font-size: var(--fs-4); line-height: 24px; overflow-y: auto; }
 .zmc .cin:focus-visible { outline: none; }
 .zmc .ctools { display: flex; align-items: center; gap: var(--s1); margin-left: calc(-1 * (var(--h-sm) - 16px) / 2); }
@@ -299,8 +320,10 @@ const BASE = `
 .zmc .hist__note { display: flex; gap: var(--s2); margin: var(--s1) 0 0; font-size: var(--fs-2); color: var(--ink-muted); line-height: 1.5; } .zmc .hist__note svg { width: 14px; height: 14px; margin-top: 2px; }
 .zmc .hrow__t { color: var(--ink); }
 .zmc .hrow__m { font-size: var(--fs-1); color: var(--ink-muted); }
-.zmc .hrow__del { opacity: 0; } .zmc :is(.hrow:hover, .hrow:focus-within) .hrow__del, .zmc .hrow__del:focus-visible { opacity: 1; }
-@media (hover: none) { .zmc .hrow__del { opacity: 0.7; } }
+.zmc :is(.hrow__del, .hrow__ren) { opacity: 0; } .zmc :is(.hrow:hover, .hrow:focus-within) :is(.hrow__del, .hrow__ren), .zmc :is(.hrow__del, .hrow__ren):focus-visible { opacity: 1; }
+@media (hover: none) { .zmc :is(.hrow__del, .hrow__ren) { opacity: 0.7; } }
+.zmc .hrow--editing { gap: var(--s1); padding: var(--s1) var(--s2); }
+.zmc .hrow__edit { flex: 1; min-width: 0; height: var(--h-sm); }
 .zmc .hrow--confirm { padding: var(--s2); gap: var(--s2); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 .zmc .hrow__q { flex: 1; }
 .zmc .vempty { display: flex; flex-direction: column; align-items: center; gap: var(--s1); padding: 48px var(--s4); text-align: center; color: var(--ink-muted); }
@@ -338,6 +361,8 @@ const BASE = `
 .zmc .select::after { content: ""; position: absolute; right: var(--s3); top: 50%; width: 6px; height: 6px; margin-top: -5px; border-right: 1.5px solid var(--ink-muted); border-bottom: 1.5px solid var(--ink-muted); transform: rotate(45deg); pointer-events: none; }
 .zmc .swrow { display: flex; align-items: center; justify-content: space-between; gap: var(--s4); min-height: var(--h-row); padding: var(--s2) 0; cursor: pointer; }
 .zmc .swrow + .swrow { border-top: 1px solid var(--rule); }
+/* A field group that follows the switches (the title-source dropdown) gets the same divider above it. */
+.zmc .swrow + .fields { margin-top: 0; padding-top: var(--s3); border-top: 1px solid var(--rule); }
 .zmc .swrow__tx { display: flex; flex-direction: column; min-width: 0; }
 .zmc .swrow__d { font-size: var(--fs-2); color: var(--ink-muted); line-height: 1.4; }
 .zmc .switch { position: relative; flex: none; width: 32px; height: 20px; }

@@ -124,6 +124,7 @@ def test_setup_openai_new_config_defaults_to_batch(monkeypatch):
         "1",  # manual updates
         "",  # default PDF max pages
         "",  # default extraction workers
+        "",  # default chunking choice
         "",  # auto-detect DB path
     ])
     monkeypatch.setattr(builtins, "input", lambda *args: next(answers))
@@ -321,6 +322,7 @@ def test_chroma_client_upsert_embeddings_passes_precomputed_vectors():
             self.kwargs = kwargs
 
     client = ChromaClient.__new__(ChromaClient)
+    client.route_passages = False
     client.collection = FakeCollection()
 
     client.upsert_embeddings(
@@ -351,6 +353,7 @@ def test_chroma_client_upsert_embeddings_splits_batches_over_max_batch_size():
             return 2
 
     client = ChromaClient.__new__(ChromaClient)
+    client.route_passages = False
     client.collection = FakeCollection()
     client.client = FakeUnderlyingClient()
 

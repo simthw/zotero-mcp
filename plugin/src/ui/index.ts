@@ -4,8 +4,9 @@
 import type { BackendId, Catalog, MountPanel, PanelHost, ZoteroRef } from "../types.ts";
 import { STYLES } from "./styles.ts";
 import { Look } from "./appearance.ts";
-import { clear, clip, copyText, env, errMessage, h, icon, initEnv, setKids } from "./dom.ts";
+import { clear, cleanTitle, clip, copyText, env, errMessage, h, icon, initEnv, setKids } from "./dom.ts";
 import { Composer } from "./composer.ts";
+import { imageChips, imageFiles } from "./images.ts";
 import { chatStats, contextFill, sentLine } from "./economy.ts";
 import type { Choices, SlashItem } from "./composer.ts";
 import { Chat } from "./chat.ts";
@@ -15,14 +16,14 @@ import { Feed } from "./messages.ts";
 import { answerNote } from "./notes.ts";
 import { answerText, promptFor } from "./transcript.ts";
 import { settingsView } from "./settings.ts";
+import { ownProviders } from "./settings-model.ts";
 import { BACKEND_LABEL, BACKENDS, emptyState, historyView, setupCard, statusView } from "./views.ts";
 import { welcomeView } from "./welcome.ts";
 import { enabledSkills, invocationText, parseInvocation, pinned, skillPath } from "./skills-model.ts";
+import { resolveLanguage, setLanguage, t } from "../i18n.ts";
 
 type View = "chat" | "history" | "settings" | "status" | "welcome";
 
-/** The footer's "Explain better": the last answer again, the way a good teacher would start. */
-const EXPLAIN_BETTER = "Explain that again from the intuition first, with a tiny example, then the details.";
 
 export const mountPanel: MountPanel = (root, host) => {
   initEnv(root);
@@ -36,17 +37,21 @@ class Panel {
   private chat: Chat;
   private health: Health;
   private chips: ChipState;
-  private feed: Feed;
-  private composer: Composer;
-
-  private app: HTMLElement;
-  private chatEl: HTMLElement;
-  private viewEl: HTMLElement;
-  private setupSlot = h("div.setupslot");
-  private statusBtn: HTMLButtonElement;
-  private accountEl = h("span.stat__t");
-  private historyBtn: HTMLButtonElement;
-  private look: Look;
+  // Drawn by build(), and again when the interface language changes (relabel).
+  private feed!: Feed;
+  private composer!: Composer;
+  private app!: HTMLElement;
+  private chatEl!: HTMLElement;
+  private viewEl!: HTMLElement;
+  private setupSlot!: HTMLElement;
+  private statusBtn!: HTMLButtonElement;
+  private accountEl!: HTMLElement;
+  private historyBtn!: HTMLButtonElement;
+  /** The chat's name at the top; click to rename. Drawn by build()/render(), rebuilt by relabel(). */
+  private titleBtn!: HTMLButtonElement;
+  /** The inline rename input while it is open; render() must leave it alone. */
+  private titleInput: HTMLInputElement | null = null;
+  private look!: Look;
 
   private view: View = "chat";
   private activeView: { render?: () => void; refresh?: () => void } | null = null;
@@ -67,69 +72,14 @@ class Panel {
       host,
       onChange: () => this.scheduleRender(),
       blockReason: () => this.health.blockReason(),
-      turnEnded: (stop) => this.feed.announce(stop === "end_turn" ? "Answer finished" : "Turn ended"),
+      turnEnded: (stop) => this.feed.announce(stop === "end_turn" ? t("chat.answerFinished") : t("chat.turnEnded")),
       setupFailed: () => void this.health.refresh(),
       sessionChanged: () => this.syncPickers(),
+      shownChanged: () => this.refreshChips(),
       expand: (text, cwd) => this.expand(text, cwd),
     });
-    this.feed = new Feed({
-      open: (t) => void this.open(t),
-      copy: (t) => void copyText(t),
-      retry: (id) => this.chat.retry(id),
-      answer: (turn, pid, oid) => this.chat.answerPermission(turn, pid, oid),
-      checkSetup: () => this.show("status"),
-      saveFile: (n, d, m) => host.saveFile(n, d, m),
-      saveNote: (n) => host.saveNote(n),
-      saveAnswer: async (id) => {
-        const m = this.chat.tr.messages.find((x) => x.id === id);
-        if (m?.role !== "assistant") throw new Error("that answer is no longer here");
-        return host.saveNote(await answerNote(answerText(m), promptFor(this.chat.tr, id)?.text));
-      },
-      explain: () => this.send(EXPLAIN_BETTER, false),
-    });
-    this.composer = new Composer({
-      search: (q) => host.search(q),
-      chipFor: (hit) => host.chipFor(hit),
-      open: (t) => void this.open(t),
-      onSend: (t) => this.send(t),
-      onStop: () => void this.chat.stop(),
-      onAddChip: (c) => { this.chips.add(c); this.refreshChips(); },
-      onDrop: async (data) => {
-        // Only the host reads a drop: Zotero's drag formats are not the UI's business.
-        const dropped = await host.dropChips(data).catch(() => []);
-        for (const c of dropped) this.chips.add(c, true);
-        if (dropped.length) this.refreshChips();
-        return dropped.length;
-      },
-      onRemoveChip: (c) => { this.chips.remove(c); this.refreshChips(); },
-      onTogglePin: (c) => { this.chips.togglePin(c); this.refreshChips(); },
-      onPick: (kind, id) => void this.pick(kind, id),
-      loadChoices: async () => { await this.loadCatalog(true); return this.choices(); },
-      switchAgent: (id) => this.switchAgent(id),
-      hasMessages: () => this.chat.tr.messages.length > 0,
-      onFirstFocus: () => { if (!this.chat.session && !this.chat.starting && !this.health.blockReason()) void this.chat.ensureSession().catch(() => {}); },
-      checkSetup: () => this.show("status"),
-      onNewChat: () => void this.newChat(),
-      contextInfo: () => ({ stats: chatStats(this.chat.tr), showCost: host.getSettings().showUsage, sent: sentLine(this.chat.lastContext), canCompact: !!this.chat.session?.canCompact }),
-      onCompact: () => void this.chat.compact(),
-      slashItems: () => this.slashItems(),
-    });
-
-    const btn = (label: string, ic: Parameters<typeof icon>[0], onclick: () => void) =>
-      h("button.iconbtn", { type: "button", "aria-label": label, title: label, onclick }, icon(ic)) as HTMLButtonElement;
-    this.historyBtn = btn("History", "history", () => this.show(this.view === "history" ? "chat" : "history"));
-    this.statusBtn = h("button.stat", { type: "button", onclick: () => this.show(this.view === "status" ? "chat" : "status") }, h("span.stat__dot"), this.accountEl) as HTMLButtonElement;
-    const hd = h("header.hd", null,
-      btn("Close the panel", "close", () => (root.host ?? this.app).dispatchEvent(new env.win.CustomEvent("zmc-close", { bubbles: true, composed: true }))),
-      btn("New chat", "plus", () => void this.newChat()), this.historyBtn,
-      h("span.hd__fill"), this.statusBtn,
-      btn("Settings", "gear", () => this.show(this.view === "settings" ? "chat" : "settings")));
-    this.chatEl = h("div.chat", null, this.feed.el, h("div.dock", null, this.setupSlot, this.composer.el));
-    this.viewEl = h("div.viewhost", { hidden: true });
-    this.app = h("div.zmc", { dataset: { theme: host.theme(), view: "chat" }, onkeydown: (e: KeyboardEvent) => this.onKey(e) }, hd, h("div.body", null, this.chatEl, this.viewEl));
-    this.look = new Look(this.app, host);
-    this.look.apply();
-    root.append(h("style", { text: STYLES }), this.app);
+    this.applyLanguage();
+    this.build();
 
     this.disposers.push(host.onContextChange(() => this.refreshChips()), host.onThemeChange(() => { this.app.dataset.theme = host.theme(); }),
       host.onSettingsChange(() => this.onOutsideSettings()));
@@ -146,6 +96,94 @@ class Panel {
       focusComposer: () => { this.show("chat"); this.composer.focus(); },
       runPrompt: (slot) => this.runPinned(slot),
     };
+  }
+
+  /** The DOM: header, feed, composer, the view host. The chat, its session and the chips live outside it. */
+  private build(): void {
+    const { root, host } = this;
+    this.setupSlot = h("div.setupslot");
+    this.accountEl = h("span.stat__t");
+    this.feed = new Feed({
+      open: (t) => void this.open(t),
+      copy: (t) => void copyText(t),
+      retry: (id) => this.chat.retry(id),
+      answer: (turn, pid, oid) => this.chat.answerPermission(turn, pid, oid),
+      checkSetup: () => this.show("status"),
+      saveFile: (n, d, m) => host.saveFile(n, d, m),
+      saveNote: (n) => host.saveNote(n),
+      saveAnswer: async (id) => {
+        const m = this.chat.tr.messages.find((x) => x.id === id);
+        if (m?.role !== "assistant") throw new Error(t("chat.answerGone"));
+        return host.saveNote(await answerNote(answerText(m), promptFor(this.chat.tr, id)?.text));
+      },
+      explain: () => this.send(t("answer.explainPrompt"), false), // the last answer again, the way a good teacher would start
+    });
+    this.composer = new Composer({
+      search: (q) => host.search(q),
+      chipFor: (hit) => host.chipFor(hit),
+      open: (t) => void this.open(t),
+      onSend: (t) => this.send(t),
+      onStop: () => void this.chat.stop(),
+      onAddChip: (c) => { this.chips.add(c); this.refreshChips(); },
+      onDrop: async (data) => {
+        // Only the host reads a drop: Zotero's drag formats are not the UI's business.
+        const dropped = await host.dropChips(data).catch(() => []);
+        for (const c of dropped) this.chips.add(c, true);
+        const pics = await imageChips(imageFiles(data)); // pictures are for the next message only, like a paste
+        for (const c of pics) this.chips.add(c);
+        if (dropped.length || pics.length) this.refreshChips();
+        return dropped.length + pics.length;
+      },
+      onPasteImages: (files) => void imageChips(files).then((pics) => { for (const c of pics) this.chips.add(c); if (pics.length) this.refreshChips(); }),
+      onRemoveChip: (c) => { this.chips.remove(c); this.refreshChips(); },
+      onTogglePin: (c) => { this.chips.togglePin(c); this.refreshChips(); },
+      onPick: (kind, id) => void this.pick(kind, id),
+      loadChoices: async () => { await this.loadCatalog(true); return this.choices(); },
+      switchAgent: (id) => this.switchAgent(id),
+      hasMessages: () => this.chat.tr.messages.length > 0,
+      onFirstFocus: () => { if (!this.chat.session && !this.chat.starting && !this.health.blockReason()) void this.chat.ensureSession().catch(() => {}); },
+      checkSetup: () => this.show("status"),
+      onNewChat: () => void this.newChat(),
+      contextInfo: () => ({ stats: chatStats(this.chat.tr), showCost: host.getSettings().showUsage, sent: sentLine(this.chat.lastContext), canCompact: !!this.chat.session?.canCompact }),
+      onCompact: () => void this.chat.compact(),
+      slashItems: () => this.slashItems(),
+    });
+
+    const btn = (label: string, ic: Parameters<typeof icon>[0], onclick: () => void) =>
+      h("button.iconbtn", { type: "button", "aria-label": label, title: label, onclick }, icon(ic)) as HTMLButtonElement;
+    this.titleInput = null;
+    this.titleBtn = h("button.hd__title", { type: "button", hidden: true, title: t("header.renameTip"), "aria-label": t("header.renameTip"), onclick: () => this.editTitle() }) as HTMLButtonElement;
+    this.historyBtn = btn(t("history.title"), "history", () => this.show(this.view === "history" ? "chat" : "history"));
+    this.statusBtn = h("button.stat", { type: "button", onclick: () => this.show(this.view === "status" ? "chat" : "status") }, h("span.stat__dot"), this.accountEl) as HTMLButtonElement;
+    const hd = h("header.hd", null,
+      btn(t("header.close"), "close", () => (root.host ?? this.app).dispatchEvent(new env.win.CustomEvent("zmc-close", { bubbles: true, composed: true }))),
+      btn(t("common.newChat"), "plus", () => void this.newChat()), this.historyBtn,
+      h("span.hd__fill", null, this.titleBtn), this.statusBtn,
+      btn(t("settings.title"), "gear", () => this.show(this.view === "settings" ? "chat" : "settings")));
+    this.chatEl = h("div.chat", null, this.feed.el, h("div.dock", null, this.setupSlot, this.composer.el));
+    this.viewEl = h("div.viewhost", { hidden: true });
+    this.app = h("div.zmc", { dataset: { theme: host.theme(), view: "chat" }, onkeydown: (e: KeyboardEvent) => this.onKey(e) }, hd, h("div.body", null, this.chatEl, this.viewEl));
+    this.look = new Look(this.app, host);
+    this.look.apply();
+    root.append(h("style", { text: STYLES }), this.app);
+  }
+
+  /** The setting, else Zotero's language; true when it changed. */
+  private applyLanguage(): boolean { return setLanguage(resolveLanguage(this.host.getSettings().uiLanguage, this.host.locale())); }
+
+  /** The interface language changed: everything is drawn again in it. The chat, its session, the chips and the draft stay. */
+  private relabel(): void {
+    const draft = this.composer.ta.value;
+    const view = this.view;
+    this.composer.dispose();
+    clear(this.root);
+    this.emptyShown = null;
+    this.build();
+    this.composer.setText(draft);
+    this.refreshChips();
+    this.applyBehavior();
+    this.render();
+    this.show(view, view === "settings" ? "#look" : undefined);
   }
 
   // ───────────────────────────── screens ─────────────────────────────
@@ -166,7 +204,7 @@ class Panel {
     const back = () => this.show("chat");
     const host = this.host;
     const screen =
-      v === "history" ? historyView(host, { current: () => this.chat.saved?.id ?? null, back, resume: (s) => void this.openSaved(s), deleted: (id) => { if (this.chat.saved?.id === id) void this.newChat(); } })
+      v === "history" ? historyView(host, { current: () => this.chat.saved?.id ?? null, back, resume: (s) => void this.openSaved(s), deleted: (id) => { if (this.chat.saved?.id === id) void this.newChat(); }, renamed: (s) => this.chat.adoptRename(s.id, s.title) })
       : v === "welcome" ? welcomeView(host, this.health, { done: () => void this.finishWelcome(), recheck: () => void this.health.refresh(), changed: () => this.onSettings(), openSettings: () => this.show("settings") })
       : v === "status" ? statusView(host, { back, initial: this.health.checks, openSettings: () => this.show("settings"), changed: (c) => this.health.set(c) })
       : settingsView(host, { back, statuses: () => this.health.statuses, refreshStatuses: () => void this.health.refreshStatuses().then(() => this.activeView?.render?.()), changed: () => this.onSettings(), look: this.look,
@@ -184,6 +222,39 @@ class Panel {
     this.show("chat");
   }
 
+  /** Rename the open chat: an inline input in the header. Enter saves (and locks), Esc and a click away cancel, an empty change does nothing. */
+  private editTitle(): void {
+    const saved = this.chat.saved;
+    if (!saved || this.titleInput) return;
+    const wrap = this.titleBtn.parentElement;
+    if (!wrap) return;
+    const input = h("input.input.hd__title-input", { type: "text", value: saved.title, maxlength: "120", "aria-label": t("header.renameTip") }) as HTMLInputElement;
+    let closed = false;
+    const done = (save: boolean) => {
+      if (closed) return;
+      closed = true;
+      const name = cleanTitle(input.value);
+      input.remove();
+      this.titleInput = null;
+      this.titleBtn.hidden = false;
+      if (save && name && name !== saved.title) void this.chat.rename(name).catch((e) => this.warn(t("header.renameFailed", { error: errMessage(e) })));
+      else this.render();
+    };
+    input.addEventListener("keydown", (e) => {
+      // An Enter or Esc that belongs to an IME (Chinese, Japanese, Korean: picking a candidate) is not ours; keyCode 229 is WebKit's older way to say so.
+      if (e.isComposing || e.keyCode === 229) { e.stopPropagation(); return; }
+      if (e.key === "Enter") { e.preventDefault(); done(true); }
+      else if (e.key === "Escape") { e.preventDefault(); done(false); }
+      e.stopPropagation(); // the panel's own Escape handler closes views; this Esc only closes the edit
+    });
+    input.addEventListener("blur", () => done(false));
+    this.titleBtn.hidden = true;
+    this.titleInput = input;
+    wrap.append(input);
+    input.focus();
+    input.select();
+  }
+
   /** A notice in the chat that is not saved with it. */
   private warn(message: string): void { this.chat.dispatch({ t: "notice", level: "warn", message }, false); }
 
@@ -197,7 +268,7 @@ class Panel {
   }
 
   private async open(target: string | ZoteroRef): Promise<void> {
-    try { await this.host.open(target); } catch (e) { this.warn(`Couldn't open that in Zotero: ${errMessage(e)}`); }
+    try { await this.host.open(target); } catch (e) { this.warn(t("chat.openFailed", { error: errMessage(e) })); }
   }
 
   private async newChat(): Promise<void> {
@@ -225,13 +296,13 @@ class Panel {
     const s = this.host.getSettings();
     const st = this.health.backend();
     this.statusBtn.dataset.state = this.health.state;
-    // Say plainly who pays: a subscription's account name, or "API key". pi has neither: it uses the user's own provider keys.
-    const label = s.backend === "pi" ? "pi" : s.auth[s.backend] === "api-key" ? `${BACKEND_LABEL[s.backend]} · API key` : st?.account || `${BACKEND_LABEL[s.backend]} · subscription`;
+    // Say plainly who pays: a subscription's account name, or "API key". pi and OpenCode have neither: they use the providers set up in them.
+    const label = s.backend === "custom" ? s.customAgent?.label || t("agent.custom.label") : ownProviders(s.backend) ? BACKEND_LABEL[s.backend] : s.auth[s.backend] === "api-key" ? t("header.apiKey", { agent: BACKEND_LABEL[s.backend] }) : st?.account || t("header.subscription", { agent: BACKEND_LABEL[s.backend] });
     this.accountEl.textContent = label;
     const bad = this.health.failing;
-    const tip = { ok: "Everything is set up", checking: "Checking…", unknown: "Status unknown", warn: "", bad: "" }[this.health.state] || bad.map((c) => c.label).join(", ");
-    this.statusBtn.title = `${tip}. Open status`;
-    this.statusBtn.setAttribute("aria-label", `${label}. Status: ${tip}`);
+    const tip = { ok: t("status.allSet"), checking: t("common.checking"), unknown: t("header.statusUnknown"), warn: "", bad: "" }[this.health.state] || bad.map((c) => c.label).join(", ");
+    this.statusBtn.title = t("header.statusTip", { status: tip });
+    this.statusBtn.setAttribute("aria-label", t("header.statusLabel", { account: label, status: tip }));
     this.composer.setBlocked(this.health.blockReason());
     this.syncPickers(); // the agents' status dots
     this.paintEmpty();
@@ -253,6 +324,8 @@ class Panel {
   }
 
   private onSettings(): void {
+    if (this.applyLanguage()) this.relabel();
+    this.catalogs.delete("custom");
     this.onHealth();
     this.applyBehavior();
     // An empty chat has no history to protect: let a changed backend take effect on the next send.
@@ -296,9 +369,12 @@ class Panel {
   /** The chosen backend's models, modes and efforts. `strict`: let a failure reach the caller (a picker menu shows it). */
   private async loadCatalog(strict: boolean): Promise<void> {
     const b = this.host.getSettings().backend;
+    if (b === "custom" && !strict) return this.syncPickers();
     if (this.catalogs.has(b) || this.chat.session?.backend === b) return this.syncPickers();
+    const source = JSON.stringify(this.host.getSettings().customAgent);
     try {
-      this.catalogs.set(b, await this.host.runtime.catalog(b));
+      const catalog = await this.host.runtime.catalog(b);
+      if (b !== "custom" || source === JSON.stringify(this.host.getSettings().customAgent)) this.catalogs.set(b, catalog);
     } catch (e) {
       if (strict) throw e;
     }
@@ -315,7 +391,7 @@ class Panel {
 
   /** A choice from the pickers; the model "" is the agent's own default (the saved choice is cleared). */
   private async pick(kind: "model" | "effort" | "mode", id: string): Promise<void> {
-    try { await this.chat.pick(kind, id, kind === "model" && !id ? this.choices().defaultModel : id); } catch (e) { this.warn(`Couldn't switch the ${kind}: ${errMessage(e)}`); }
+    try { await this.chat.pick(kind, id, kind === "model" && !id ? this.choices().defaultModel : id); } catch (e) { this.warn(t(kind === "model" ? "chat.switchModelFailed" : kind === "effort" ? "chat.switchEffortFailed" : "chat.switchModeFailed", { error: errMessage(e) })); }
     this.syncPickers();
   }
 
@@ -328,7 +404,8 @@ class Panel {
 
   // ───────────────────────────── the chat ─────────────────────────────
 
-  private refreshChips(): void { this.composer.setChips(this.chips.current()); }
+  /** Chips already shown in a sent message are left out: they still reach the agent, as a one-line reminder. */
+  private refreshChips(): void { if (this.chat) this.composer.setChips(this.chips.current().filter((c) => !this.chat.isShown(c))); }
 
   private paintEmpty(): void {
     const s = this.host.getSettings();
@@ -354,7 +431,9 @@ class Panel {
     this.refreshChips();
     void this.chat.send(text, used);
     this.render();
-    this.feed.toBottom(false);
+    // Off: a reader asking from higher up keeps their place — and the follow state machine (follow.ts) keeps
+    // holding it while the answer streams, since they already let go by scrolling up.
+    if (this.host.getSettings().scrollOnSend) this.feed.toBottom(false);
   }
 
   /** A pinned item (the empty state's list, or its shortcut): a prompt sends its text, a skill runs on what is open. */
@@ -372,7 +451,7 @@ class Panel {
 
   /** A pinned skill runs on what is open, as `/name` would. */
   private async runSkill(name: string): Promise<void> {
-    if (!(await this.host.skills.list().catch(() => [])).some((k) => k.name === name)) { this.show("chat"); this.warn(`The “${name}” skill is no longer in your skills folder. Unpin it in Settings.`); return; }
+    if (!(await this.host.skills.list().catch(() => [])).some((k) => k.name === name)) { this.show("chat"); this.warn(t("chat.skillGone", { name })); return; }
     this.runText(`/${name}`);
   }
 
@@ -381,7 +460,7 @@ class Panel {
     const s = this.host.getSettings();
     const items: SlashItem[] = enabledSkills(s, await this.host.skills.list()).map((k) => ({ group: "Skills", id: k.name, label: `/${k.name}`, detail: k.description, insert: `/${k.name} ` }));
     for (const p of s.prompts) if (!p.off && (p.title || p.text)) items.push({ group: "Prompts", id: p.id, label: p.title || clip(p.text, 60), detail: p.title ? p.text : "", insert: p.text });
-    if (this.chat.tr.messages.length && this.chat.session?.canCompact && !this.chat.busy) items.push({ group: "Agent", id: "compact", label: "Summarise now", detail: "Summarise the chat so far to free up context", run: () => void this.chat.compact() });
+    if (this.chat.tr.messages.length && this.chat.session?.canCompact && !this.chat.busy) items.push({ group: "Agent", id: "compact", label: t("ring.compact"), detail: t("slash.compactDetail"), run: () => void this.chat.compact() });
     return items;
   }
 
@@ -407,10 +486,15 @@ class Panel {
     const c = this.chat;
     const empty = c.tr.messages.length === 0;
     if (this.emptyShown !== empty) { this.emptyShown = empty; this.paintEmpty(); }
+    if (!this.titleInput) { // an open rename edit is not clobbered by a repaint
+      const title = c.saved?.title ?? "";
+      this.titleBtn.textContent = title;
+      this.titleBtn.hidden = !title;
+    }
     this.feed.update(c.tr, !c.busy);
     this.composer.setBusy(c.busy);
     this.composer.setContextFill(contextFill(c.tr));
-    this.feed.setPending(c.sending && c.tr.running === null ? (c.compacting ? "Summarising" : c.starting ? `Starting ${BACKEND_LABEL[this.host.getSettings().backend]}` : "Sending") : null);
+    this.feed.setPending(c.sending && c.tr.running === null ? (c.compacting ? t("work.summarising") : c.starting ? t("work.starting", { agent: BACKEND_LABEL[this.host.getSettings().backend] }) : t("work.sending")) : null);
   }
 
   private dispose(): void {

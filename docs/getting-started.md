@@ -13,6 +13,7 @@ This guide walks you through installing Zotero MCP and connecting it to your AI 
 uv tool install zotero-mcp-server   # recommended
 pip install zotero-mcp-server       # or with pip
 pipx install zotero-mcp-server      # or with pipx
+nix profile install github:54yyyu/zotero-mcp   # or with Nix (core install, no extras)
 ```
 
 Optional extras (`semantic`, `pdf`, `scite`, `all`) are listed in the [README](../README.md#optional-extras). If you are new to the command line, the community-built [Zotero MCP Setup](https://github.com/ehawkin/zotero-mcp-setup) has a macOS GUI installer (DMG), one-click install scripts for Mac and Windows, and a step-by-step guide.
@@ -57,6 +58,10 @@ If you want to connect to your Zotero library via the web API:
    export ZOTERO_LIBRARY_ID=your_library_id
    export ZOTERO_LIBRARY_TYPE=user  # or 'group' for group libraries
    ```
+
+   For a self-hosted server that speaks the Zotero Web API (such as
+   [altero](https://github.com/eseifert/altero)), also set `ZOTERO_API_URL` to its
+   base URL, the same value as Zotero desktop's `extensions.zotero.api.url`.
 
 ## Integrating with Claude Desktop and Claude Code
 
@@ -106,81 +111,226 @@ If you want to connect to your Zotero library via the web API:
 
 If your agent has a shell (Claude Code, Cursor, Codex …), you can use `zotero-cli` through an agent skill instead of the MCP server, at a fraction of the context cost: `zotero-mcp install-skill`. See [CLI and agent skill](cli.md).
 
+## Integrating with VS Code and GitHub Copilot
+
+Install Zotero MCP and complete [local Zotero setup](#option-1-local-zotero-recommended)
+above, then open a local project folder in VS Code with GitHub Copilot enabled.
+These examples use local reads, so no Zotero API key is needed.
+
+### Copilot personal configuration
+
+In current VS Code, run **MCP: Add Server** from the Command Palette, choose
+**Command (stdio)**, enter `zotero-mcp serve --transport stdio`, and name the
+server `zotero`. Choose **Global > Copilot Global** for a personal configuration.
+Run **Chat: Open Customizations**, select **MCP Servers**, and edit the entry to
+set `ZOTERO_LOCAL` in its environment. The resulting entry in
+`$COPILOT_HOME/mcp-config.json` (or `~/.copilot/mcp-config.json` when unset) is:
+
+```json
+{
+  "mcpServers": {
+    "zotero": {
+      "command": "zotero-mcp",
+      "args": ["serve", "--transport", "stdio"],
+      "env": {
+        "ZOTERO_LOCAL": "true"
+      }
+    }
+  }
+}
+```
+
+Merge the entry into an existing file rather than replacing other servers.
+On Windows, the default personal file is
+`%USERPROFILE%\.copilot\mcp-config.json`.
+
+### VS Code workspace configuration
+
+For a VS Code workspace/Local harness configuration, create `.vscode/mcp.json`
+in the project folder and merge this entry. This format uses `servers`:
+
+```json
+{
+  "servers": {
+    "zotero": {
+      "type": "stdio",
+      "command": "zotero-mcp",
+      "args": ["serve", "--transport", "stdio"],
+      "env": {
+        "ZOTERO_LOCAL": "true"
+      }
+    }
+  }
+}
+```
+
+Newer VS Code versions label these VS Code-specific destinations deprecated in
+the guided setup, while retaining compatibility. Eligible entries are also
+forwarded to Copilot sessions; entries requiring interactive input variables
+are not. See VS Code's [configuration formats](https://code.visualstudio.com/docs/agents/reference/mcp-configuration)
+and [configuration destinations](https://code.visualstudio.com/docs/agent-customization/mcp-servers#choose-a-configuration-destination)
+when choosing a scope. `zotero-mcp setup` configures Claude clients; it is not
+required for either VS Code configuration.
+
+### Start and verify
+
+Run **MCP: List Servers**, select `zotero`, and choose **Start Server** (or restart
+it after a configuration change). Review any trust prompt, then use the same
+agent harness for which you configured the server. Ask it to
+"Use `zotero_get_collections` to list the collections in my Zotero library."
+Inspect the tool call and result to confirm that the server can read your
+library, rather than relying only on the chat's answer.
+
+If startup fails, select the server's **Show Output** action. A command-not-found
+error usually means VS Code did not inherit the installation's `PATH`. Find the
+executable with `zotero-mcp setup-info`, `Get-Command zotero-mcp` (PowerShell), or
+`command -v zotero-mcp` (macOS/Linux). Put its full path in `command`, keeping
+`args` separate; Windows JSON paths can use forward slashes, for example
+`"command": "C:/full/path/to/zotero-mcp.exe"`.
+
+With WSL, SSH or Dev Containers, check where the server command runs: its
+`localhost` and Zotero database paths belong to that environment. The examples
+above assume the server can access the desktop Zotero installation locally.
+See [VS Code's server troubleshooting](https://code.visualstudio.com/docs/agents/run/manage-mcp-servers#troubleshoot-mcp-servers)
+and this project's [Troubleshooting](troubleshooting.md) for more diagnostics.
+
+## Authenticated HTTP clients
+
+For clients that connect over HTTP, set `ZOTERO_MCP_AUTH_TOKEN` on the server and
+start it on loopback:
+
+```bash
+zotero-mcp serve --transport streamable-http --host 127.0.0.1 --port 8000
+```
+
+See [HTTP authentication and network access](configuration.md#http-authentication-and-network-access)
+for token generation, persistent configuration, and non-loopback bind rules.
+The examples below expect the same token in each client's environment. Starting
+a client in another terminal does not automatically copy the server's environment.
+For a remote deployment, replace the loopback URL with your authenticated HTTPS
+endpoint.
+
+### Claude Code
+
+Merge this entry into your project's `.mcp.json`. Claude Code expands the token
+from its environment when reading the HTTP headers:
+
+```json
+{
+  "mcpServers": {
+    "zotero": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${ZOTERO_MCP_AUTH_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+Start Claude Code with that environment variable set, then check `/mcp`.
+See [Claude Code's MCP configuration](https://code.claude.com/docs/en/mcp#environment-variable-expansion-in-mcp-json).
+The earlier Claude Desktop example uses local `stdio` and needs no HTTP token.
+
+### Codex
+
+Add this entry to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.zotero]
+url = "http://127.0.0.1:8000/mcp"
+bearer_token_env_var = "ZOTERO_MCP_AUTH_TOKEN"
+```
+
+The value is the environment variable's name; Codex reads its contents and sends
+the bearer header. Set it in the environment that launches Codex.
+
+### Cursor
+
+Merge this entry into `~/.cursor/mcp.json` or your project's `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "zotero": {
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:ZOTERO_MCP_AUTH_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+Ensure Cursor inherits the variable, then restart it. Cursor uses the
+`${env:NAME}` syntax for [configuration interpolation](https://cursor.com/docs/mcp#config-interpolation).
+
 ## Integrating with OpenAI's ChatGPT
 
-This option is available through the ChatGPT web app. You must use [ChatGPT Developer mode](https://platform.openai.com/docs/guides/developer-mode) which may be restricted to a limited number of OpenAI platforms and apps. A paid subscription appears to be required.
+ChatGPT connects to an MCP server with OAuth or with no authentication; OpenAI's
+[authentication docs](https://developers.openai.com/plugins/build/auth#client-identification)
+say it cannot present custom API keys, so it cannot send `ZOTERO_MCP_AUTH_TOKEN`.
+Do not work around that by exposing an unauthenticated server through a public
+tunnel: anyone with the URL could use every tool, writes included.
 
-zotero-mcp is not available by default as a web-based MCP, and it seems likely that many users will want to stick with a local MCP due to their large document libraries. Since ChatGPT does not support local MCPs natively through their desktop app (yet?) the way you can move forward is by tunneling.
+The supported route is OpenAI's [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels),
+which runs zotero-mcp as a local `stdio` process and opens only an outbound
+connection to OpenAI, so there is no public listener to protect. It needs
+ChatGPT developer mode and a tunnel in your OpenAI Platform organization
+(Tunnels permission Read + Manage to create it, Read + Use to run it).
 
-**Use at your own risk**
+1. Install [tunnel-client](https://github.com/openai/tunnel-client)
+   (`brew install openai/tools/tunnel-client` on macOS; see its README for other platforms).
+2. Create a tunnel in [Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels)
+   and export its runtime key as `CONTROL_PLANE_API_KEY` (an OpenAI credential,
+   unrelated to Zotero keys).
+3. Create a profile that starts zotero-mcp over stdio, using your tunnel ID, and run it:
 
-`zotero-mcp serve` has no authentication of its own. Treat the tunnel URL as a bearer token: anyone who has it can use every tool with whatever access the running server has, including writes when web API credentials are configured. The connector recipe below sends no credentials, so ngrok's basic auth would block it; what protects you is keeping the URL private, stopping the tunnel whenever you are not using it, and any ngrok traffic policy (IP or method restrictions) you can apply. If your ChatGPT account offers OAuth for connectors, prefer it over `No authentication`. Whatever the AI service can read from your library is exposed to that service; judge that for your own situation before continuing.
+   ```bash
+   export ZOTERO_LOCAL=true
+   tunnel-client init --sample sample_mcp_stdio_local --profile zotero \
+     --tunnel-id tunnel_0123456789abcdef0123456789abcdef \
+     --mcp-command "zotero-mcp serve --transport stdio"
+   tunnel-client doctor --profile zotero --explain
+   tunnel-client run --profile zotero
+   ```
 
-### Setting up a desktop tunnel for zotero-mcp
+   Use the full path to `zotero-mcp` if the tunnel client cannot find it, and run
+   one `tunnel-client` per tunnel ID.
+4. In ChatGPT, add an app in developer mode, choose **Tunnel** under
+   **Connection** and select your tunnel. Keep `tunnel-client` running while you
+   use it.
 
-A tunnel makes your locally running `zotero-mcp` server securely available to a web service like ChatGPT. We recommend [ngrok](https://ngrok.com/) for this.
+This route has not yet been tested end to end against a live ChatGPT account;
+check that the tools are listed and a read-only search works. Whatever the tools
+return is shared with OpenAI, and with write access configured they can change
+your library.
 
-1.  **Install ngrok**: Follow the instructions on the [ngrok website](https://ngrok.com/download) to download and install it. Mac users can use `brew` and we have successfully tested this approach.
+## Public tunnel with a bearer token (ngrok)
 
-2.  **Start the `zotero-mcp` server**: Before starting the tunnel, make sure your MCP server is running. For web-based clients use the `streamable-http` transport (`sse` still works but is deprecated and prints a warning). Open a terminal and run:
-    ```bash
-    # Make sure your Zotero environment variables are set first!
-    # e.g., export ZOTERO_LOCAL=true
-    zotero-mcp serve --transport streamable-http --port 8000
-    ```
-    Leave `--host` at its default (localhost): ngrok forwards to localhost, and binding `0.0.0.0` would also expose the server to your local network.
+For clients that can send the `Authorization` header (the
+[HTTP clients above](#authenticated-http-clients)), a tunnel to a token-protected
+server works from anywhere:
 
-    The server refuses requests whose `Host` header is not `localhost` or `127.0.0.1` (protection against DNS rebinding), and ngrok forwards its public hostname by default. Tell the server about it before starting, using your own ngrok hostname:
-    ```bash
-    export FASTMCP_HTTP_ALLOWED_HOSTS='["<random-string>.ngrok-free.app"]'
-    ```
-    or start ngrok with `ngrok http 8000 --host-header=rewrite`, which sends `localhost:8000` instead. If a tunnel gets `421 Misdirected Request`, this is why.
+1. Set `ZOTERO_MCP_AUTH_TOKEN` and start the server on loopback (a tunnel does not
+   need a LAN listener):
 
-Important: you should probably leave this terminal open in order to ensure tunnel traffic is successfully transiting to the server.
+   ```bash
+   zotero-mcp serve --transport streamable-http --host 127.0.0.1 --port 8000
+   ```
 
-3.  **Start the ngrok tunnel**: Open a *second* terminal and start ngrok, pointing it to the port your server is using (8000). Here is an instruction that will work on a mac
-    ```bash
-    ngrok http 8000
-    ```
-4.  **Copy the URL**: Ngrok will provide a public `Forwarding` URL that looks something like `https://<random-string>.ngrok-free.app`. Copy this HTTPS URL—you'll need it for the ChatGPT connector setup.
+2. In a second terminal: `ngrok http 8000 --host-header=rewrite`. The server
+   refuses a `Host` header other than `localhost` or `127.0.0.1` (DNS-rebinding
+   protection) with `421 Misdirected Request`, and ngrok otherwise forwards its
+   public hostname. Instead of rewriting you can allow that hostname before
+   starting the server:
+   `export FASTMCP_HTTP_ALLOWED_HOSTS='["<random-string>.ngrok-free.app"]'`.
+3. Point the client at the HTTPS forwarding URL plus `/mcp`, with the
+   `Authorization: Bearer <token>` header. A request without it gets `401`.
 
-### Setting up a ChatGPT or OpenAI client for zotero-mcp
-There are actually two ways to work with ChatGPT on the web once you have a tunnel open to your server: through the ChatGPT app at [chatgpt.com](https://chatgpt.com), or through the chat prompt builder screen at the [OpenAI platform page](https://platform.openai.com/chat).
-
-The setup is nearly identical for both.
-
-#### 1. ChatGPT.com setup
-
-1.  Navigate to [chatgpt.com](https://chatgpt.com). Make sure you are logged in, and at the base "chat" user interface.
-2.  Click on your profile name, then **Settings**.
-3.  Go to the **Connectors** tab:
-    *   First you must enable "Developer Mode." At the bottom of the connectors tab, there is an "Advanced..." button. Click this and then on the next screen enable "Developer Mode."
-    *   Now from the main Connectors browser window, click **Create**
-4.  Fill in the details:
-    *   **Name**: Zotero MCP
-    *   **Description**: Search and retrieve documents from a local Zotero library.
-    *   **MCP Server URL**: This is the critical part. With the `streamable-http` transport the endpoint is `/mcp` (example: `https://<YOUR_NGROK_URL>.ngrok-free.app/mcp`). The steps below were last verified with the deprecated `sse` transport; if the connector does not accept the `/mcp` URL, start the server with `--transport sse` and use the `/sse/` form: combine your ngrok URL, the `/sse/` endpoint (with a trailing slash), and a unique `session_id`.
-        *   If you use the `sse` fallback: the trailing slash on `/sse/` is important to avoid a redirect.
-        *   The `session_id` must be a valid [UUIDv4](https://www.uuidgenerator.net/). While some clients might negotiate a session automatically, explicitly providing a unique ID is the most reliable method.
-        *   Example URL: `https://<YOUR_NGROK_URL>.ngrok-free.app/sse/?session_id=<YOUR_UUID>`
-    *   **Authentication**: `No authentication` — the server has none, and this recipe sends no credentials; see "Use at your own risk" above.
-    *   Tick the "I trust this application" checkbox.
-5.  Click **Create**. If you are successfully connecting you should see relevant communications logs in your tunnel and your server terminals. If this is successful, an important indication will be the listing of all zotero-mcp tools in the ChatGPT interface.
-    *   *Important: our testing indicates that you need to turn all the "Edit" sliders to "Off" in the list of tools.* Otherwise the tool may not be enabled in Developer Mode.
-
-      ![ChatGPT Connector Tool List](../public/ChatGPT_zot_mcp_1.png)
-
-6.  You should now be ready to add Zotero-MCP to new chats. To do this, go to the main ChatGPT interface. It should indicate that you are in development mode. When you start a new chat, click the "plus" icon in the text box interface to select "Deep Research" as a chat mode. A "Sources" menu will become available: enable Zotero-MCP as one of the sources:
-
-      ![Enable Zotero-MCP as a Source](../public/ChatGPT_zot_mcp_2.png)
-
-#### 2. OpenAI Chat Builder setup
-
-The process is the same as above, but you create the connector within the context of building a custom GPT on the OpenAI Platform.
-
-1.  Navigate to the [OpenAI Platform Chat page](https://platform.openai.com/chat).
-2.  When configuring a custom GPT, go to the **Tools** section and choose to add an MCP connector.
-3.  Follow the same steps as in the `ChatGPT.com setup` to configure the connector URL and other details.
+The URL and any `session_id` are not credentials; the token is. Stop both
+processes when you are done.
 
 ## Integrating with Cherry Studio
 
@@ -246,7 +396,8 @@ Zotero MCP works with any MCP-compatible client. You can start the server manual
 zotero-mcp serve --transport stdio
 ```
 
-For HTTP-based clients:
+For HTTP-based clients, configure [authentication](#authenticated-http-clients)
+before starting the server:
 
 ```bash
 zotero-mcp serve --transport streamable-http --host localhost --port 8000

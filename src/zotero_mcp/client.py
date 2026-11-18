@@ -2,6 +2,7 @@
 Zotero client wrapper for MCP server.
 """
 
+import contextvars
 import functools
 import json
 import logging
@@ -46,6 +47,12 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
+
+# After .env, so ZOTERO_STRICT_SQLITE can be set there too. Every tool imports
+# this module before its first request, so the guard is in place in time.
+from zotero_mcp import strict_sqlite as _strict_sqlite  # noqa: E402
+
+_strict_sqlite.activate_if_requested()
 
 # Serialize all Zotero API access. The local API (port 23119) is single-threaded;
 # concurrent requests from parallel MCP tool threads queue at the network layer and
@@ -136,28 +143,93 @@ def with_zotero_api_lock(func):
 # in get_zotero_client(). Keys: "library_id", "library_type".
 _active_library_override: dict[str, str] = {}
 
+# On a shared HTTP server each client session has its own override (#739):
+# the process-wide one above would let one client's switch re-scope every
+# other client's reads and writes. _library_session names the session of the
+# tool call in progress (set by _context.sync_context); None means the
+# process-wide override, which is what stdio and the CLI use.
+_library_session: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "zotero_library_session", default=None,
+)
+_session_library_overrides: dict[str, dict[str, str]] = {}
+#: Sessions whose switch is remembered; the oldest is forgotten past this.
+_MAX_SESSION_OVERRIDES = 1024
+
+
+@contextmanager
+def library_session(session: str | None):
+    """Scope library switches and lookups in this block to *session*."""
+    token = _library_session.set(session)
+    try:
+        yield
+    finally:
+        _library_session.reset(token)
+
+
+def _current_override() -> dict[str, str]:
+    session = _library_session.get()
+    if session is None:
+        return _active_library_override
+    return _session_library_overrides.get(session, {})
+
 
 def set_active_library(library_id: str, library_type: str) -> None:
     """Set runtime library override for all subsequent get_zotero_client() calls."""
-    _active_library_override["library_id"] = library_id
-    _active_library_override["library_type"] = library_type
+    session = _library_session.get()
+    if session is None:
+        _active_library_override["library_id"] = library_id
+        _active_library_override["library_type"] = library_type
+        return
+    _session_library_overrides.pop(session, None)
+    _session_library_overrides[session] = {
+        "library_id": library_id, "library_type": library_type,
+    }
+    while len(_session_library_overrides) > _MAX_SESSION_OVERRIDES:
+        _session_library_overrides.pop(next(iter(_session_library_overrides)))
 
 
 def clear_active_library() -> None:
     """Clear runtime library override, reverting to environment variable defaults."""
-    _active_library_override.clear()
+    session = _library_session.get()
+    if session is None:
+        _active_library_override.clear()
+    else:
+        _session_library_overrides.pop(session, None)
 
 
 def get_active_library() -> dict[str, str]:
     """Return the current active library override (empty dict if using defaults)."""
-    return dict(_active_library_override)
+    return dict(_current_override())
+
+
+@contextmanager
+def temporary_active_library(library_id: str, library_type: str):
+    """Context manager to temporarily override the active library.
+
+    Restores the previous active library state (or clears it if there was none)
+    when exiting the context.
+
+    ``_active_library_override`` is a module-level global, not thread-local, so
+    this must only be used while holding ``_zotero_api_lock`` (i.e. inside a
+    ``with_zotero_api_lock``-wrapped tool) — otherwise a concurrent call could
+    see, or override, another thread's active library mid-operation.
+    """
+    previous = get_active_library()
+    set_active_library(library_id, library_type)
+    try:
+        yield
+    finally:
+        if previous:
+            set_active_library(previous["library_id"], previous["library_type"])
+        else:
+            clear_active_library()
 
 
 def get_active_group_id() -> int:
     """group_id (0 = personal, else Zotero groupID) of the library
     ``get_zotero_client()`` is currently scoped to."""
 
-    override = _active_library_override
+    override = _current_override()
     library_id = override.get("library_id") or os.getenv("ZOTERO_LIBRARY_ID") or "0"
     library_type = override.get("library_type") or os.getenv("ZOTERO_LIBRARY_TYPE", "user")
     if library_type == "group":
@@ -274,6 +346,20 @@ def _apply_default_headers(zot: zotero.Zotero) -> zotero.Zotero:
     return zot
 
 
+def _with_api_url(zot: zotero.Zotero) -> zotero.Zotero:
+    """Point a web API client at ZOTERO_API_URL when it is set.
+
+    For a self-hosted server that speaks the Zotero Web API (e.g. altero) in
+    place of api.zotero.org — the counterpart of Zotero desktop's
+    extensions.zotero.api.url. pyzotero hard-codes its endpoint but reads it
+    from the instance on every request, so overriding the attribute is enough.
+    """
+    url = os.getenv("ZOTERO_API_URL", "").strip()
+    if url:
+        zot.endpoint = url.rstrip("/")
+    return zot
+
+
 @dataclass
 class AttachmentDetails:
     """Details about a Zotero attachment."""
@@ -307,7 +393,7 @@ def get_zotero_client() -> zotero.Zotero:
         ValueError: If required environment variables are missing.
     """
     # Runtime overrides take precedence over environment variables
-    override = _active_library_override
+    override = _current_override()
     library_id = override.get("library_id") or os.getenv("ZOTERO_LIBRARY_ID")
     library_type = override.get("library_type") or os.getenv("ZOTERO_LIBRARY_TYPE", "user")
     api_key = os.getenv("ZOTERO_API_KEY")
@@ -331,7 +417,7 @@ def get_zotero_client() -> zotero.Zotero:
         local=local,
         client=_make_local_http_client() if local else None,
     )
-    return _apply_default_headers(zot) if local else zot
+    return _apply_default_headers(zot) if local else _with_api_url(zot)
 
 
 def get_local_zotero_client() -> zotero.Zotero | None:
@@ -382,11 +468,13 @@ def get_web_zotero_client() -> zotero.Zotero | None:
     if not library_id or not api_key:
         return None
 
-    return zotero.Zotero(
-        library_id=library_id,
-        library_type=library_type,
-        api_key=api_key,
-        local=False,
+    return _with_api_url(
+        zotero.Zotero(
+            library_id=library_id,
+            library_type=library_type,
+            api_key=api_key,
+            local=False,
+        )
     )
 
 
@@ -505,16 +593,30 @@ def probe_local_server_id(timeout: float = 3.0, force: bool = False) -> str | No
     # does: Zotero listens on 127.0.0.1 only, and "localhost" can resolve to
     # ::1 first or be routed through a proxy.
     server_id = None
+    reachable = False
     try:
         with _make_local_http_client(timeout) as http:
             resp = http.get("http://127.0.0.1:23119/api/")
+            reachable = True
             server_id = resp.headers.get("zotero-server-id")
     except Exception:
         server_id = None
 
     _local_probe_cache["server_id"] = server_id
+    # A missing header means two different things: nothing answered at all
+    # (Zotero is closed), or a Zotero without the write API answered (#744).
+    _local_probe_cache["reachable"] = reachable
     _local_probe_cache["checked_at"] = time.monotonic()
     return server_id
+
+
+def local_server_unreachable() -> bool:
+    """Whether the last probe found nothing listening on 127.0.0.1:23119.
+
+    False when Zotero answered, and when no probe has said otherwise.
+    """
+    probe_local_server_id()
+    return _local_probe_cache.get("reachable") is False
 
 
 def get_local_write_credentials() -> tuple[str | None, str | None, str | None]:
@@ -622,7 +724,7 @@ def get_local_write_client() -> zotero.Zotero | None:
     if not key:
         return None
 
-    override = _active_library_override
+    override = _current_override()
     library_type = override.get("library_type") or os.getenv("ZOTERO_LIBRARY_TYPE", "user")
     library_id = override.get("library_id") or os.getenv("ZOTERO_LIBRARY_ID")
     # The local API addresses the user library as users/0 whatever the web
@@ -766,6 +868,9 @@ def format_item_metadata(item: dict[str, Any], include_abstract: bool = True) ->
     # had explicitly removed. Surface it near the top where it's hard to miss.
     if data.get("deleted"):
         lines.append("**Status:** 🗑️ In Trash (recoverable from Zotero Trash view)")
+
+    if data.get("retracted") is True:
+        lines.append("**Retraction:** Flagged as retracted by Zotero (cached local status)")
 
     # Date. Resolved the same way as the title: a case's date is
     # `dateDecided`, a statute's `dateEnacted`, a patent's `issueDate` (#452).

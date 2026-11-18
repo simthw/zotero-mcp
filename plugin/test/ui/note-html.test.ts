@@ -70,7 +70,7 @@ test("tables keep their cells", () => {
 test("a title is the note's first line; diagrams are embedded images, or code without one", () => {
   const svg = '<svg viewBox="0 0 10 10"><rect width="5" height="5"/></svg>';
   const md = `Intro\n\n\`\`\`svg\n${svg}\n\`\`\`\n\nMiddle\n\n\`\`\`svg\n${svg.replace("5", "6")}\n\`\`\``;
-  assert.deepEqual(noteDiagrams(md), [svg, svg.replace("5", "6")]);
+  assert.deepEqual(noteDiagrams(md), [{ src: svg, lang: "svg" }, { src: svg.replace("5", "6"), lang: "svg" }]);
   const html = noteHtml(md, { title: "  What is   the gap?\n", image: (i) => (i === 0 ? { key: "IMGKEY01", width: 450.4, height: 300 } : null) });
   assert.equal(leak(html), null);
   assert.match(html, /^<div data-schema-version="8"><h1>What is the gap\?<\/h1><p>Intro<\/p>/);
@@ -128,4 +128,12 @@ test("the agent's formatting guide names exactly what the panel and the note acc
     assert.ok([...walk(tree)].some((n) => n.tag !== "p"), `${tag} renders as formatting, not text`);
   }
   assert.ok([...walk(mdToTree('<span style="color: red">x</span>'))].some((n) => n.attrs?.color === "#ff2020"));
+});
+
+test("a callout is a quote with its label in bold, numbered within the note, and a \\ref says which one", () => {
+  const html = noteHtml("> [!definition] Metric $d$\n> A map.\n\n\\begin{proof}[Banach]\nTrivial.\n\\end{proof}\n\nSee \\ref{def:m} and \\ref{nope}.\n\n> [!theorem] T\n> \\label{def:m}\n> x");
+  assert.match(html, /<blockquote><p><strong>Definition 1<\/strong> — Metric <span class="math">\$d\$<\/span><\/p><p>A map\.<\/p><\/blockquote>/);
+  assert.match(html, /<strong>Proof\.<\/strong> — Banach<\/p><p>Trivial\.<\/p><p>∎<\/p>/);
+  assert.match(html, /See Theorem 2 and nope\./);
+  assert.equal(leak(html), null);
 });

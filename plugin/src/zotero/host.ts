@@ -1,7 +1,7 @@
 // PanelHost: what ui/ gets. This is the only place that knows both the UI's needs and Zotero's APIs.
 import type { AgentRuntime, BackendId, Catalog, ContextChip, PanelHost, Spawner } from "../types.ts";
-import { DRAWING_GUIDE, FORMAT_GUIDE, TOOL_SHEET, buildBrief, createRuntime, prepareWorkspace, resumeCommand } from "../agent/index.ts";
-import { ContextTracker } from "./context.ts";
+import { CALLOUT_GUIDE, DRAWING_GUIDE, FORMAT_GUIDE, TOOL_SHEET, buildBrief, createRuntime, prepareWorkspace, resumeCommand } from "../agent/index.ts";
+import { ContextTracker, stripBidi } from "./context.ts";
 import { describeContext } from "./describe.ts";
 import { dropChips } from "./drop.ts";
 import { createDoctor, findCli } from "./doctor.ts";
@@ -13,6 +13,7 @@ import { openTarget } from "./open.ts";
 import { chipForHit, search } from "./search.ts";
 import { createGeckoSpawner } from "./spawn-gecko.ts";
 import { createSettingsHost } from "./settings-host.ts";
+import { t } from "../i18n.ts";
 
 export interface HostBundle {
   host: PanelHost;
@@ -34,7 +35,7 @@ export function createHost(opts: { id: string; version: string; win: any; dataDi
   const spawner = createGeckoSpawner();
   const context = new ContextTracker(opts.id);
   context.start(win);
-  const base = createRuntime({ spawner, bridgeDir: PathUtils.join(dataDir, "bridges") });
+  const base = createRuntime({ spawner, bridgeDir: PathUtils.join(dataDir, "bridges"), customAgent: () => settings().customAgent });
   const known = new Map<BackendId, Catalog>();
   // Wherever zotero-cli is, the agent's shell must find it: its folder goes on the agent's PATH.
   const runtime: AgentRuntime = {
@@ -88,10 +89,19 @@ export function createHost(opts: { id: string; version: string; win: any; dataDi
     loadEvents: (id) => store.loadEvents(id),
     appendEvent: (s, ev) => store.appendEvent(s, ev),
     deleteSession: (id) => store.deleteSession(id),
+    renameSession: (id, title) => store.renameSession(id, title),
+    paperTitle(chips: ContextChip[]): string | null {
+      // The same resolution describe.ts gives the <zotero-context> block: the open reader's paper, else the first item chip.
+      const ref = chips.find((c) => c.kind === "reader" && c.ref.itemKey)?.ref ?? chips.find((c) => c.kind === "item" && c.ref.itemKey)?.ref;
+      if (!ref?.itemKey) return null;
+      const item = Zotero.Items.getByLibraryAndKey(ref.libraryID, ref.itemKey);
+      const title = item ? stripBidi(String(item.getDisplayTitle() ?? "")) : "";
+      return title || null;
+    },
     async saveFile(name, data, mime) {
       const fp = Cc["@mozilla.org/filepicker;1"].createInstance(Ci.nsIFilePicker);
       const ext = /\.([a-z0-9]{1,5})$/i.exec(name)?.[1]?.toLowerCase() ?? "";
-      fp.init(win.browsingContext, "Save", Ci.nsIFilePicker.modeSave);
+      fp.init(win.browsingContext, t("common.save"), Ci.nsIFilePicker.modeSave);
       fp.defaultString = name;
       if (ext) { fp.appendFilter(`${ext.toUpperCase()} (${mime})`, `*.${ext}`); fp.defaultExtension = ext; }
       const result: number = await new Promise((r) => fp.open(r));
@@ -117,8 +127,8 @@ export function createHost(opts: { id: string; version: string; win: any; dataDi
       await skills.sync(cwd, (await skills.host.list()).filter((k) => !s.skills?.[k.name]?.off).map((k) => k.name)).catch((e) => Zotero.logError(e));
       const key = s.auth[s.backend] === "api-key" ? await keychain.getApiKey(s.backend) : null;
       const varName = keychain.API_KEY_ENV[s.backend];
-      return { cwd, brief: `${buildBrief()}\n\n${TOOL_SHEET}\n\n${DRAWING_GUIDE}\n\n${FORMAT_GUIDE}`, env: key && varName ? { [varName]: key } : {} };
+      return { cwd, brief: `${buildBrief()}\n\n${TOOL_SHEET}\n\n${DRAWING_GUIDE}\n\n${CALLOUT_GUIDE}\n\n${FORMAT_GUIDE}`, env: key && varName ? { [varName]: key } : {} };
     },
   };
-  return { host, spawner, context, prefetchPaper: () => papers.prefetch(host.currentContext()), importImage: images.importImage, knownCatalog: (b) => known.get(b), dispose: () => { offSettings(); sh.dispose(); context.stop(); } };
+  return { host, spawner, context, prefetchPaper: () => papers.prefetch(host.currentContext()), importImage: images.importImage, knownCatalog: (b) => b === "custom" ? undefined : known.get(b), dispose: () => { offSettings(); sh.dispose(); context.stop(); } };
 }

@@ -63,6 +63,7 @@ DASH_REPLACEMENTS = {
     '\u2012': '-',  # figure dash
     '\u2011': '-',  # non-breaking hyphen
     '\u2010': '-',  # hyphen
+    '\u2212': '-',  # minus sign, which PDFs and typed text swap with the hyphen-minus
 }
 
 QUOTE_REPLACEMENTS = {
@@ -87,7 +88,8 @@ def normalize_text(text: str) -> str:
 
     Transformations applied:
     - Remove hyphenation at line breaks ("regard-\\nless" -> "regardless")
-    - Normalize dashes (em-dash, en-dash, etc.) to simple hyphen
+    - Remove soft hyphens
+    - Normalize dashes (em-dash, en-dash, minus sign, etc.) to simple hyphen
     - Normalize curly quotes to straight quotes
     - Expand common ligatures (fi, fl, ff, etc.)
     - Collapse whitespace to single spaces
@@ -100,6 +102,7 @@ def normalize_text(text: str) -> str:
     """
     # Remove hyphenation at line breaks
     text = re.sub(r'[\u00ad\u2010\u2011-]\s*\n\s*', '', text)
+    text = text.replace('\u00ad', '')
 
     # Apply character replacements
     for old, new in DASH_REPLACEMENTS.items():
@@ -170,6 +173,23 @@ def _extract_page_spans(page) -> list[dict[str, Any]]:
     return spans
 
 
+def _hyphenates_into_next_line(normalized: str, spans: list[dict], i: int) -> bool:
+    """True when span ``i`` ends in the hyphen of a word broken across lines.
+
+    The hyphen is dropped from the index so that "regard-" and "less" on the
+    next line match a search for "regardless". Only a letter before the
+    hyphen and a lowercase letter starting the next line count, so a dash
+    before a number, or a hyphenated compound whose second half is capitalized,
+    is left alone.
+    """
+    if len(normalized) < 2 or not normalized.endswith("-") or not normalized[-2].isalpha():
+        return False
+    if i + 1 >= len(spans) or spans[i + 1].get("line") == spans[i].get("line"):
+        return False
+    following = spans[i + 1]["text"].lstrip()
+    return bool(following) and following[0].isalpha() and following[0].islower()
+
+
 def _build_normalized_text_index(spans: list[dict]) -> tuple[str, list[tuple[int, int, int]]]:
     """
     Build a normalized cumulative text string and index mapping.
@@ -191,6 +211,8 @@ def _build_normalized_text_index(spans: list[dict]) -> tuple[str, list[tuple[int
     for i, span in enumerate(spans):
         start = len(cumulative)
         normalized = normalize_for_matching(span["text"])
+        if _hyphenates_into_next_line(normalized, spans, i):
+            normalized = normalized[:-1]
         cumulative += normalized
         end = len(cumulative)
         positions.append((start, end, i))
@@ -285,17 +307,33 @@ def _clip_span(span: dict, lo: int, hi: int) -> tuple[tuple, str] | None:
 # Coordinate Conversion
 # =============================================================================
 
+def _pdf_to_page_transform(page) -> tuple[float, float, float, float, float, float]:
+    """
+    Native PDF user space -> PyMuPDF page space, as (a, b, c, d, e, f).
+
+    PyMuPDF reports text in the unrotated page with the CropBox's top-left
+    corner as origin. On an unrotated page that mapping is
+    page.transformation_matrix. On a page with /Rotate, PyMuPDF builds that
+    matrix as (1, 0, 0, -1, 0, cropbox height) and so drops a page box origin
+    that is not (0, 0): rects would land off by the CropBox / MediaBox offset.
+    The mapping below is the same on every page, rotated or not.
+    """
+    if not getattr(page, "rotation", 0) % 360:
+        return tuple(page.transformation_matrix)
+    cropbox, mediabox = page.cropbox, page.mediabox
+    return (1.0, 0.0, 0.0, -1.0, -cropbox.x0, mediabox.y1 - cropbox.y0)
+
+
 def _page_to_pdf_transform(page) -> tuple[float, float, float, float, float, float]:
     """
-    Inverse of page.transformation_matrix as (a, b, c, d, e, f).
+    Inverse of _pdf_to_page_transform as (a, b, c, d, e, f).
 
     Maps PyMuPDF page space (top-left origin, normalized to the CropBox so
     page.rect is (0, 0, w, h)) back to native PDF user space (MediaBox
     lower-left origin), which is where Zotero positions annotations. Besides
-    flipping the y-axis, this restores any non-zero page box origin and
-    accounts for page rotation.
+    flipping the y-axis, this restores any non-zero page box origin.
     """
-    a, b, c, d, e, f = page.transformation_matrix
+    a, b, c, d, e, f = _pdf_to_page_transform(page)
     det = a * d - b * c
     return (
         d / det,
@@ -659,7 +697,7 @@ def _fuzzy_search_page(search_text: str, text_index) -> dict | None:
             match_start, match_start + len(normalized_search), span_positions, spans
         )
         if bboxes:
-            return {"rects": bboxes, "matched_text": " ".join(texts), "score": 1.0}
+            return {"rects": bboxes, "bboxes": bboxes, "matched_text": " ".join(texts), "score": 1.0}
 
     match = _sliding_window_match(cumulative, normalized_search)
     if match is None:
@@ -670,9 +708,49 @@ def _fuzzy_search_page(search_text: str, text_index) -> dict | None:
         return None
     return {
         "rects": bboxes if match_score >= threshold else [],
+        "bboxes": bboxes,
         "matched_text": " ".join(texts),
         "score": match_score,
     }
+
+
+def _first_occurrence_bboxes(search_rects: list, search_text: str, text_index) -> list | None:
+    """
+    Boxes of one occurrence of search_text, when it occurs more than once on the page.
+
+    page.search_for returns the rects of every occurrence, with nothing to
+    tell where one ends and the next begins, so a quote that appears twice on
+    a page (a repeated table cell, a sentence from the abstract) would be
+    highlighted twice. This finds the occurrences in the page's text index
+    and keeps the one at search_for's first rect.
+
+    Args:
+        search_rects: Rects from page.search_for, in PyMuPDF page space
+        search_text: Text that was searched for
+        text_index: (spans, cumulative, span_positions) for the page
+
+    Returns:
+        Boxes of that occurrence in PyMuPDF page space, or None when the text
+        index has at most one occurrence (then all rects belong to it, e.g. a
+        quote over several lines)
+    """
+    spans, cumulative, span_positions = text_index
+    needle = normalize_for_matching(search_text)
+    if not needle:
+        return None
+    starts = [m.start() for m in re.finditer(re.escape(needle), cumulative)]
+    if len(starts) < 2:
+        return None
+
+    first = list(search_rects[0])
+    best = None
+    for start in starts:
+        bboxes, _ = _get_spans_in_range(start, start + len(needle), span_positions, spans)
+        if bboxes:
+            distance = _rect_distance(list(bboxes[0]), first)
+            if best is None or distance < best[0]:
+                best = (distance, bboxes)
+    return best[1] if best else None
 
 
 def _search_single_page(page, page_index: int, search_text: str, best_debug: dict) -> dict | None:
@@ -717,7 +795,10 @@ def _search_single_page(page, page_index: int, search_text: str, best_debug: dic
         # Try with normalized whitespace
         text_instances = page.search_for(" ".join(search_text.split()))
     if text_instances:
-        rects = _convert_rects_to_zotero(list(text_instances), page)
+        bboxes = list(text_instances)
+        if len(bboxes) > 1:
+            bboxes = _first_occurrence_bboxes(bboxes, search_text, text_index()) or bboxes
+        rects = _convert_rects_to_zotero(bboxes, page)
         return {
             "pageIndex": page_index,
             "rects": rects,
@@ -733,6 +814,10 @@ def _search_single_page(page, page_index: int, search_text: str, best_debug: dic
             best_debug["match"] = fuzzy_result.get("matched_text")
             best_debug["score"] = score
             best_debug["page"] = page_index
+        best_debug.setdefault("candidates", []).append({
+            "page_index": page_index, "score": score,
+            "matched_text": fuzzy_result.get("matched_text", ""), "bboxes": fuzzy_result["bboxes"],
+        })
         if fuzzy_result.get("rects"):
             rects = _convert_rects_to_zotero(fuzzy_result["rects"], page)
             return {
@@ -762,7 +847,7 @@ def open_pdf(pdf):
         yield pdf
         return
     try:
-        import fitz
+        from zotero_mcp._pymupdf import fitz
     except ImportError as exc:
         raise ImportError(f"PDF features require PyMuPDF. {install_hint('pdf')}") from exc
     document = fitz.open(pdf)
@@ -836,7 +921,7 @@ def find_text_position(pdf, page_num: int, search_text: str) -> dict:
             if target_index + offset < total_pages:
                 pages_to_search.append(target_index + offset)
 
-        best_debug = {"match": None, "score": 0.0, "page": None}
+        best_debug = {"match": None, "score": 0.0, "page": None, "candidates": []}
         for page_index in pages_to_search:
             result = _search_single_page(doc[page_index], page_index, search_text, best_debug)
             if result:
@@ -848,7 +933,39 @@ def find_text_position(pdf, page_num: int, search_text: str) -> dict:
             "best_score": best_debug["score"],
             "page_found": best_debug["page"] + 1 if best_debug["page"] is not None else None,
             "pages_searched": [p + 1 for p in pages_to_search],
+            "candidates": _nearest_candidates(doc, best_debug["candidates"]),
         }
+
+
+#: A miss lists at most this many near matches, none scoring below the floor.
+MAX_CANDIDATES = 3
+CANDIDATE_MIN_SCORE = 0.4
+
+
+def _nearest_candidates(doc, found: list[dict]) -> list[dict]:
+    """The closest fuzzy matches of a failed search, best first, ready to show.
+
+    Each is ``{"page", "best_match", "score", "rect", "rects"}``; ``rect`` and
+    ``rects`` are ``[x, y, w, h]`` boxes normalized to the page as displayed,
+    the form ``--rect`` and ``annotations preview`` use, so the candidate can
+    be looked at before the text is corrected.
+    """
+    ranked = sorted((c for c in found if c["score"] >= CANDIDATE_MIN_SCORE),
+                    key=lambda c: -c["score"])[:MAX_CANDIDATES]
+    candidates = []
+    for candidate in ranked:
+        page = doc[candidate["page_index"]]
+        rects = zotero_rects_to_shown(page, _convert_rects_to_zotero(candidate["bboxes"], page))
+        if not rects:
+            continue
+        candidates.append({
+            "page": candidate["page_index"] + 1,
+            "best_match": normalize_text(candidate["matched_text"])[:200],
+            "score": round(candidate["score"], 3),
+            "rect": union_box(rects),
+            "rects": rects,
+        })
+    return candidates
 
 
 def get_page_label(pdf, page_num: int) -> str:
@@ -890,11 +1007,10 @@ def text_in_rects(pdf, page_index: int, rects: list[list[float]]) -> str:
     Returns:
         The text of all rects joined by spaces
     """
-    import fitz
-
+    from zotero_mcp._pymupdf import fitz
     with open_pdf(pdf) as doc:
         page = doc[page_index]
-        to_page = page.transformation_matrix
+        to_page = fitz.Matrix(*_pdf_to_page_transform(page))
         parts = []
         for x0, y0, x1, y1 in rects:
             box = fitz.Rect(x0, y0, x1, y1) * to_page
@@ -1009,3 +1125,87 @@ def _shown_rect_to_zotero(page, x0: float, y0: float, x1: float, y1: float):
         x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
     bbox = [tuple(round(v, 4) for v in (x0, y0, x1, y1))]
     return _convert_rects_to_zotero(bbox, page)
+
+
+def zotero_rects_to_shown(page, rects: list[list[float]]) -> list[list[float]]:
+    """Stored Zotero rects -> normalized ``[x, y, w, h]`` boxes on the page as displayed.
+
+    The inverse of ``_shown_rect_to_zotero``: native PDF user space (bottom-left
+    origin, MediaBox) back to the top-left origin frame ``create`` and ``batch``
+    take, undoing any /Rotate on the way. A box listed this way can be passed
+    straight back to ``--rect``.
+    """
+    to_page = _pdf_to_page_transform(page)
+    rotate = tuple(page.rotation_matrix) if getattr(page, "rotation", 0) % 360 else None
+    width, height = page.rect.width, page.rect.height
+    boxes = []
+    for x0, y0, x1, y1 in rects:
+        corners = []
+        for x, y in ((x0, y0), (x1, y1)):
+            a, b, c, d, e, f = to_page
+            x, y = a * x + c * y + e, b * x + d * y + f
+            if rotate:
+                a, b, c, d, e, f = rotate
+                x, y = a * x + c * y + e, b * x + d * y + f
+            corners.append((x, y))
+        left, right = sorted(p[0] for p in corners)
+        top, bottom = sorted(p[1] for p in corners)
+        boxes.append([round(v, 4) for v in (
+            left / width, top / height, (right - left) / width, (bottom - top) / height)])
+    return boxes
+
+
+def union_box(boxes: list[list[float]]) -> list[float]:
+    """The ``[x, y, w, h]`` box that covers all of the given ``[x, y, w, h]`` boxes."""
+    left = min(b[0] for b in boxes)
+    top = min(b[1] for b in boxes)
+    right = max(b[0] + b[2] for b in boxes)
+    bottom = max(b[1] + b[3] for b in boxes)
+    return [round(v, 4) for v in (left, top, right - left, bottom - top)]
+
+
+_DOI_IN_TEXT_RE = re.compile(r"10\.\d{4,9}/[^\s\"'<>]+")
+
+
+def doi_from_pdf(pdf) -> tuple[str | None, str]:
+    """The DOI of the article a PDF holds, and where it was found (or why not).
+
+    Looks at the document's metadata (including XMP) and at the whole first
+    page, not just its first lines: a PDF cut from a journal spread carries the
+    neighbouring article's DOI too, so the answer is only given when it is
+    unambiguous. Metadata naming exactly one DOI wins unless page 1 names
+    others and not that one. Otherwise page 1 must name exactly one DOI.
+    Anything else returns ``(None, "ambiguous: ...")`` rather than a guess.
+    """
+    from zotero_mcp.identifiers import doi_match_key, normalize_doi
+
+    def dois_in(text: str) -> dict[str, str]:
+        # A DOI wrapped at one of its own hyphens is joined back up first.
+        found: dict[str, str] = {}
+        for match in _DOI_IN_TEXT_RE.finditer(re.sub(r"-[ \t]*\n\s*", "-", text or "")):
+            doi = normalize_doi(match.group(0))
+            if doi:
+                found.setdefault(doi_match_key(doi), doi)
+        return found
+
+    with open_pdf(pdf) as doc:
+        meta = " ".join(str(v) for v in (doc.metadata or {}).values() if v)
+        try:
+            meta += " " + (doc.get_xml_metadata() or "")
+        except Exception:
+            pass
+        first_page = doc[0].get_text() if len(doc) else ""
+
+    from_meta = dois_in(meta)
+    on_page = dois_in(first_page)
+    named = ", ".join(list(on_page.values())[:3])
+    if len(from_meta) == 1:
+        (key, doi), = from_meta.items()
+        if not on_page or key in on_page:
+            return doi, "metadata"
+        return None, f"ambiguous: metadata names {doi}, page 1 names {named}"
+    if len(on_page) == 1:
+        return next(iter(on_page.values())), "page 1"
+    if not on_page:
+        return None, "no DOI in the metadata or on page 1"
+    return None, f"ambiguous: {named}"

@@ -13,7 +13,7 @@ import math
 import os
 import uuid
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -255,6 +255,41 @@ def newest_manifest_for_group(root: Path, group_id: int | None) -> dict[str, Any
     return None
 
 
+#: How long an unfinished run holds up a new submission for its library: the
+#: providers' 24-hour window plus a day. Manifest states are only refreshed by
+#: batch-status and batch-import, so a run nobody collects must not hold forever.
+UNFINISHED_HOLD = timedelta(hours=48)
+
+
+def unfinished_run(root: Path, group_id: int | None, adapter: BatchAdapter) -> dict[str, Any] | None:
+    """The library's newest run that may still deliver results, or ``None``.
+
+    A run counts while any chunk is not yet imported and is either parked,
+    still running, or finished with results to import, and it was created
+    less than :data:`UNFINISHED_HOLD` ago. A new run cut from the same sync
+    version would pay again for those items and leave this run's parked
+    chunks unsent.
+    """
+    manifest = newest_manifest_for_group(root, group_id)
+    if not manifest:
+        return None
+    try:
+        created = datetime.fromisoformat(str(manifest.get("created_at")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) - created > UNFINISHED_HOLD:
+        return None
+    for batch in manifest.get("batches", []):
+        if batch.get("imported_at"):
+            continue
+        state = _entry_state(adapter, batch)
+        if state not in TERMINAL_STATES or state in IMPORTABLE_STATES:
+            return manifest
+    return None
+
+
 def find_manifest(root: Path, batch_id: str | None = None, provider_label: str = "batch") -> dict[str, Any]:
     """Find the newest manifest, or the manifest that contains a batch ID."""
     for _, manifest in _sorted_manifests(root):
@@ -373,6 +408,7 @@ def submit_embedding_batches(
     client: Any | None = None,
     max_enqueued_tokens: int | None = None,
     max_requests: int | None = None,
+    run_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Upload JSONL files and create one or more embedding batches for ``adapter``.
 
@@ -411,6 +447,10 @@ def submit_embedding_batches(
         "manifest_path": str(run_dir / "manifest.json"),
         "batches": [],
     }
+    # What the caller needs to know about the run at import time, saved with
+    # its first chunk so an interrupted submission still records it.
+    for key, value in (run_info or {}).items():
+        manifest.setdefault(key, value)
 
     chunks = split_embedding_records(
         records,

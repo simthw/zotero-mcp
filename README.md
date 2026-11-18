@@ -50,7 +50,7 @@ One package, `zotero-mcp-server`, ships all three. Pick the one that fits where 
 |---|---|---|---|
 | **For** | Chat apps that speak MCP but have no shell: Claude Desktop, ChatGPT, Cherry Studio, Chorus | Agents with a shell: Claude Code, Codex, Cursor, Windsurf, Gemini CLI, Amp, OpenCode | Chatting inside Zotero, next to the PDF you are reading |
 | **How** | `zotero-mcp setup` | `zotero-mcp install-skill` | `zotero-cli plugin`, then install the `.xpi` in Zotero |
-| **Why** | Works in any MCP client | 98 tokens in context until it is needed, instead of ~13k | Knows the item, page and selection you have open; answers link to pages |
+| **Why** | Works in any MCP client | 98 tokens in context until it is needed, instead of ~8k | Knows the item, page and selection you have open; answers link to pages |
 | **Guide** | [Getting started](https://github.com/54yyyu/zotero-mcp/blob/main/docs/getting-started.md) | [CLI and agent skill](https://github.com/54yyyu/zotero-mcp/blob/main/docs/cli.md) | [Zotero Agent plugin](https://github.com/54yyyu/zotero-mcp/blob/main/docs/chat-plugin.md) |
 
 ## What it does
@@ -164,15 +164,17 @@ An MCP server sends every tool's schema on every request, before you type anythi
 
 | Route | In context | Paid |
 |---|---:|---|
-| MCP server, default profile (38 tools) | **13,448** | every request |
+| MCP server, default profile (38 tools) | **7,939** | every request |
+| MCP server, all tools (50) | 11,225 | every request |
 | Agent skill, frontmatter only | **98** | always |
-| Agent skill, body loaded | 1,368 | when it fires |
+| Agent skill, body loaded | 2,400 | when it fires |
+| Agent skill + full command reference | 6,582 | worst case |
 
 Use the MCP server when your client speaks MCP but has no shell (Claude Desktop, ChatGPT); use the skill when it has a shell. Both share one config. Details: [CLI and agent skill](https://github.com/54yyyu/zotero-mcp/blob/main/docs/cli.md).
 
 ## Zotero Agent: chat inside Zotero
 
-A plugin that adds a chat panel to Zotero itself, driven by your own Claude Code, Codex or pi. It knows which item and page you have open and works your library through `zotero-cli`. Answers cite papers with real `zotero://` links, so a click opens the PDF at that page. It ships in the wheel: run `zotero-cli plugin` for the file and the install steps, or paste the one-paragraph prompt in the docs to your agent and let it do the setup. Details: [Zotero Agent plugin](https://github.com/54yyyu/zotero-mcp/blob/main/docs/chat-plugin.md).
+A plugin that adds a chat panel to Zotero itself, driven by your own Claude Code, Codex, pi or OpenCode. It knows which item and page you have open and works your library through `zotero-cli`. Answers cite papers with real `zotero://` links, so a click opens the PDF at that page. It ships in the wheel: run `zotero-cli plugin` for the file and the install steps, or paste the one-paragraph prompt in the docs to your agent and let it do the setup. Details: [Zotero Agent plugin](https://github.com/54yyyu/zotero-mcp/blob/main/docs/chat-plugin.md).
 
 <p align="center">
   <picture>
@@ -186,7 +188,7 @@ A plugin that adds a chat panel to Zotero itself, driven by your own Claude Code
 
 | Guide | What's in it |
 |---|---|
-| [Getting started](https://github.com/54yyyu/zotero-mcp/blob/main/docs/getting-started.md) | Connecting Claude Desktop and Claude Code, ChatGPT, Cherry Studio, Chorus, Autohand, and other MCP clients |
+| [Getting started](https://github.com/54yyyu/zotero-mcp/blob/main/docs/getting-started.md) | Connecting Claude Desktop and Claude Code, VS Code / GitHub Copilot, ChatGPT, Cherry Studio, Chorus, Autohand, and other MCP clients |
 | [Configuration](https://github.com/54yyyu/zotero-mcp/blob/main/docs/configuration.md) | Environment variables, local writes, web and hybrid modes, the SQLite read backend, global search, text extraction, command-line options |
 | [Semantic search](https://github.com/54yyyu/zotero-mcp/blob/main/docs/semantic-search.md) | Embedding models, building and updating the index |
 | [Tools](https://github.com/54yyyu/zotero-mcp/blob/main/docs/tools.md) | Every MCP tool, tool groups (`ZOTERO_MCP_TOOLSETS`), related items, PDF annotation extraction |

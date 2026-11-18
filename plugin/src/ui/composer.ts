@@ -2,6 +2,7 @@
 // It owns the draft and the popups; the controller (index.ts) owns what a send does.
 import type { BackendId, ContextChip, ItemHit, ZoteroRef } from "../types.ts";
 import { CHIP_ICON, append, env, errMessage, h, icon, isMac, setKids } from "./dom.ts";
+import { imageFiles } from "./images.ts";
 import type { Fill } from "./economy.ts";
 import { SearchPopup } from "./search.ts";
 import { Pickers } from "./pickers.ts";
@@ -10,6 +11,7 @@ import { ContextRing, FULL_AT } from "./ring.ts";
 import type { RingInfo } from "./ring.ts";
 import { SlashMenu } from "./slash.ts";
 import type { SlashItem } from "./slash.ts";
+import { t } from "../i18n.ts";
 
 export type { Choices, SlashItem };
 
@@ -24,6 +26,8 @@ export interface ComposerOpts {
   onTogglePin(chip: ContextChip): void;
   /** Something was dropped on the composer; resolves with how many chips it added. */
   onDrop(data: DataTransfer): Promise<number>;
+  /** Pictures pasted into the message box. */
+  onPasteImages(files: File[]): void;
   onPick(kind: PickKind, id: string): void;
   /** The agent's models and modes. May start the agent, so it is asked only when a picker opens. */
   loadChoices(): Promise<Choices>;
@@ -70,27 +74,28 @@ export class Composer {
   constructor(opts: ComposerOpts) {
     this.opts = opts;
     this.ta = h("textarea.cin", {
-      rows: "1", placeholder: "Ask about your library…", "aria-label": "Message", "aria-autocomplete": "list",
+      rows: "1", placeholder: t("composer.placeholder"), "aria-label": t("composer.message"), "aria-autocomplete": "list",
       oninput: () => this.onInput(),
       onkeydown: (e: KeyboardEvent) => this.onKey(e),
+      onpaste: (e: ClipboardEvent) => { const files = imageFiles(e.clipboardData); if (files.length) { e.preventDefault(); this.opts.onPasteImages(files); } },
       onfocus: () => { if (!this.warmed) { this.warmed = true; this.opts.onFirstFocus(); } },
     }) as HTMLTextAreaElement;
     this.pop = new SearchPopup(opts, (hit) => this.pickHit(hit), () => this.afterPopClose());
     const active = (id: string | null) => { if (id) this.ta.setAttribute("aria-activedescendant", id); else this.ta.removeAttribute("aria-activedescendant"); };
     this.pop.onActive = active;
 
-    this.plusBtn = h("button.iconbtn.iconbtn--sm", { type: "button", "aria-label": "Add a source", title: "Add a source (@)", "aria-haspopup": "listbox", onclick: () => this.togglePlus() }, icon("plus")) as HTMLButtonElement;
+    this.plusBtn = h("button.iconbtn.iconbtn--sm", { type: "button", "aria-label": t("composer.add"), title: t("composer.addTip"), "aria-haspopup": "listbox", onclick: () => this.togglePlus() }, icon("plus")) as HTMLButtonElement;
     this.el = h("div.composer");
     this.slash = new SlashMenu(this.el, () => opts.slashItems(), (it) => this.pickSlash(it));
     this.slash.onActive = active;
     this.pickers = new Pickers(this.el, { load: () => opts.loadChoices(), pick: (k, id) => opts.onPick(k, id), switchAgent: (id) => opts.switchAgent(id), hasMessages: () => opts.hasMessages(), checkSetup: () => opts.checkSetup() });
-    this.sendBtn = h("button.send", { type: "button", "aria-label": "Send", title: "Send (Enter)", onclick: () => this.send() }, icon("send")) as HTMLButtonElement;
+    this.sendBtn = h("button.send", { type: "button", "aria-label": t("keys.send"), title: t("composer.sendTip", { keys: "Enter" }), onclick: () => this.send() }, icon("send")) as HTMLButtonElement;
 
     this.ring = new ContextRing(this.el, { info: () => opts.contextInfo(), newChat: () => opts.onNewChat(), compact: () => opts.onCompact(), opening: () => { this.pickers.close(); this.pop.close(); } });
     this.longNote = h("div.cnote", { hidden: true, role: "status" },
-      h("span.cnote__t", null, "This chat is getting long. A new chat starts fresh and carries nothing over."),
-      h("button.lnk", { type: "button", onclick: () => opts.onNewChat() }, icon("plus"), "New chat"),
-      h("button.chip__btn", { type: "button", "aria-label": "Dismiss", title: "Dismiss", onclick: () => { this.noteDismissed = true; this.longNote.hidden = true; } }, icon("close")));
+      h("span.cnote__t", null, t("composer.long")),
+      h("button.lnk", { type: "button", onclick: () => opts.onNewChat() }, icon("plus"), t("common.newChat")),
+      h("button.chip__btn", { type: "button", "aria-label": t("common.dismiss"), title: t("common.dismiss"), onclick: () => { this.noteDismissed = true; this.longNote.hidden = true; } }, icon("close")));
 
     const b = this.pickers.buttons;
     append(this.el, [this.pop.el, this.longNote, this.chipsEl, this.ta,
@@ -102,7 +107,7 @@ export class Composer {
 
   /** The whole card is the drop target. The overlay is absolute, so nothing shifts while dragging. */
   private wireDrop(): void {
-    this.el.appendChild(h("div.dropveil", { "aria-hidden": "true" }, icon("plus"), "Drop to add"));
+    this.el.appendChild(h("div.dropveil", { "aria-hidden": "true" }, icon("plus"), t("composer.drop")));
     let depth = 0;
     const off = () => { depth = 0; this.el.classList.remove("composer--drop"); };
     this.el.addEventListener("dragenter", (e) => { e.preventDefault(); depth++; this.el.classList.add("composer--drop"); });
@@ -147,31 +152,59 @@ export class Composer {
 
   setChips(chips: ContextChip[]): void {
     this.chipsEl.hidden = chips.length === 0;
-    setKids(this.chipsEl, chips.map((c) => (c.kind === "area" ? this.areaCard(c) : this.chip(c))));
+    const pic = (c: ContextChip) => c.kind === "area" || c.kind === "image";
+    const thumbs = chips.filter(pic).map((c) => this.thumb(c));
+    setKids(this.chipsEl, [...chips.filter((c) => !pic(c)).map((c) => this.chip(c)), ...(thumbs.length ? [h("div.cthumbs", null, thumbs)] : [])]);
   }
 
   private chip(c: ContextChip): HTMLElement {
-    const label = c.kind === "selection" ? "Text Selection" : c.label;
+    const label = c.kind === "selection" ? t("chip.selection") : c.label;
     const tip = c.text ? `${label}: ${c.text.slice(0, 400)}` : label;
     const pin = (c.auto || c.pinned) && c.kind !== "selection"
-      ? h("button.chip__btn.chip__pin", { type: "button", "aria-pressed": String(c.pinned), "aria-label": c.pinned ? `Unpin ${label}` : `Keep ${label} in this chat`, title: c.pinned ? "Pinned: stays when you switch items" : "Pin: keep this when you switch items", onclick: () => this.opts.onTogglePin(c) }, icon("bookmark"))
+      ? h("button.chip__btn.chip__pin", { type: "button", "aria-pressed": String(c.pinned), "aria-label": c.pinned ? t("chip.unpin", { label }) : t("chip.keep", { label }), title: c.pinned ? t("chip.pinnedTip") : t("chip.pinTip"), onclick: () => this.opts.onTogglePin(c) }, icon("bookmark"))
       : null;
-    const x = h("button.chip__btn.chip__x", { type: "button", "aria-label": `Remove ${label}`, title: "Remove", onclick: () => this.opts.onRemoveChip(c) }, icon("close"));
+    const x = h("button.chip__btn.chip__x", { type: "button", "aria-label": t("chip.remove", { label }), title: t("common.remove"), onclick: () => this.opts.onRemoveChip(c) }, icon("close"));
     return h(`div.chip${c.auto ? ".chip--auto" : ""}${c.pinned ? ".chip--pinned" : ""}`, { title: tip },
-      h("button.chip__main", { type: "button", onclick: () => this.opts.open(c.ref), "aria-label": `Open ${label}` },
+      h("button.chip__main", { type: "button", onclick: () => this.opts.open(c.ref), "aria-label": t("chip.open", { label }) },
         h("span.chip__i", null, icon(CHIP_ICON[c.kind] ?? "item")), h("span.chip__t", null, label)),
       pin, x);
   }
 
-  private areaCard(c: ContextChip): HTMLElement {
+  /** A selected area or a pasted picture: a small tile, its name as the tooltip, × on its corner. Click: a large preview. */
+  private thumb(c: ContextChip): HTMLElement {
     const src = c.image && B64.test(c.image.data) ? `data:image/png;base64,${c.image.data}` : null;
-    return h("div.area", null,
-      h("div.area__head", null, icon("area"), h("span", null, c.label || "Selected Area")),
-      src ? h("img.area__img", { src, alt: "The selected area of the page" }) : h("div.area__none", null, "No preview"),
-      h("div.area__acts", null,
-        h("button.lnk", { type: "button", onclick: () => this.opts.open(c.ref) }, icon("external"), c.ref.annotationKey ? "Go to Annotation" : "Go to Page"),
-        h("button.lnk", { type: "button", onclick: () => this.opts.onRemoveChip(c) }, icon("close"), "Remove")));
+    const label = c.label || t("chip.area");
+    const img = src ? h("img.thumb__img", { src, alt: "" }) : h("span.thumb__none", null, icon("area"));
+    return h("div.thumb", { title: label },
+      src ? h("button.thumb__main", { type: "button", "aria-label": t("chip.preview", { label }), onclick: (e: Event) => this.preview(c, src, e.currentTarget as HTMLElement) }, img)
+        : h("div.thumb__main", { role: "img", "aria-label": label }, img),
+      h("button.thumb__x", { type: "button", "aria-label": t("chip.remove", { label }), title: t("common.remove"), onclick: () => this.opts.onRemoveChip(c) }, icon("close")));
   }
+
+  /** The picture at panel size over a dimmed panel. Esc, × or a click outside closes it; an area can go to its page. */
+  private preview(c: ContextChip, src: string, from: HTMLElement): void {
+    const root = this.el.closest(".zmc");
+    if (!root) return;
+    const label = c.label || t("chip.area");
+    const close = () => { box.remove(); from.focus(); };
+    const go = c.kind === "image" ? null : c.ref.annotationKey ? t("chip.goAnnotation") : t("chip.goPage"); // a pasted picture lives nowhere in Zotero
+    const shut = h("button.lb__x", { type: "button", "aria-label": t("chip.closePreview"), title: t("chip.closeTip"), onclick: close }, icon("close")) as HTMLButtonElement;
+    // Sized in px from the panel, so the frame is exactly the picture and the × sits on its corner.
+    const r = root.getBoundingClientRect();
+    const img = h("img.lb__img", { src, alt: label, style: `max-width: ${Math.max(80, r.width - 32)}px; max-height: ${Math.max(80, r.height - 120)}px` });
+    const box = h("div.lb", {
+      role: "dialog", "aria-modal": "true", "aria-label": label,
+      onclick: (e: Event) => { if (e.target === box) close(); },
+      onkeydown: (e: KeyboardEvent) => { if (e.key === "Escape") { e.stopPropagation(); close(); } },
+    },
+      h("div.lb__pic", null, img, shut),
+      h("div.lb__cap", null, h("span", null, label),
+        go ? h("button.lnk", { type: "button", onclick: () => { close(); this.opts.open(c.ref); } }, icon("external"), go) : null));
+    root.appendChild(box);
+    shut.focus();
+  }
+
+
 
   // --- typing
 
@@ -219,9 +252,9 @@ export class Composer {
     const has = this.ta.value.trim().length > 0;
     const stop = this.busy;
     this.sendBtn.className = stop ? "send send--stop" : "send";
-    this.sendBtn.setAttribute("aria-label", stop ? "Stop" : "Send");
+    this.sendBtn.setAttribute("aria-label", stop ? t("composer.stop") : t("keys.send"));
     const key = this.enterToSend ? "Enter" : isMac() ? "⌘Enter" : "Ctrl+Enter";
-    this.sendBtn.title = stop ? "Stop (Esc)" : this.blocked ?? `Send (${key})`;
+    this.sendBtn.title = stop ? t("composer.stopTip") : this.blocked ?? t("composer.sendTip", { keys: key });
     this.ta.setAttribute("aria-keyshortcuts", this.enterToSend ? "Enter" : "Control+Enter Meta+Enter");
     this.sendBtn.disabled = !stop && (!has || !!this.blocked);
     this.sendBtn.replaceChildren(icon(stop ? "stop" : "send"));
@@ -278,7 +311,7 @@ export class Composer {
       this.opts.onAddChip(await this.opts.chipFor(hit));
     } catch (e) {
       this.chipsEl.hidden = false;
-      const err = h("div.cerr", { role: "alert" }, `Couldn't add ${hit.title}: ${errMessage(e)}`);
+      const err = h("div.cerr", { role: "alert" }, t("composer.addFailed", { title: hit.title, error: errMessage(e) }));
       this.chipsEl.appendChild(err);
       env.win.setTimeout(() => err.remove(), 5000);
     }

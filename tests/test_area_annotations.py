@@ -50,6 +50,7 @@ def _patch_fitz(monkeypatch, pages):
     fake_fitz = types.ModuleType("fitz")
     fake_fitz.open = lambda *_args, **_kwargs: FakeDocument(pages)
     monkeypatch.setitem(sys.modules, "fitz", fake_fitz)
+    monkeypatch.setattr("zotero_mcp._pymupdf.fitz", fake_fitz)  # #642: code imports PyMuPDF through this helper
 
 
 def _pdf_attachment(key="ATTACH01", content_type="application/pdf"):
@@ -277,6 +278,33 @@ def test_create_annotation_text_creates_highlight(monkeypatch):
     assert calls[0]["comment"] == "cite me"
     assert calls[0]["color"] == "#5fb236"
     assert calls[0]["tags"] == ["to-cite"]
+
+
+def test_create_annotation_underline_reaches_the_text_path(monkeypatch):
+    calls = []
+    monkeypatch.setattr(annotations, "_create_highlight_annotation",
+                        lambda **kwargs: calls.append(kwargs) or "underlined")
+
+    result = annotations.create_annotation(
+        attachment_key="ATTACH01", page=4, text="working memory", underline=True,
+        ctx=DummyContext(),
+    )
+
+    assert result == "underlined"
+    assert calls[0]["underline"] is True and calls[0]["text"] == "working memory"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {},
+    {"rect": [0.1, 0.2, 0.3, 0.4]},
+    {"note": [0.5, 0.5], "comment": "c"},
+])
+def test_create_annotation_underline_needs_text(kwargs):
+    result = annotations.create_annotation(
+        attachment_key="ATTACH01", page=1, underline=True, ctx=DummyContext(), **kwargs
+    )
+
+    assert "underline applies to text" in result
 
 
 def test_create_annotation_rejects_text_and_rect_together():

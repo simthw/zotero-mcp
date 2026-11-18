@@ -11,9 +11,11 @@ import argparse
 import getpass
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 def _obfuscate_sensitive(value: str | None, keep_chars: int = 4) -> str:
@@ -211,6 +213,113 @@ def find_claude_config(verbose: bool = False):
     return find_all_claude_configs(verbose=verbose)[0]
 
 
+def _prompt_positive_int(label: str, default: int, minimum: int = 1) -> int:
+    """Ask for an integer of at least ``minimum``; Enter keeps ``default``."""
+    while True:
+        raw = input(f"{label} [{default}]: ").strip()
+        if raw == "":
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            print("Please enter a valid number")
+            continue
+        if value >= minimum:
+            return value
+        print(f"Please enter a number of at least {minimum}")
+
+
+def _prompt_text(label: str, current: str | None, blank_means: str) -> str | None:
+    """Ask for a string; Enter keeps ``current``, ``-`` clears it.
+
+    Returns the value to store, or None for "use the default".
+    """
+    if current:
+        raw = input(f"{label} [{current}] (Enter keeps it, '-' resets to default): ").strip()
+        if raw == "":
+            return current
+        return None if raw == "-" else raw
+    raw = input(f"{label} (leave blank for {blank_means}): ").strip()
+    return raw or None
+
+
+def _prompt_secret(label: str, current: str | None, what: str = "key") -> str:
+    """Ask for a secret without echoing; Enter keeps ``current`` if there is one."""
+    if current:
+        raw = getpass.getpass(f"{label} (hidden, Enter keeps the stored {what}): ").strip()
+        return raw or current
+    return getpass.getpass(f"{label} (hidden): ").strip()
+
+
+def _prompt_choice(label: str, valid: list[str], default: str | None) -> str:
+    """Ask for one of ``valid``; Enter picks ``default`` when there is one."""
+    suffix = f" [{default}]" if default else ""
+    while True:
+        raw = input(f"{label}{suffix}: ").strip()
+        if raw == "" and default:
+            return default
+        if raw in valid:
+            return raw
+        print("Please enter " + ", ".join(valid[:-1]) + f", or {valid[-1]}")
+
+
+def _prompt_chunking(existing_semantic_config: dict | None, batch_enabled: bool = False) -> dict:
+    """Ask whether to index documents as overlapping passages.
+
+    Starts from the existing ``chunking`` block (hand-edited keys survive) and
+    only asks for the sizes when chunking is switched on, and says what the
+    next update embeds.
+    """
+    existing = dict((existing_semantic_config or {}).get("chunking") or {})
+    was_enabled = bool(existing.get("enabled", False))
+    chunking = {
+        "enabled": was_enabled,
+        "chunk_size": 1500,
+        "overlap": 200,
+        "max_chunks_per_item": 20,
+    }
+    chunking.update(existing)
+
+    print("\n=== Passage Chunking ===")
+    print("Without chunking, each item is one vector: the metadata plus the start of")
+    print("the full text, cut at the embedding model's input limit. Text beyond that")
+    print("is not searchable.")
+    print("With chunking, each item is split into overlapping passages, one vector")
+    print("each, so long PDFs stay searchable and results can quote the matching passage.")
+    print("Warning: on a large library chunking multiplies the index: many more embeddings")
+    print("to pay for and wait on, and the index sits in memory (about 6 GB per million")
+    print("passages). After turning it on, the next 'zotero-mcp update-db' embeds the")
+    print("passages for the whole library, on the realtime or the Batch API path.")
+    hint = "Y/n" if was_enabled else "y/N"
+    raw = input(f"Index full text as passages? [{hint}]: ").strip().lower()
+    enabled = was_enabled if raw == "" else raw in ("y", "yes")
+    chunking["enabled"] = enabled
+
+    if enabled:
+        chunking["chunk_size"] = _prompt_positive_int(
+            "Passage size in characters", int(chunking["chunk_size"])
+        )
+        while True:
+            chunking["overlap"] = _prompt_positive_int(
+                "Overlap between passages in characters", int(chunking["overlap"]), minimum=0
+            )
+            if chunking["overlap"] < chunking["chunk_size"]:
+                break
+            print("Overlap must be smaller than the passage size")
+        print("Max passages per item bounds how much of each document is searchable")
+        print("(passage size x max passages). More passages cost more to embed.")
+        chunking["max_chunks_per_item"] = _prompt_positive_int(
+            "Max passages per item", int(chunking["max_chunks_per_item"])
+        )
+        print(
+            f"That is up to {int(chunking['max_chunks_per_item']) * 10_000:,} embeddings "
+            "per 10,000 items."
+        )
+    if enabled != was_enabled:
+        print("Chunking changed: run 'zotero-mcp update-db --force-rebuild' to apply it.")
+    return chunking
+
+
 def setup_semantic_search(
     existing_semantic_config: dict | None = None,
     semantic_config_only_arg: bool = False,
@@ -220,22 +329,14 @@ def setup_semantic_search(
     print("\n=== Semantic Search Configuration ===")
 
     if existing_semantic_config:
-        # Display config without sensitive info
-        model = existing_semantic_config.get("embedding_model", "unknown")
-        name = existing_semantic_config.get("embedding_config", {}).get("model_name", "unknown")
-        update_freq = existing_semantic_config.get("update_config", {}).get("update_frequency", "unknown")
-        db_path = existing_db_path or existing_semantic_config.get("zotero_db_path") or "auto-detect"
-        openai_batch = existing_semantic_config.get("openai_batch", {}).get("enabled", False)
+        # Same rows as `db-status`; never prints the API key.
+        from zotero_mcp.semantic_summary import print_rows, semantic_config_rows
+
         print("Found existing semantic search configuration:")
-        print(f"  - Embedding model: {model}")
-        print(f"  - Embedding model name: {name}")
-        if model == "openai":
-            print(f"  - OpenAI Batch API updates: {'enabled' if openai_batch else 'disabled'}")
-        elif model == "gemini":
-            gemini_batch = existing_semantic_config.get("gemini_batch", {}).get("enabled", False)
-            print(f"  - Gemini Batch API updates: {'enabled' if gemini_batch else 'disabled'}")
-        print(f"  - Update frequency: {update_freq}")
-        print(f"  - Zotero database path: {db_path}")
+        print_rows(
+            semantic_config_rows(existing_semantic_config, existing_db_path),
+            "  - ",
+        )
         print("You can keep it or change it.")
         print("If you change to a new configuration, a database rebuild is advised.")
         print("Would you like to keep your existing configuration? (y/n): ", end="")
@@ -252,11 +353,16 @@ def setup_semantic_search(
     print("4. Ollama - Local embeddings via Ollama API")
     print("5. Custom model (for OpenAI-compatible APIs like SiliconFlow)")
 
-    while True:
-        choice = input("\nChoose embedding model (1-5): ").strip()
-        if choice in ["1", "2", "3", "4", "5"]:
-            break
-        print("Please enter 1, 2, 3, 4, or 5")
+    prev = existing_semantic_config or {}
+    prev_model = prev.get("embedding_model")
+    prev_embedding = prev.get("embedding_config") or {}
+    default_choice = {"default": "1", "openai": "2", "gemini": "3", "ollama": "4"}.get(prev_model)
+    print()
+    choice = _prompt_choice("Choose embedding model (1-5)", ["1", "2", "3", "4", "5"], default_choice)
+    # Stored values carry over only when the provider is unchanged: an OpenAI
+    # key must never be offered to Gemini.
+    def same(provider: str) -> bool:
+        return prev_model == provider
 
     config = {}
 
@@ -272,11 +378,9 @@ def setup_semantic_search(
         print("1. text-embedding-3-small (recommended, faster)")
         print("2. text-embedding-3-large (higher quality, slower)")
 
-        while True:
-            model_choice = input("Choose OpenAI model (1-2): ").strip()
-            if model_choice in ["1", "2"]:
-                break
-            print("Please enter 1 or 2")
+        prev_name = prev_embedding.get("model_name") if same("openai") else None
+        default_model_choice = {"text-embedding-3-small": "1", "text-embedding-3-large": "2"}.get(prev_name)
+        model_choice = _prompt_choice("Choose OpenAI model (1-2)", ["1", "2"], default_model_choice)
 
         if model_choice == "1":
             config["embedding_config"] = {"model_name": "text-embedding-3-small"}
@@ -284,14 +388,18 @@ def setup_semantic_search(
             config["embedding_config"] = {"model_name": "text-embedding-3-large"}
 
         # Get API key
-        api_key = getpass.getpass("Enter your OpenAI API key (hidden): ").strip()
+        api_key = _prompt_secret(
+            "Enter your OpenAI API key", prev_embedding.get("api_key") if same("openai") else None
+        )
         if api_key:
             config["embedding_config"]["api_key"] = api_key
         else:
             print("Warning: No API key provided. Set OPENAI_API_KEY environment variable.")
 
         # Get optional base URL
-        base_url = input("Enter custom OpenAI base URL (leave blank for default): ").strip()
+        base_url = _prompt_text(
+            "Custom OpenAI base URL", prev_embedding.get("base_url") if same("openai") else None, "default"
+        )
         if base_url:
             config["embedding_config"]["base_url"] = base_url
             print(f"Using custom OpenAI base URL: {base_url}")
@@ -324,14 +432,18 @@ def setup_semantic_search(
         config["embedding_config"] = {"model_name": "gemini-embedding-001"}
 
         # Get API key
-        api_key = getpass.getpass("Enter your Gemini API key (hidden): ").strip()
+        api_key = _prompt_secret(
+            "Enter your Gemini API key", prev_embedding.get("api_key") if same("gemini") else None
+        )
         if api_key:
             config["embedding_config"]["api_key"] = api_key
         else:
             print("Warning: No API key provided. Set GEMINI_API_KEY environment variable.")
 
         # Get optional base URL
-        base_url = input("Enter custom Gemini base URL (leave blank for default): ").strip()
+        base_url = _prompt_text(
+            "Custom Gemini base URL", prev_embedding.get("base_url") if same("gemini") else None, "default"
+        )
         if base_url:
             config["embedding_config"]["base_url"] = base_url
             print(f"Using custom Gemini base URL: {base_url}")
@@ -357,10 +469,14 @@ def setup_semantic_search(
 
     elif choice == "4":
         config["embedding_model"] = "ollama"
-        model_name = input("Enter Ollama embedding model name (default: qwen3-embedding): ").strip()
-        config["embedding_config"] = {"model_name": model_name or "qwen3-embedding"}
+        current_name = (prev_embedding.get("model_name") if same("ollama") else None) or "qwen3-embedding"
+        model_name = input(f"Ollama embedding model name [{current_name}]: ").strip()
+        config["embedding_config"] = {"model_name": model_name or current_name}
 
-        base_url = input("Enter Ollama base URL (leave blank for http://localhost:11434): ").strip()
+        base_url = _prompt_text(
+            "Ollama base URL", prev_embedding.get("base_url") if same("ollama") else None,
+            "http://localhost:11434",
+        )
         if base_url:
             config["embedding_config"]["base_url"] = base_url
             print(f"Using custom Ollama base URL: {base_url}")
@@ -402,11 +518,14 @@ def setup_semantic_search(
     print("3. Daily - Automatically update once per day")
     print("4. Every N days - Automatically update every N days")
 
-    while True:
-        update_choice = input("\nChoose update frequency (1-4): ").strip()
-        if update_choice in ["1", "2", "3", "4"]:
-            break
-        print("Please enter 1, 2, 3, or 4")
+    prev_update = prev.get("update_config") or {}
+    prev_freq = str(prev_update.get("update_frequency") or "")
+    default_update = (
+        {"manual": "1", "startup": "2", "daily": "3"}.get(prev_freq)
+        or ("4" if prev_freq.startswith("every_") else None)
+    )
+    print()
+    update_choice = _prompt_choice("Choose update frequency (1-4)", ["1", "2", "3", "4"], default_update)
 
     update_config = {}
 
@@ -430,14 +549,11 @@ def setup_semantic_search(
         }
         print("Database will be updated once per day.")
     elif update_choice == "4":
-        while True:
-            try:
-                days = int(input("Enter number of days between updates: ").strip())
-                if days > 0:
-                    break
-                print("Please enter a positive number")
-            except ValueError:
-                print("Please enter a valid number")
+        prev_days = prev_update.get("update_days")
+        days = _prompt_positive_int(
+            "Number of days between updates",
+            prev_days if isinstance(prev_days, int) and prev_days > 0 else 7,
+        )
 
         update_config = {
             "auto_update": True,
@@ -485,6 +601,12 @@ def setup_semantic_search(
         except ValueError:
             print("Please enter a valid number")
 
+    batch_enabled = bool(
+        config.get("openai_batch", {}).get("enabled")
+        or config.get("gemini_batch", {}).get("enabled")
+    )
+    chunking_config = _prompt_chunking(existing_semantic_config, batch_enabled)
+
     # Configure Zotero database path
     print("\n=== Zotero Database Path ===")
     print("By default, zotero-mcp auto-detects the Zotero database location.")
@@ -529,10 +651,9 @@ def setup_semantic_search(
     #   reranker: local cross-encoder re-rank of candidates for higher
     #             precision (needs sentence-transformers; adds a model load).
     #   chunking: index each item as overlapping passages so search returns
-    #             grounded quotes and long PDFs stay searchable. Enabling it
-    #             requires a one-time `update-db --force-rebuild`. It has no
-    #             effect while `openai_batch.enabled` is true: that path
-    #             indexes item-level and update-db warns about it (#416).
+    #             grounded quotes and long PDFs stay searchable. After enabling
+    #             it, the next `update-db` adds the passages, on either the
+    #             realtime or the Batch API path.
     if existing_semantic_config and existing_semantic_config.get("reranker"):
         config["reranker"] = existing_semantic_config["reranker"]
     else:
@@ -545,15 +666,7 @@ def setup_semantic_search(
     # the default path (#617).
     if existing_semantic_config and existing_semantic_config.get("persist_directory"):
         config["persist_directory"] = existing_semantic_config["persist_directory"]
-    if existing_semantic_config and existing_semantic_config.get("chunking"):
-        config["chunking"] = existing_semantic_config["chunking"]
-    else:
-        config.setdefault("chunking", {
-            "enabled": False,
-            "chunk_size": 1500,
-            "overlap": 200,
-            "max_chunks_per_item": 20,
-        })
+    config["chunking"] = chunking_config
     return config, zotero_db_path
 
 
@@ -625,16 +738,167 @@ def load_semantic_search_config(semantic_config_path: Path) -> dict:
         return {}
 
 
-def update_claude_config(config_path, zotero_mcp_path, local=True, api_key=None, library_id=None, library_type="user", semantic_config=None):
+WEBDAV_KEYS = ("ZOTERO_WEBDAV_URL", "ZOTERO_WEBDAV_USERNAME", "ZOTERO_WEBDAV_PASSWORD")
+
+
+def _webdav_values(env) -> dict | None:
+    """The three WebDAV settings in *env*, or None unless all are set (as webdav.py reads them)."""
+    from zotero_mcp.webdav import _PLACEHOLDER_PREFIX
+
+    values = {key: str(env.get(key) or "").strip() for key in WEBDAV_KEYS}
+    if all(v and not v.startswith(_PLACEHOLDER_PREFIX) for v in values.values()):
+        return values
+    return None
+
+
+def _existing_webdav(config_paths) -> dict | None:
+    """The WebDAV settings in the first of *config_paths* that has all three."""
+    for path in config_paths:
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f)
+            env = cfg.get("client_env") or cfg.get("mcpServers", {}).get("zotero", {}).get("env") or {}
+            found = _webdav_values(env)
+        except Exception:
+            continue
+        if found:
+            return found
+    return None
+
+
+def _webdav_env(existing_env, webdav: dict | None) -> dict:
+    """The WebDAV settings to write into a config's env section.
+
+    *webdav* is setup's answer and replaces what the config had; ``{}`` means
+    no WebDAV. With None, setup did not ask, and the settings already in
+    *existing_env* are kept as they are.
+    """
+    if webdav is not None:
+        return webdav
+    if not isinstance(existing_env, dict):
+        return {}
+    return {key: existing_env[key] for key in WEBDAV_KEYS if key in existing_env}
+
+
+def _zotero_folder_url(address: str) -> str:
+    """The folder Zotero keeps its files in, from the address in Zotero's sync settings.
+
+    Zotero's settings drop a trailing /zotero from what is typed and add zotero/ to the
+    address; the upload writes <KEY>.zip straight into the folder it is given, so it
+    needs that folder.
+    """
+    url = address.strip()
+    if "://" not in url:  # Zotero's settings pick the scheme in a separate menu
+        url = "https://" + url
+    # Trailing slashes, then one /zotero path segment (not a host named zotero).
+    url = re.sub(r"(?<!/)/zotero$", "", url.rstrip("/"))
+    return url + "/zotero/"
+
+
+def _webdav_address_problem(url: str) -> str | None:
+    """Why *url* cannot be the WebDAV folder, or None when it can."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "it is not an http or https address"
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return "it is not an http or https address"
+    if parsed.username or parsed.password:
+        return "the username and the password are asked for next, so leave them out of it"
+    return None
+
+
+def setup_webdav(existing: dict | None) -> dict | None:
+    """Ask whether attachment files sync over WebDAV.
+
+    Returns the three ZOTERO_WEBDAV_* settings to write, ``{}`` for no WebDAV,
+    or None to leave each config as it is: at the end of input, when nothing
+    is stored and the question is passed with Enter, or when an answer is
+    left blank. Complete settings in the environment are used without asking,
+    as ZOTERO_API_KEY is. *existing* holds the stored settings; they are the
+    defaults, so Enter keeps them.
+    """
+    from_env = _webdav_values(os.environ)
+    if from_env:
+        print("\nUsing the WebDAV settings in the environment (ZOTERO_WEBDAV_*).")
+        return from_env
+
+    print("\n=== WebDAV File Sync ===")
+    print("If Zotero syncs your attachment files over WebDAV (Zotero settings > Sync >")
+    print("File Syncing), files added through the web API can go straight to that server.")
+    print("Otherwise they go to Zotero Storage and count against its quota.")
+    if existing and _webdav_address_problem(existing["ZOTERO_WEBDAV_URL"]):
+        existing = None  # not shown: it may hold a login. Enter still leaves it in the config
+    stored = existing or {}
+    stored_url = stored.get("ZOTERO_WEBDAV_URL")
+    stored_username = stored.get("ZOTERO_WEBDAV_USERNAME")
+    hint = "Y/n" if existing else "y/N"
+    try:
+        while True:
+            raw = input(f"Do you sync attachment files over WebDAV? [{hint}]: ").strip().lower()
+            if raw in ("", "y", "yes", "n", "no"):
+                break
+            print("Please enter y or n")
+        if raw in ("n", "no"):
+            return {}
+        if raw == "" and not existing:
+            return None
+        if existing and not stored_url.rstrip("/").endswith("/zotero"):
+            # Zotero reads <address>/zotero/, so files put anywhere else never reach it.
+            print("Note: the stored folder does not end in /zotero/, where Zotero keeps its files.")
+            print("Type the address from Zotero's settings to use its zotero folder.")
+        while True:
+            if existing:
+                address = input(f"WebDAV address, as in Zotero's settings [{stored_url}]: ").strip()
+            else:
+                address = input(
+                    "WebDAV address as in Zotero's settings, with https:// or http:// "
+                    "(e.g. https://dav.example.com): "
+                ).strip()
+            if not address:
+                url = stored_url  # Enter keeps the stored folder as it is
+                break
+            url = _zotero_folder_url(address)
+            problem = _webdav_address_problem(url)
+            if problem is None:
+                break
+            # The address is not repeated: it may hold a password.
+            print(f"That address cannot be used: {problem}.")
+        if not url:
+            print("WebDAV settings not changed: no address was given.")
+            return None
+        if existing:
+            username = input(f"WebDAV username [{stored_username}]: ").strip() or stored_username
+        else:
+            username = input("WebDAV username: ").strip()
+        password = _prompt_secret("WebDAV password", stored.get("ZOTERO_WEBDAV_PASSWORD"), "password")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+    if not (username and password):
+        print("WebDAV settings not changed: the username and the password are both needed.")
+        return None
+    print(f"Files will go to: {url}")
+    return {
+        "ZOTERO_WEBDAV_URL": url,
+        "ZOTERO_WEBDAV_USERNAME": username,
+        "ZOTERO_WEBDAV_PASSWORD": password,
+    }
+
+
+def update_claude_config(config_path, zotero_mcp_path, local=True, api_key=None, library_id=None, library_type="user", semantic_config=None, webdav=None):
     """Update Claude Desktop config to add zotero-mcp."""
     # Create directory if it doesn't exist
     config_dir = config_path.parent
     config_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load existing config or create new one
+    # Load existing config or create new one. Claude Desktop writes this file
+    # as UTF-8; without an explicit encoding Windows reads it with the locale
+    # code page and the rewrite below would garble other servers' entries.
     if config_path.exists():
         try:
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 config = json.load(f)
             print(f"Loaded existing config from: {config_path}")
         except json.JSONDecodeError:
@@ -652,6 +916,12 @@ def update_claude_config(config_path, zotero_mcp_path, local=True, api_key=None,
     env_settings = {
         "ZOTERO_LOCAL": "true" if local else "false"
     }
+    # Setup changes the Zotero connection, not HTTP authentication. Preserve
+    # even an invalid value so the serve-time validator can reject it safely.
+    existing_zotero = config["mcpServers"].get("zotero", {})
+    existing_env = existing_zotero.get("env", {}) if isinstance(existing_zotero, dict) else {}
+    if isinstance(existing_env, dict) and "ZOTERO_MCP_AUTH_TOKEN" in existing_env:
+        env_settings["ZOTERO_MCP_AUTH_TOKEN"] = existing_env["ZOTERO_MCP_AUTH_TOKEN"]
 
     # Add API key and library settings for web API
     if not local:
@@ -661,6 +931,8 @@ def update_claude_config(config_path, zotero_mcp_path, local=True, api_key=None,
             env_settings["ZOTERO_LIBRARY_ID"] = library_id
         if library_type:
             env_settings["ZOTERO_LIBRARY_TYPE"] = library_type
+    # Without these a rebuilt env section sends uploads back to Zotero Storage.
+    env_settings.update(_webdav_env(existing_env, webdav))
 
     # Add semantic search settings if provided
     if semantic_config:
@@ -697,7 +969,7 @@ def update_claude_config(config_path, zotero_mcp_path, local=True, api_key=None,
 
     # Write updated config
     try:
-        with open(config_path, 'w') as f:
+        with open(config_path, 'w', encoding="utf-8") as f:
             json.dump(config, f, indent=2)
         _restrict_file_permissions(config_path)
         print(f"\nSuccessfully wrote config to: {config_path}")
@@ -708,7 +980,7 @@ def update_claude_config(config_path, zotero_mcp_path, local=True, api_key=None,
     return config_path
 
 
-def _write_standalone_config(local: bool, api_key: str, library_id: str, library_type: str, semantic_config: dict, no_claude: bool = False) -> Path:
+def _write_standalone_config(local: bool, api_key: str, library_id: str, library_type: str, semantic_config: dict, no_claude: bool = False, webdav: dict | None = None) -> Path:
     """Write a central config file used by semantic search and provide client env."""
     cfg_dir = Path.home() / ".config" / "zotero-mcp"
     from zotero_mcp.utils import ensure_private_dir
@@ -732,6 +1004,9 @@ def _write_standalone_config(local: bool, api_key: str, library_id: str, library
     client_env = {
         "ZOTERO_LOCAL": "true" if local else "false"
     }
+    existing_env = full.get("client_env", {})
+    if isinstance(existing_env, dict) and "ZOTERO_MCP_AUTH_TOKEN" in existing_env:
+        client_env["ZOTERO_MCP_AUTH_TOKEN"] = existing_env["ZOTERO_MCP_AUTH_TOKEN"]
     # Persist global guard to disable Claude detection/output if requested
     if no_claude:
         client_env["ZOTERO_NO_CLAUDE"] = "true"
@@ -742,6 +1017,7 @@ def _write_standalone_config(local: bool, api_key: str, library_id: str, library
             client_env["ZOTERO_LIBRARY_ID"] = library_id
         if library_type:
             client_env["ZOTERO_LIBRARY_TYPE"] = library_type
+    client_env.update(_webdav_env(existing_env, webdav))
 
     full["client_env"] = client_env
 
@@ -862,12 +1138,24 @@ def main(cli_args=None):
                 existing_semantic_config = new_semantic_config  # Update the config to use
                 save_semantic_search_config(existing_semantic_config, semantic_config_path, zotero_db_path)
 
+    # WebDAV file sync, asked in web mode for a personal library (a group's
+    # files always go to Zotero Storage). Otherwise each config keeps the
+    # WebDAV settings it has. It is the last question: a script that pipes
+    # answers to the ones above reaches end of input here, which changes
+    # nothing.
+    webdav = None
+    if not use_local and library_type == "user":
+        rewritten = [semantic_config_path] if args.no_claude else config_paths
+        webdav = setup_webdav(_existing_webdav(rewritten))
+
     print("\nSetup with the following settings:")
     print(f"  Local API: {use_local}")
     if not use_local:
         print(f"  API Key: {_obfuscate_sensitive(api_key)}")
         print(f"  Library ID: {library_id or 'Not provided'}")
         print(f"  Library Type: {library_type}")
+        if webdav is not None:
+            print(f"  WebDAV file sync: {'yes' if webdav else 'no'}")
 
     # Use the potentially updated semantic config
     semantic_config = existing_semantic_config
@@ -881,11 +1169,12 @@ def main(cli_args=None):
                 library_id=library_id,
                 library_type=library_type,
                 semantic_config=semantic_config,
-                no_claude=args.no_claude
+                no_claude=args.no_claude,
+                webdav=webdav,
             )
             print("\nSetup complete (standalone/web mode)!")
             print(f"Config saved to: {cfg_path}")
-            # Emit one-line client_env for easy copy/paste. Mask the API key
+            # Emit one-line client_env for easy copy/paste. Mask credentials
             # by default — single-line JSON is exactly what gets pasted into
             # bug reports / shared terminals; only print it in full on request.
             try:
@@ -896,15 +1185,13 @@ def main(cli_args=None):
                 if show_secrets:
                     display_env = client_env
                 else:
-                    display_env = dict(client_env)
-                    if display_env.get("ZOTERO_API_KEY"):
-                        display_env["ZOTERO_API_KEY"] = _obfuscate_sensitive(
-                            display_env["ZOTERO_API_KEY"]
-                        )
+                    from zotero_mcp.cli import obfuscate_config_for_display
+
+                    display_env = obfuscate_config_for_display(client_env)
                 print("Client environment (single-line JSON):")
                 print(json.dumps(display_env, separators=(',', ':')))
-                if not show_secrets and client_env.get("ZOTERO_API_KEY"):
-                    print("  (API key masked — re-run with --show-secrets to print it in full)")
+                if not show_secrets and display_env != client_env:
+                    print("  (Secrets masked — re-run with --show-secrets to print them in full)")
             except Exception:
                 pass
             if semantic_config_changed:
@@ -922,7 +1209,8 @@ def main(cli_args=None):
                     api_key=api_key,
                     library_id=library_id,
                     library_type=library_type,
-                    semantic_config=semantic_config
+                    semantic_config=semantic_config,
+                    webdav=webdav,
                 )
                 if result:
                     updated_paths.append(result)

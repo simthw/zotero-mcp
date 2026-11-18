@@ -16,6 +16,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import weakref
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
@@ -587,7 +588,7 @@ def _tag_condition(operation: str, value: str) -> tuple[str, list]:
 # reading the caller wanted, decline the query and let them fall back.
 _TAG_WILDCARDS = ("%", "*")
 
-# ` OR ` as documented by `zotero_search_by_tag`, and `||` as Zotero's own
+# ` OR ` as documented for `zotero_search_items(tag=...)`, and `||` as Zotero's own
 # API spells it. Uppercase only: "or" is an ordinary word inside a tag name.
 _TAG_OR_SEPARATOR = re.compile(r"\s+OR\s+|\|\|")
 
@@ -595,7 +596,7 @@ _TAG_OR_SEPARATOR = re.compile(r"\s+OR\s+|\|\|")
 def _tag_dsl_condition(entries: list[str]) -> tuple[str, list] | None:
     """Compile the `tag=` boolean DSL into one SQL fragment.
 
-    The syntax is the one `zotero_search_by_tag` documents and pyzotero
+    The syntax is the one `zotero_search_items(tag=...)` documents and pyzotero
     forwards to Zotero's `tag` parameter: entries are ANDed, ` OR ` (or
     Zotero's own `||` spelling) disjoins within an entry, and a leading `-`
     on a term excludes it.
@@ -736,17 +737,73 @@ _SNAPSHOT_PREFIX = "zotero_mcp_db_"
 _LEGACY_SNAPSHOT_MAX_AGE = 7 * 24 * 3600
 _swept_stale_snapshots = False
 
+# Windows cannot delete a file that has an open SQLite connection, and
+# ``rmtree(ignore_errors=True)`` fails silently on it. Readers are tracked so
+# the exit cleanup can close them first, and a replaced copy that could not be
+# deleted yet is remembered and retried on the next copy and at exit.
+_open_readers: "weakref.WeakSet[LocalZoteroReader]" = weakref.WeakSet()
+_superseded_snapshots: set[str] = set()
+
+
+def _remove_snapshot_dir(path: str) -> bool:
+    """Delete one copy's directory; True when it is gone."""
+    shutil.rmtree(path, ignore_errors=True)
+    return not os.path.exists(path)
+
+
+def _retry_superseded_snapshots() -> None:
+    for path in list(_superseded_snapshots):
+        if _remove_snapshot_dir(path):
+            _superseded_snapshots.discard(path)
+
 
 _IS_WINDOWS = os.name == "nt"
+
+
+def _windows_pid_alive(pid: int) -> bool:
+    """Whether ``pid`` is a running process, asked of the Windows kernel.
+
+    OpenProcess fails with ERROR_ACCESS_DENIED for a process that exists but
+    belongs to someone else, and with ERROR_INVALID_PARAMETER for a pid no
+    process holds. A handle to a process that has exited but is not yet reaped
+    reports an exit code other than STILL_ACTIVE. Anything unexpected counts as
+    alive, so a copy is kept rather than deleted.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    process_query_limited_information = 0x1000
+    error_invalid_parameter = 87
+    still_active = 259
+
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() != error_invalid_parameter
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _pid_alive(pid: int) -> bool:
     if _IS_WINDOWS:
         # os.kill(pid, 0) is not a liveness probe on Windows: signal 0 equals
         # CTRL_C_EVENT there, so it can send Ctrl+C to processes on the
-        # console, and a failure is a generic OSError. Say "alive" and let the
-        # sweep fall back to the age rule.
-        return True
+        # console, and a failure is a generic OSError. Ask the kernel instead;
+        # where that is not possible, say "alive" and let the sweep fall back
+        # to the age rule.
+        try:
+            return _windows_pid_alive(pid)
+        except (AttributeError, OSError):
+            return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -802,10 +859,22 @@ def _sweep_stale_snapshots() -> None:
 
 @atexit.register
 def _remove_snapshots() -> None:
-    """Delete this process's database copies; they hold the whole library."""
+    """Delete this process's database copies; they hold the whole library.
+
+    Open readers are closed first: on Windows a copy with an open connection
+    cannot be deleted, so every short-lived process (each ``zotero-cli`` run)
+    used to leave its copy behind. A connection made on another thread cannot
+    be closed from here and keeps its copy; the next process's sweep removes it.
+    """
+    for reader in list(_open_readers):
+        try:
+            reader.close()
+        except Exception:  # a connection owned by another thread, or already gone
+            pass
     for _sig, snap, _made_at, _gen in list(_snapshots.values()):
-        shutil.rmtree(os.path.dirname(snap), ignore_errors=True)
+        _remove_snapshot_dir(os.path.dirname(snap))
     _snapshots.clear()
+    _retry_superseded_snapshots()
 
 
 def _file_signature(path: str) -> tuple[int, int] | None:
@@ -861,6 +930,7 @@ def _wal_snapshot_path(db_path: str) -> str | None:
                     # made before our own latest write skips this, once.
                     return cached[1]
             _sweep_stale_snapshots()
+            _retry_superseded_snapshots()
             snap_dir = tempfile.mkdtemp(prefix=f"{_SNAPSHOT_PREFIX}{os.getpid()}_")
             snap = os.path.join(snap_dir, "zotero.sqlite")
             try:
@@ -877,9 +947,12 @@ def _wal_snapshot_path(db_path: str) -> str | None:
                 shutil.rmtree(snap_dir, ignore_errors=True)
                 continue
             if cached:
-                # Best effort: an open connection elsewhere keeps its files
-                # alive on POSIX, and on Windows the directory is left behind.
-                shutil.rmtree(os.path.dirname(cached[1]), ignore_errors=True)
+                # An open connection elsewhere keeps its files alive on POSIX;
+                # on Windows it blocks the delete, so the directory is retried
+                # once that reader has moved on (next copy, or exit).
+                old_dir = os.path.dirname(cached[1])
+                if not _remove_snapshot_dir(old_dir):
+                    _superseded_snapshots.add(old_dir)
             _snapshots[source] = (before, snap, time.monotonic(), gen)
             return snap
     logger.warning(
@@ -968,6 +1041,7 @@ def _row_to_full_api_item(
     collections: list[str],
     relations: dict[str, object],
     library: tuple[int, str] | None,
+    retracted: bool = False,
 ) -> dict:
     """Build a complete pyzotero-shaped item record from one hydrated row.
 
@@ -1020,6 +1094,9 @@ def _row_to_full_api_item(
 
     if row["deleted"]:
         data["deleted"] = 1
+
+    if retracted:
+        data["retracted"] = True
 
     item = {"key": row["key"], "version": row["version"], "data": data}
     if library is not None:
@@ -1117,6 +1194,9 @@ class LocalZoteroReader:
         self.fulltext_cache_enabled: bool = fulltext_cache_enabled
         self.config_path: str | None = config_path
         self.reuse_pdf_parse: bool = reuse_pdf_parse
+        # So the exit cleanup can close this reader's connection before it
+        # deletes the database copy the connection has open.
+        _open_readers.add(self)
 
     def _find_zotero_db(self) -> str:
         """
@@ -2779,7 +2859,7 @@ class LocalZoteroReader:
         like_params: list = []
         if not variants:
             # A blank query is a *filter-only* search — "every item carrying
-            # this tag" — which is exactly what zotero_search_by_tag asks for
+            # this tag" — which is exactly what a tag-only zotero_search_items asks for
             # and which this backend can answer perfectly well. It is only
             # unanswerable with nothing else to filter on, since that would
             # quietly mean "return the whole library".
@@ -2966,6 +3046,23 @@ class LocalZoteroReader:
             for item_id, preds in gathered.items()
         }
 
+    def _fetch_retractions(self, conn: sqlite3.Connection, item_ids: list[int]) -> set[int]:
+        """Item IDs Zotero's local cache flags as retracted.
+
+        As Zotero.Retractions.isRetracted: flag 1 hides a retraction, flag 2
+        only silences citation warnings and is still retracted. Read from
+        Zotero's last check; no row is not proof the paper stands.
+        """
+        placeholders = ",".join("?" * len(item_ids))
+        try:
+            rows = conn.execute(
+                f"SELECT itemID FROM retractedItems WHERE flag IS NOT 1 AND itemID IN ({placeholders})",
+                item_ids,
+            ).fetchall()
+        except sqlite3.OperationalError:  # no retractedItems table
+            return set()
+        return {row[0] for row in rows}
+
     _FULL_ITEM_COLUMNS = """
             SELECT i.itemID, i.key, i.libraryID, i.version, i.dateAdded, i.dateModified,
                    it.typeName AS itemType,
@@ -2989,8 +3086,8 @@ class LocalZoteroReader:
     def _build_full_items(self, conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[dict]:
         """Hydrate `_FULL_ITEM_COLUMNS` rows into complete API-shaped items.
 
-        Five queries total regardless of row count: fields, creators, tags,
-        collection membership, relations.
+        A fixed number of queries regardless of row count: fields, creators,
+        tags, collection membership, relations and cached retraction flags.
         """
         if not rows:
             return []
@@ -3000,6 +3097,7 @@ class LocalZoteroReader:
         tags = self._fetch_tags(conn, item_ids)
         collections = self._fetch_item_collections(conn, item_ids)
         relations = self._fetch_relations(conn, item_ids)
+        retractions = self._fetch_retractions(conn, item_ids)
         labels = self.get_library_labels()
         return [
             _row_to_full_api_item(
@@ -3010,6 +3108,7 @@ class LocalZoteroReader:
                 collections.get(row["itemID"], []),
                 relations.get(row["itemID"], {}),
                 labels.get(row["libraryID"]),
+                row["itemID"] in retractions,
             )
             for row in rows
         ]
@@ -3020,6 +3119,7 @@ class LocalZoteroReader:
         *,
         group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
         include_trashed: bool = True,
+        library_id: int | None = None,
     ) -> dict[str, dict]:
         """Complete records for `keys`, keyed by item key.
 
@@ -3033,7 +3133,10 @@ class LocalZoteroReader:
         if not keys:
             return {}
         conn = self._get_connection()
-        lib_ids = self._resolve_scope_library_ids(group_id)
+        if library_id is not None:
+            lib_ids = [library_id]
+        else:
+            lib_ids = self._resolve_scope_library_ids(group_id)
         if not lib_ids:
             return {}
         lib_ph = ",".join("?" * len(lib_ids))
@@ -3052,6 +3155,7 @@ class LocalZoteroReader:
         *,
         item_type: str | None = None,
         group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
+        library_id: int | None = None,
     ) -> dict[str, list[dict]]:
         """Children of every given parent, keyed by parent key, in one pass.
 
@@ -3069,7 +3173,10 @@ class LocalZoteroReader:
         if not parent_keys:
             return {}
         conn = self._get_connection()
-        lib_ids = self._resolve_scope_library_ids(group_id)
+        if library_id is not None:
+            lib_ids = [library_id]
+        else:
+            lib_ids = self._resolve_scope_library_ids(group_id)
         if not lib_ids:
             return {}
         lib_ph = ",".join("?" * len(lib_ids))
@@ -3120,6 +3227,68 @@ class LocalZoteroReader:
             if parent_key is not None:
                 result[parent_key].append(item)
         return result
+
+    def get_duplicate_scan_items(
+        self,
+        *,
+        collection_key: str | None = None,
+        group_id: int | None = PERSONAL_LIBRARY_GROUP_ID,
+    ) -> list[dict]:
+        """All regular items needed for duplicate grouping and keeper ranking.
+
+        The projection includes the abstract and creation date used by auto
+        merge. Read the raw title field, matching metadata_match_keys' existing
+        API policy. No per-item hydration or item-ID parameter list is needed,
+        so this also works above SQLite's bound-variable limit.
+        """
+        conn = self._get_connection()
+        lib_ids = self._resolve_scope_library_ids(group_id)
+        if not lib_ids:
+            return []
+        placeholders = ",".join("?" * len(lib_ids))
+        collection_sql, collection_params = "", []
+        if collection_key:
+            collection = conn.execute(
+                f"SELECT collectionID FROM collections WHERE key = ? "
+                f"AND libraryID IN ({placeholders})",
+                [collection_key] + list(lib_ids),
+            ).fetchone()
+            if collection is None:
+                raise ValueError(f"Collection '{collection_key}' not found in the active library.")
+            collection_sql = " AND i.itemID IN (SELECT itemID FROM collectionItems WHERE collectionID = ?)"
+            collection_params = [collection[0]]
+        rows = conn.execute(
+            """SELECT i.key, it.typeName AS itemType, i.dateAdded, i.dateModified,
+                      title_val.value AS title, doi_val.value AS DOI,
+                      abstract_val.value AS abstractNote, date_val.value AS date
+               FROM items i JOIN itemTypes it ON it.itemTypeID = i.itemTypeID
+            """
+            + _plain_field_join("title", "title")
+            + _plain_field_join("doi", "DOI")
+            + _plain_field_join("abstract", "abstractNote")
+            + _plain_field_join("date", "date")
+            + f""" WHERE i.libraryID IN ({placeholders})
+                   AND i.itemID NOT IN (SELECT itemID FROM deletedItems)
+                   AND it.typeName NOT IN ('attachment', 'note', 'annotation')
+            """
+            + collection_sql
+            + " ORDER BY i.dateModified DESC, i.itemID",
+            list(lib_ids) + collection_params,
+        ).fetchall()
+        return [
+            {
+                "key": row["key"],
+                "data": {
+                    "key": row["key"], "itemType": row["itemType"],
+                    "title": row["title"] or "", "DOI": row["DOI"] or "",
+                    "abstractNote": row["abstractNote"] or "",
+                    "date": _api_date_field(row["date"] or ""),
+                    "dateAdded": _api_timestamp(row["dateAdded"]),
+                    "dateModified": _api_timestamp(row["dateModified"]),
+                },
+            }
+            for row in rows
+        ]
 
     def list_items_of_type(
         self,

@@ -1,6 +1,7 @@
 // Puts the panel in Zotero's main window. Measured on Zotero 10: #tabs-deck sits in an hbox below the tab bar,
 // so a sibling appended to that hbox is right of the library AND of every reader tab, and stays put when tabs switch.
 import type { Panel } from "./panel.ts";
+import { startupWord } from "../locales/languages.ts";
 
 const XHTML = "http://www.w3.org/1999/xhtml";
 const MIN_W = 300;
@@ -24,6 +25,16 @@ export interface Injected {
 // is what is centred.
 const ICON = "data:image/svg+xml;utf8," + encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="9 -1 110 125" fill="none" stroke="context-stroke" stroke-linecap="round" stroke-linejoin="round"><path stroke-width="11" d="M40 12H88a26 26 0 0 1 26 26V78a26 26 0 0 1-26 26H62L38 118V104H40a26 26 0 0 1-26-26V38a26 26 0 0 1 26-26Z"/><path stroke-width="13" d="M47 39H81L47 77H81"/></svg>');
+
+/** A PDF reader zoomed to a fixed percentage keeps its page width when the panel narrows it, so the page spills out of the
+ *  view. Fit-modes (page-width, auto, page-fit) refit on their own; a fixed zoom that now overflows becomes page-width. */
+function refitReaders(): void {
+  for (const reader of Zotero.Reader._readers) {
+    const viewer = reader._internalReader?._primaryView?._iframeWindow?.PDFViewerApplication?.pdfViewer;
+    const box = viewer?.container;
+    if (box && box.clientWidth > 0 && box.scrollWidth > box.clientWidth + 1 && !isNaN(Number(viewer.currentScaleValue))) viewer.currentScaleValue = "page-width";
+  }
+}
 
 export function injectPanel(win: any, load: (shadow: ShadowRoot) => Panel, prefs: { get(k: string): any; set(k: string, v: any): void; json<T>(k: string, fallback: T): T }): Injected | null {
   const doc = win.document;
@@ -63,6 +74,14 @@ export function injectPanel(win: any, load: (shadow: ShadowRoot) => Panel, prefs
     handle.addEventListener("pointerup", up);
   });
 
+  // Whenever the panel's width changes (opening, dragging), once pdf.js has laid out at the new size, refit a fixed zoom;
+  // and when a tab is shown, since a reader in the background was not laid out while the panel moved.
+  let refit = 0;
+  const later = () => { win.clearTimeout(refit); refit = win.setTimeout(refitReaders, 150); };
+  const resizes = new win.ResizeObserver(later);
+  resizes.observe(panel);
+  const tabs = Zotero.Notifier.registerObserver({ notify: (event: string) => { if (event === "select" && open) later(); } }, ["tab"], "zmc-refit");
+
   // The close button inside the panel (ui/ has no other way to reach us).
   surface.addEventListener("zmc-close", () => set(false));
 
@@ -75,8 +94,9 @@ export function injectPanel(win: any, load: (shadow: ShadowRoot) => Panel, prefs
   const button = doc.createXULElement("toolbarbutton");
   button.id = "zmc-toggle";
   button.className = "zotero-tb-button";
-  button.setAttribute("tooltiptext", "Chat");
-  button.setAttribute("aria-label", "Chat");
+  const chat = startupWord("chat", prefs.json<{ uiLanguage?: string }>("settings", {}).uiLanguage, Zotero.locale);
+  button.setAttribute("tooltiptext", chat);
+  button.setAttribute("aria-label", chat);
   button.style.cssText = `-moz-context-properties: stroke; stroke: currentColor; list-style-image: url("${ICON}");`;
   toolbar?.insertBefore(button, doc.getElementById("zotero-tb-tabs-menu")?.nextSibling ?? null);
 
@@ -108,6 +128,9 @@ export function injectPanel(win: any, load: (shadow: ShadowRoot) => Panel, prefs
     show: () => set(true), hide: () => set(false), toggle: () => set(!open), isOpen: () => open,
     remove() {
       win.removeEventListener("keydown", onKey, true);
+      win.clearTimeout(refit);
+      resizes.disconnect();
+      Zotero.Notifier.unregisterObserver(tabs);
       panelApi?.dispose();
       button.remove();
       panel.remove();
