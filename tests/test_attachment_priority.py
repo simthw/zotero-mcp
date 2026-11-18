@@ -186,22 +186,24 @@ def pdf_and_markdown(tmp_path):
 
 
 class TestLocalReaderHonorsPriority:
-    def test_default_still_reads_the_pdf(self, pdf_and_markdown):
+    def test_default_reads_the_mineru_markdown_sidecar(self, pdf_and_markdown):
+        """This fork treats a .md beside the PDF as a MinerU sidecar and
+        prefers it over parsing the PDF, whatever the attachment priority."""
         attachments, resolved = pdf_and_markdown
         reader = _Reader(attachments, resolved)
         text, source = reader._extract_fulltext_for_item(item_id=1)
-        assert source == "pdf"
-        assert "paper.pdf" in text
+        assert source == "mineru_md"
+        assert "clean converted text" in text
 
-    def test_markdown_first_reads_the_markdown(self, pdf_and_markdown):
-        """#265 made Markdown readable; this makes it preferred."""
+    def test_markdown_first_reads_the_mineru_markdown_sidecar(self, pdf_and_markdown):
+        """#265 made Markdown readable; this fork reads it as a MinerU sidecar."""
         attachments, resolved = pdf_and_markdown
         reader = _Reader(
             attachments, resolved, attachment_priority=["markdown", "pdf", "html", "other"]
         )
         text, source = reader._extract_fulltext_for_item(item_id=1)
-        assert source == "file"
-        assert "paper.md" in text
+        assert source == "mineru_md"
+        assert "clean converted text" in text
 
     def test_markdown_first_still_reads_the_pdf_when_no_markdown_exists(self, tmp_path):
         pdf = tmp_path / "only.pdf"

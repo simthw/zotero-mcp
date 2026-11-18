@@ -2354,7 +2354,7 @@ class ZoteroSemanticSearch:
                                 # replaced bad PDF and a PDF newly attached to an item that
                                 # was indexed metadata-only). A newly generated MinerU output
                                 # must also clear the failure even though neither Zotero field
-                                # changes when content_list.json appears beside an attachment.
+                                # changes when a .md sidecar appears beside an attachment.
                                 if chroma_has_fulltext == "failed":
                                     chroma_date = existing_metadata.get("date_modified", "")
                                     item_date = getattr(it, "date_modified", "") or ""
@@ -2406,9 +2406,9 @@ class ZoteroSemanticSearch:
                                         existing_metadata.get("fulltext_source")
                                     )
                                 ):
-                                    # A MinerU sidecar (.md or legacy content_list.json)
-                                    # is now available (a higher-quality source than
-                                    # whatever produced the stored embedding) — re-extract.
+                                    # A MinerU .md sidecar is now available (a
+                                    # higher-quality source than whatever produced
+                                    # the stored embedding) — re-extract.
                                     logger.info(
                                         f"MinerU output found for item {it.key}, will re-extract"
                                     )

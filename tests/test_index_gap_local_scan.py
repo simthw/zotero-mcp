@@ -58,6 +58,9 @@ class FakeReader:
     def get_fulltext_meta_for_item(self, item_id):
         return [list(row) for row in ATTACHMENTS]
 
+    def has_mineru_output(self, item_id):
+        return False
+
     def extract_fulltext_for_item(self, item_id):
         self.extract_calls += 1
         return ("extracted text", "pdf")

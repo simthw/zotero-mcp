@@ -62,11 +62,13 @@ One package, `zotero-mcp-server`, ships all three. Pick the one that fits where 
 - **Local or web**: in local mode reads come straight from `zotero.sqlite`; writes go to the running Zotero 10+ or through the web API
 - **Scite** citation tallies and retraction alerts (optional)
 
-> **Local fork:** MinerU structured full text is supported. Place `content_list.json`
-> or `<document>_content_list.json` beside a Zotero PDF/HTML attachment and index
-> with `zotero-mcp update-db --fulltext`. MinerU output is preferred over Zotero's
-> `.zotero-ft-cache` and direct PDF extraction, and output generated after an item
-> was indexed upgrades that item on the next full-text update.
+> **Local fork:** MinerU structured full text is supported. Place the MinerU
+> Markdown output (`<document>.md`, `<document>_content_list.md`, or
+> `content_list.md`) beside a Zotero PDF/HTML attachment — or in a sibling
+> `auto/`, `output/`, or `<document>/` directory — and index with
+> `zotero-mcp update-db --fulltext`. The Markdown sidecar is preferred over
+> Zotero's `.zotero-ft-cache` and direct PDF extraction, and output generated
+> after an item was indexed upgrades that item on the next full-text update.
 
 ## Quick start
 
